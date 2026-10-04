@@ -43,6 +43,24 @@ enum Command {
         #[command(subcommand)]
         command: EntityCmd,
     },
+    /// Search file contents and metadata
+    Search {
+        #[command(subcommand)]
+        command: SearchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SearchCmd {
+    /// Full-text search over file contents (FTS5 syntax)
+    Content {
+        pattern: String,
+        /// Limit to one project
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long, default_value_t = 100)]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +89,11 @@ enum FileCmd {
 enum EntityCmd {
     /// Entity counts by kind
     Stats,
+    /// One hop out of and into an entity, addressed <kind>/<external_ref>
+    Explore {
+        /// e.g. Commit/1CC0818B7CC9085A
+        entity: String,
+    },
 }
 
 fn main() {
@@ -121,6 +144,26 @@ fn run() -> Result<()> {
             }
         },
         Command::Entity { command } => match command {
+            EntityCmd::Explore { entity } => {
+                // <kind>/<external_ref>, split on the FIRST slash only:
+                // refs routinely contain slashes themselves (File entities
+                // are '<slug>/<path>'), so splitting on the last would
+                // mangle every one of the 1,972 of them.
+                let (kind, eref) = entity
+                    .split_once('/')
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "expected <kind>/<external_ref>, got {entity:?}"))?;
+                let (out, inc) = templedb_db::explore(&conn, kind, eref)?;
+                println!("{kind}/{eref}");
+                println!("\n  outbound ({})", out.len());
+                for e in &out {
+                    println!("    --{}--> {}  [{}]", e.kind, e.other, e.authority);
+                }
+                println!("\n  inbound ({})", inc.len());
+                for e in &inc {
+                    println!("    <--{}-- {}  [{}]", e.kind, e.other, e.authority);
+                }
+            }
             EntityCmd::Stats => {
                 let stats = templedb_db::entity_stats(&conn)?;
                 let total: i64 = stats.iter().map(|(_, n)| n).sum();
@@ -128,6 +171,30 @@ fn run() -> Result<()> {
                     println!("{:<20} {:>8}", kind, n);
                 }
                 println!("{:<20} {:>8}", "TOTAL", total);
+            }
+        },
+        Command::Search { command } => match command {
+            SearchCmd::Content {
+                pattern,
+                project,
+                limit,
+            } => {
+                let hits = templedb_db::search_content(
+                    &conn,
+                    &pattern,
+                    project.as_deref(),
+                    limit,
+                )?;
+                if hits.is_empty() {
+                    eprintln!("no files containing {pattern:?}");
+                    return Ok(());
+                }
+                for h in &hits {
+                    println!("{}  {}", h.project, h.path);
+                    // Snippets are one line so output stays greppable.
+                    println!("    {}", h.snippet.replace('\n', " "));
+                }
+                eprintln!("\n{} hit(s)", hits.len());
             }
         },
     }

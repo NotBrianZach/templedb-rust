@@ -19,11 +19,20 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs file cat <proj> <path>` | byte-identical output |
 | `templedb-rs file ls <proj> [prefix] [-l]` | matches |
 | `templedb-rs entity stats` | identical counts, TOTAL 35,012 |
+| `templedb-rs search content <pat> [-p] [--limit]` | same hit set as the *fixed* Python |
+| `templedb-rs entity explore <kind>/<ref>` | same edge counts and kinds |
 
 Verification is byte-level, not eyeball: `file cat` of
 `templedb src/cli/commands/entity.py` (5,048 lines) produces the same
 sha256 as the Python implementation, and `entity stats` agrees on every
 kind.
+
+`entity explore` prints edges only. The Python version also shows the
+entity's `label`, `source_authority` and `observed_at` above them; that is
+a known cosmetic gap, not parity.
+
+`search content` found a real bug in the original while being written —
+see *Bugs found while porting* below.
 
 **Not implemented.** Everything else — which is most of it. No writes of
 any kind, no VCS operations, no sessions, no checkouts, no ingest, no
@@ -64,6 +73,24 @@ Two bugs from the Python side are already designed out here:
   `rusqlite::Statement` finalizes when it leaves scope. This is arguably
   the strongest argument for the port after startup time.
 
+## Bugs found while porting
+
+Reimplementing a query means reading the schema it runs against, which is
+a different kind of attention than using it.
+
+- **`search content` attributed matches to the wrong project.**
+  `file_contents_fts` indexes `(file_path UNINDEXED, content_text)` with
+  no project column, and the Python query joined `file_search_view` on
+  `file_path` alone. 14 projects have a `README.md`, so one hit fanned
+  out to one row per project owning that path — and with `-p` the slug
+  filter then *passed* for a project whose file never contained the term.
+  `search content rusqlite -p trig-navigator` reported a match and showed
+  this repo's README as the snippet; unqualified, it returned 18 results
+  against a ground truth of 5. No migration was needed: migration 110 had
+  already set `rowid = project_files.id`, and the query simply never used
+  it. Fixed in templedb as `1DB323BCFDDF1DBA`; this port joined on rowid
+  from the start.
+
 ## Building
 
 ```bash
@@ -95,10 +122,11 @@ crates/templedb-cli/   clap binary `templedb-rs`
 Reads first, by how often they are used and how self-contained they are.
 Writes last, and only once the read layer is trusted.
 
-1. **Done** — projects, file read/list, entity stats.
-2. **Next** — `search content` (FTS5 over `file_contents_fts`),
-   `entity explore` / `trace` (graph walks), `source snapshot` at a
-   revision.
+1. **Done** — projects, file read/list, entity stats, `search content`
+   (FTS5), `entity explore` (one hop both directions).
+2. **Next** — `entity trace` (multi-hop BFS with `--depth` / `--via`),
+   `source snapshot` at a revision, and the `label` / `observed_at` header
+   `entity explore` still omits.
 3. **Then** — `summary` and `doctor` read-only invariants. These are pure
    queries and the highest-value target after search: `doctor` hashes
    roughly 400 files per run, which is work Rust does far better.

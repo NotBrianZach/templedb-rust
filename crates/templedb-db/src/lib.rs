@@ -190,3 +190,106 @@ pub fn entity_stats(conn: &Connection) -> Result<Vec<(String, i64)>> {
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("entity stats")
 }
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub project: String,
+    pub path: String,
+    pub snippet: String,
+}
+
+/// Full-text search over `file_contents_fts`.
+///
+/// Joined on `file_contents_fts.rowid`, which migration 110 established
+/// is `project_files.id`. The Python implementation joined
+/// `file_search_view` on `file_path` instead, and `file_path` is not
+/// unique across projects — 14 have a `README.md` — so one hit fanned out
+/// to one row per project owning that path, and `-p` then matched a
+/// project whose file did not contain the term. `search content rusqlite`
+/// returned 18 rows against a ground truth of 5 until 2026-10-04. This
+/// port never had that bug; it is recorded here so nobody reintroduces
+/// the path join thinking it is equivalent.
+pub fn search_content(
+    conn: &Connection,
+    pattern: &str,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SearchHit>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.slug,
+                pf.file_path,
+                snippet(file_contents_fts, 1, '[', ']', ' … ', 16)
+           FROM file_contents_fts
+           JOIN project_files pf ON pf.id = file_contents_fts.rowid
+           JOIN projects p ON p.id = pf.project_id
+          WHERE file_contents_fts MATCH ?1
+            AND (?2 IS NULL OR p.slug = ?2)
+          ORDER BY rank
+          LIMIT ?3",
+    )?;
+    let rows = stmt.query_map((pattern, project, limit), |r| {
+        Ok(SearchHit {
+            project: r.get(0)?,
+            path: r.get(1)?,
+            snippet: r.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("FTS search")
+}
+
+#[derive(Debug, Clone)]
+pub struct Edge {
+    pub kind: String,
+    pub other: String,
+    pub authority: String,
+}
+
+/// One hop out of and into an entity, addressed as `<kind>/<external_ref>`
+/// the way `templedb entity explore` addresses it.
+///
+/// Returns (outbound, inbound). Split rather than merged because
+/// direction is the question being asked — "what did this cause" and
+/// "what caused this" are different reads of the same graph.
+pub fn explore(
+    conn: &Connection,
+    kind: &str,
+    external_ref: &str,
+) -> Result<(Vec<Edge>, Vec<Edge>)> {
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM entities WHERE kind = ?1 AND external_ref = ?2",
+            (kind, external_ref),
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                anyhow::anyhow!("no entity {kind}/{external_ref}")
+            }
+            other => anyhow::Error::new(other),
+        })?;
+
+    let mut out = conn.prepare(
+        "SELECT r.kind, e.kind || '/' || e.external_ref, r.source_authority
+           FROM relations r JOIN entities e ON e.id = r.to_entity_id
+          WHERE r.from_entity_id = ?1 ORDER BY r.kind, 2",
+    )?;
+    let outbound = out
+        .query_map([id], |r| {
+            Ok(Edge { kind: r.get(0)?, other: r.get(1)?, authority: r.get(2)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut inc = conn.prepare(
+        "SELECT r.kind, e.kind || '/' || e.external_ref, r.source_authority
+           FROM relations r JOIN entities e ON e.id = r.from_entity_id
+          WHERE r.to_entity_id = ?1 ORDER BY r.kind, 2",
+    )?;
+    let inbound = inc
+        .query_map([id], |r| {
+            Ok(Edge { kind: r.get(0)?, other: r.get(1)?, authority: r.get(2)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok((outbound, inbound))
+}

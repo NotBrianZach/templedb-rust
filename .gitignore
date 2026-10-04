@@ -1,0 +1,16 @@
+# Build output. Non-negotiable: a release build of this workspace is
+# ~500 MB of target/, and templedb's importer walks the tree — letting it
+# in would put build artifacts in content_blobs, which is already the
+# largest table in the database at 470 MB.
+/target/
+**/target/
+
+# Rust/Cargo
+Cargo.lock.bak
+*.rs.bk
+*.pdb
+
+# Nix
+result
+result-*
+.direnv/

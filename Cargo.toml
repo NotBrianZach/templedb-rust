@@ -1,0 +1,20 @@
+# Workspace from the start, not a single crate that gets split later.
+#
+# The thing being ported is 274,689 lines of Python across 801 files with a
+# 163-table schema, and its own layering (cli / services / repositories) is
+# the main reason a correctness fix in one repository file can change a
+# dozen commands at once. Mirroring that split here keeps the same
+# property: the SQL lives in one place that the CLI cannot reach around.
+[workspace]
+members = ["crates/templedb-db", "crates/templedb-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }

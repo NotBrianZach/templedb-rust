@@ -23,16 +23,23 @@
           name = "templedb-rust-dev";
 
           packages = with pkgs; [
+            # `rustToolchain` already provides cargo, rustc and (via the
+            # extension above) rust-analyzer. Listing pkgs.cargo /
+            # pkgs.rustc / pkgs.rust-analyzer alongside it put a second,
+            # *different* toolchain on PATH — `which -a cargo` returned
+            # 1.99.0 from the overlay and 1.98.1 from nixpkgs. The
+            # overlay won only because mkShell resolves collisions by
+            # list order, so the pin was decided by where a line sat in
+            # this file. Reordering the list, or nixpkgs moving, would
+            # have silently changed the compiler.
             rustToolchain
-            cargo
-            rustc
-            rust-analyzer
 
-            # Native deps
+            # rusqlite uses the `bundled` feature, so SQLite is not a
+            # build input. `sqlite` is here for the CLI: checking a
+            # query against the live database by hand is how most of
+            # the parity work gets done.
             sqlite
-            pkg-config
 
-            # Development tools
             git
             just
           ];

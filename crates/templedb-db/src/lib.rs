@@ -97,8 +97,9 @@ pub use source::{revisions, snapshot, snapshot_body, Revision, Snapshot, Snapsho
 pub use store::Store;
 pub use value::{Row, Value};
 pub use vcs::{
-    branches, commit_detail, commit_log, content_at_commit, parent_hash, BranchEntry, CommitDetail,
-    CommitEntry, FileChange, Visibility,
+    branches, commit_detail, commit_log, content_at_commit, content_versions, current_content,
+    parent_hash, version_text, BranchEntry, CommitContent, CommitDetail, CommitEntry,
+    ContentVersion, FileChange, Visibility,
 };
 
 // Nothing from `rusqlite` or `postgres` is re-exported. The previous

@@ -240,6 +240,32 @@ enum VcsCmd {
     ///
     /// Listing only — creating and deleting branches are writes.
     Branch { project: String },
+    /// Diff one file between revisions.
+    ///
+    /// Three forms, mirroring Python:
+    ///
+    /// - `diff <proj> <file> <c1> <c2>` — between two commits.
+    /// - `diff <proj> <file> <c1>` — a commit against current.
+    /// - `diff <proj> <file>` — the two newest stored revisions. This
+    ///   one can never produce a diff against the live database:
+    ///   `file_contents` keeps no history, so it always reports that
+    ///   only one version exists. Ported anyway, because the message is
+    ///   the command's answer.
+    ///
+    /// Python's `--staged` and its no-file working-set form are absent:
+    /// staging is session-scoped and the working set is written by
+    /// `vcs status --refresh`. Same boundary as `vcs log`'s default.
+    Diff {
+        project: String,
+        file: String,
+        /// Commit hash or prefix
+        commit1: Option<String>,
+        /// Commit hash or prefix
+        commit2: Option<String>,
+        /// Print the diff without ANSI colour.
+        #[arg(long)]
+        no_color: bool,
+    },
     /// Show commit metadata, its changed-file list, and a diff of each
     /// file against the commit's first parent.
     ///
@@ -821,6 +847,104 @@ fn run() -> Result<i32> {
                     );
                 }
             }
+            VcsCmd::Diff {
+                project,
+                file,
+                commit1,
+                commit2,
+                no_color,
+            } => {
+                let p = resolve_project_row(&store, &project)?;
+                let f = match templedb_db::match_file(&store, p.id, &file)? {
+                    templedb_db::FileLookup::Found(f) => f,
+                    templedb_db::FileLookup::NotFound => {
+                        eprintln!("No file matches '{file}'");
+                        eprintln!("Use: templedb-rs file ls {project} to see available files");
+                        return Ok(1);
+                    }
+                    templedb_db::FileLookup::Ambiguous(list) => {
+                        eprintln!("Multiple files match '{file}':");
+                        for (path, score) in &list {
+                            // ● above 0.8, ○ below — Python's threshold.
+                            let marker = if *score > 0.8 { '●' } else { '○' };
+                            eprintln!("  {marker} {path}");
+                        }
+                        eprintln!("Please specify exact file name");
+                        return Ok(1);
+                    }
+                };
+
+                // Which pair of texts to compare, and what to label
+                // them. The three arms are Python's three forms.
+                let (old, new, label1, label2) = match (&commit1, &commit2) {
+                    (Some(c1), Some(c2)) => {
+                        let a = templedb_db::content_at_commit(&store, p.id, &f.file_path, c1)?;
+                        let b = templedb_db::content_at_commit(&store, p.id, &f.file_path, c2)?;
+                        (a.content, b.content, a.label, b.label)
+                    }
+                    (Some(c1), None) => {
+                        let a = templedb_db::content_at_commit(&store, p.id, &f.file_path, c1)?;
+                        let b = templedb_db::current_content(&store, f.id)?;
+                        // Python's early exit, before the None checks
+                        // below: identical content prints a pointer at
+                        // `vcs show` rather than an empty diff. The
+                        // unbalanced parentheses are Python's too.
+                        if let (Some(x), Some(y)) = (&a.content, &b) {
+                            if x == y {
+                                let short: String = c1.chars().take(8).collect();
+                                println!("No differences");
+                                println!("  ({short}'s content matches the current worktree.");
+                                println!("   To see what {short} itself changed, use:");
+                                println!("     templedb vcs show {project} {c1})");
+                                return Ok(0);
+                            }
+                        }
+                        (a.content, b, a.label, "current".to_string())
+                    }
+                    // `commit2` without `commit1` is unreachable:
+                    // clap fills positionals in order.
+                    (None, _) => {
+                        let versions = templedb_db::content_versions(&store, f.id)?;
+                        if versions.len() < 2 {
+                            println!("Only one version exists, no diff available");
+                            return Ok(0);
+                        }
+                        let (newer, older) = (&versions[0], &versions[1]);
+                        (
+                            templedb_db::version_text(&store, older)?,
+                            templedb_db::version_text(&store, newer)?,
+                            format!("version {}", older.version),
+                            format!("version {} (current)", newer.version),
+                        )
+                    }
+                };
+
+                // Absent content is an error here, where `vcs show`
+                // coerces it to empty. Both messages go to stderr, so
+                // stdout stays comparable either way.
+                let (Some(old), Some(new)) = (old, new) else {
+                    eprintln!("Could not retrieve old version");
+                    eprintln!("The content may have been deleted or corrupted");
+                    return Ok(1);
+                };
+
+                let (old_lines, new_lines) =
+                    (templedb_db::splitlines(&old), templedb_db::splitlines(&new));
+                let diff = templedb_db::unified_diff(
+                    &old_lines,
+                    &new_lines,
+                    &format!("{} ({label1})", f.file_path),
+                    &format!("{} ({label2})", f.file_path),
+                    3,
+                );
+                if diff.is_empty() {
+                    println!("No differences");
+                } else {
+                    for line in &diff {
+                        println!("{}", colorize_diff_line(line, !no_color));
+                    }
+                }
+            }
             VcsCmd::Show {
                 project,
                 commit,
@@ -863,16 +987,24 @@ fn run() -> Result<i32> {
                 if !files.is_empty() && !no_diff {
                     let parent = templedb_db::parent_hash(&store, d.id)?;
                     for f in &files {
+                        // `vcs show` discards the labels and builds its
+                        // own `a/path (hash)` pair, and coerces absent
+                        // content to the empty string — which is where
+                        // the misclassified-blob bug surfaces as
+                        // "No differences". `vcs diff` treats the same
+                        // `None` as an error instead. Both are Python's.
                         let new = templedb_db::content_at_commit(
                             &store,
                             p.id,
                             &f.file_path,
                             &d.commit_hash,
                         )?
+                        .content
                         .unwrap_or_default();
                         let old = match &parent {
                             Some(h) => {
                                 templedb_db::content_at_commit(&store, p.id, &f.file_path, h)?
+                                    .content
                                     .unwrap_or_default()
                             }
                             None => String::new(),

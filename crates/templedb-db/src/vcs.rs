@@ -394,48 +394,123 @@ pub fn parent_hash(store: &dyn Store, commit_id: i64) -> Result<Option<String>> 
 /// read out of the database, and reachable from `vcs diff`, which passes
 /// what the caller typed. Escaped here so it is not reachable from
 /// either.
+/// A file's text at one commit, plus the label Python puts in the diff
+/// header.
+///
+/// The label is on stdout, so it is part of the contract rather than a
+/// diagnostic — and it is present even when `content` is `None`, which
+/// is how Python's `(content, label)` tuple behaves. The two fields are
+/// genuinely independent: a missing blob yields no content but a
+/// perfectly good hash label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitContent {
+    /// `None` when there is no text to show. `Some("")` specifically
+    /// for a deletion, whose content at that commit really is nothing.
+    pub content: Option<String>,
+    pub label: String,
+}
+
+/// `commit_hash[:8]`, which is how Python abbreviates every hash it
+/// prints. Slicing is by character so a short hash cannot panic.
+fn short(hash: &str) -> String {
+    hash.chars().take(8).collect()
+}
+
 pub fn content_at_commit(
     store: &dyn Store,
     project_id: i64,
     file_path: &str,
     commit_ref: &str,
-) -> Result<Option<String>> {
+) -> Result<CommitContent> {
     // `change_type` and `content_hash` in one go, with the file
     // resolved by path. Python issues three queries to get here; the
     // joins are the same ones, and all three are inner, so a missing
     // row at any level drops out as no row at all.
-    let state = store
+    // The commit is resolved on its own first, because its hash is in
+    // three of the five labels below — including the ones where no file
+    // state exists to join against.
+    let commit = store
         .query_opt(
-            "SELECT vfs.change_type, vfs.content_hash
-               FROM vcs_commits c
-               JOIN vcs_file_states vfs ON vfs.commit_id = c.id
-               JOIN project_files pf ON pf.id = vfs.file_id
-              WHERE c.project_id = ?1
-                AND pf.project_id = ?1
-                AND pf.file_path = ?2
-                AND (c.commit_hash = ?3
-                     OR c.commit_hash LIKE ?4 || '%' ESCAPE '\\')
-              ORDER BY c.commit_hash
+            "SELECT id, commit_hash FROM vcs_commits
+              WHERE project_id = ?1
+                AND (commit_hash = ?2 OR commit_hash LIKE ?3 || '%' ESCAPE '\\')
+              ORDER BY commit_hash
               LIMIT 1",
             &[
                 Value::from(project_id),
-                Value::from(file_path),
                 Value::from(commit_ref),
                 Value::from(escape_like(commit_ref)),
+            ],
+        )
+        .context("resolving a commit")?;
+    let Some(commit) = commit else {
+        return Ok(CommitContent {
+            content: None,
+            label: format!("commit {commit_ref} not found"),
+        });
+    };
+    let (commit_id, commit_hash) = (commit.get_i64(0)?, commit.get_string(1)?);
+
+    let state = store
+        .query_opt(
+            "SELECT vfs.change_type, vfs.content_hash
+               FROM vcs_file_states vfs
+               JOIN project_files pf ON pf.id = vfs.file_id
+              WHERE vfs.commit_id = ?1
+                AND pf.project_id = ?2
+                AND pf.file_path = ?3",
+            &[
+                Value::from(commit_id),
+                Value::from(project_id),
+                Value::from(file_path),
             ],
         )
         .context("resolving the file state at a commit")?;
 
     let Some(state) = state else {
-        return Ok(None);
+        return Ok(CommitContent {
+            content: None,
+            label: format!("file not in commit {}", short(&commit_hash)),
+        });
     };
     if state.get_string(0)? == "deleted" {
-        return Ok(Some(String::new()));
+        return Ok(CommitContent {
+            content: Some(String::new()),
+            label: format!("deleted in {}", short(&commit_hash)),
+        });
     }
     let Some(hash) = state.get_opt_string(1)? else {
-        return Ok(None);
+        return Ok(CommitContent {
+            content: None,
+            label: format!("content unavailable at {}", short(&commit_hash)),
+        });
     };
 
+    // From here the label is the hash whether or not the blob produces
+    // text, which is Python's shape: `content, _ = get_content_by_hash`
+    // then `return content, commit_hash[:8]`. A missing or non-text blob
+    // therefore yields no content under a perfectly ordinary label, and
+    // the two callers treat that differently — `vcs show` coerces it to
+    // the empty string and prints "No differences", `vcs diff` errors
+    // and exits 1. Both are reproduced.
+    Ok(CommitContent {
+        content: blob_text(store, &hash)?,
+        label: short(&commit_hash),
+    })
+}
+
+/// A blob's text, or `None` when it is absent or not text.
+///
+/// The `content_type != 'text'` test is Python's, and it is **wrong** —
+/// reproduced because it is on stdout. `content_blobs.content_type` is
+/// not two-valued: alongside 4,078 `text` and 37 genuinely binary rows,
+/// the live database holds 9 `text/plain` and 5 `text/x-shellscript`
+/// blobs, all with real `content_text` and no bytes. Those 14 are
+/// ordinary source files classified as binary, which is why
+/// `templedb vcs show templedb 40E93339139FA809` reports a newly added
+/// 125-line Prolog file as having no differences. Filed as handoff #20;
+/// the two implementations have to agree until it is fixed there.
+fn blob_text(store: &dyn Store, hash: &str) -> Result<Option<String>> {
     let blob = store
         .query_opt(
             "SELECT content_text, content_type FROM content_blobs
@@ -446,12 +521,77 @@ pub fn content_at_commit(
     let Some(blob) = blob else {
         return Ok(None);
     };
-    // Python tests `content_type != 'text'` and returns no content for
-    // anything else, so a NULL type is also "not text".
     if blob.get_opt_string(1)?.as_deref() != Some("text") {
         return Ok(None);
     }
     blob.get_opt_string(0)
+}
+
+/// The file's current text, from whichever `file_contents` row is
+/// flagged `is_current`.
+///
+/// `None` covers both "no current row" and "the blob gave no text", as
+/// Python's `_get_current_content` does.
+pub fn current_content(store: &dyn Store, file_id: i64) -> Result<Option<String>> {
+    let row = store
+        .query_opt(
+            "SELECT content_hash FROM file_contents
+              WHERE file_id = ?1 AND is_current = 1",
+            &[Value::from(file_id)],
+        )
+        .context("reading current content")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(hash) = row.get_opt_string(0)? else {
+        return Ok(None);
+    };
+    blob_text(store, &hash)
+}
+
+/// One stored revision of a file's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentVersion {
+    pub version: i64,
+    pub content_hash: Option<String>,
+}
+
+/// The two newest `file_contents` rows for a file, newest first.
+///
+/// `vcs diff <proj> <file>` with no commits diffs these two against
+/// each other. Python takes `ORDER BY fc.version DESC LIMIT 2`, which
+/// this reproduces — and `version` is unique per file in practice, so
+/// unlike the timestamp orderings elsewhere in this crate it needs no
+/// tie-break. `id` is added anyway, because nothing in the schema
+/// *declares* that uniqueness and the cost of being wrong is diffing
+/// the wrong pair of revisions.
+pub fn content_versions(store: &dyn Store, file_id: i64) -> Result<Vec<ContentVersion>> {
+    let rows = store
+        .query(
+            "SELECT version, content_hash FROM file_contents
+              WHERE file_id = ?1
+              ORDER BY version DESC, id DESC
+              LIMIT 2",
+            &[Value::from(file_id)],
+        )
+        .context("listing content versions")?;
+    rows.iter()
+        .map(|r| {
+            Ok(ContentVersion {
+                version: r.get_i64(0)?,
+                content_hash: r.get_opt_string(1)?,
+            })
+        })
+        .collect()
+}
+
+/// Text for a `file_contents` row's hash — the pairing
+/// [`content_versions`] needs to render a diff.
+pub fn version_text(store: &dyn Store, v: &ContentVersion) -> Result<Option<String>> {
+    match &v.content_hash {
+        Some(h) => blob_text(store, h),
+        None => Ok(None),
+    }
 }
 
 /// One row of `vcs branch`'s listing.
@@ -815,66 +955,92 @@ mod tests {
         assert_eq!(parent_hash(&c, 19).unwrap().as_deref(), Some("C1"));
     }
 
+    fn at(c: &dyn Store, proj: i64, path: &str, rev: &str) -> CommitContent {
+        content_at_commit(c, proj, path, rev).unwrap()
+    }
+
     #[test]
     fn content_at_commit_reads_the_text_at_that_revision() {
         let c = testdb::fixture();
         // src/main.rs is one line at C1 and three at C2.
-        assert_eq!(
-            content_at_commit(&c, 1, "src/main.rs", "C1").unwrap(),
-            Some("fn main() {}\n".to_string())
-        );
-        assert_eq!(
-            content_at_commit(&c, 1, "src/main.rs", "C2").unwrap(),
-            Some("fn main() {}\nsecond\nthird\n".to_string())
-        );
+        let c1 = at(&c, 1, "src/main.rs", "C1");
+        assert_eq!(c1.content.as_deref(), Some("fn main() {}\n"));
+        assert_eq!(c1.label, "C1");
+        let c2 = at(&c, 1, "src/main.rs", "C2");
+        assert_eq!(c2.content.as_deref(), Some("fn main() {}\nsecond\nthird\n"));
+        assert_eq!(c2.label, "C2");
     }
 
     /// A deletion is `Some("")`, not `None`: the file's content at that
-    /// commit genuinely is nothing, so the diff should show every line
-    /// being removed rather than showing nothing at all.
+    /// commit genuinely is nothing, so the diff shows every line being
+    /// removed rather than showing nothing at all. Its label says so.
     #[test]
     fn a_deleted_file_reads_as_empty_rather_than_absent() {
         let c = testdb::fixture();
-        assert_eq!(
-            content_at_commit(&c, 2, "removed.txt", "DEAD0002").unwrap(),
-            Some(String::new())
-        );
+        let d = at(&c, 2, "removed.txt", "DEAD0002");
+        assert_eq!(d.content, Some(String::new()));
+        assert_eq!(d.label, "deleted in DEAD0002");
     }
 
-    /// The four ways there is no text, all of which Python collapses to
-    /// the empty string at the call site.
+    /// The five ways there is no text. The labels differ and are on
+    /// stdout, so they are asserted too — `vcs diff` prints them in the
+    /// diff header for the one case that still renders.
     #[test]
-    fn the_absent_cases_are_all_none() {
+    fn the_absent_cases_carry_distinct_labels() {
         let c = testdb::fixture();
-        // A commit that does not resolve.
-        assert_eq!(
-            content_at_commit(&c, 1, "src/main.rs", "nope").unwrap(),
-            None
-        );
-        // A path that is not in project_files.
-        assert_eq!(content_at_commit(&c, 1, "no/such.rs", "C1").unwrap(), None);
-        // A file the commit does not touch.
-        assert_eq!(content_at_commit(&c, 1, "README.md", "C1").unwrap(), None);
-        // A content_hash naming a blob that is not there.
-        assert_eq!(
-            content_at_commit(&c, 2, "orphan.txt", "CAFE0001").unwrap(),
-            None
-        );
-        // A blob that is not text. This is the one that produces a
-        // wrong answer downstream — the diff shows "No differences" for
-        // a binary file that did change — and it is Python's answer.
-        assert_eq!(content_at_commit(&c, 2, "logo.png", "B1").unwrap(), None);
+
+        // A commit that does not resolve names what you asked for.
+        let bad = at(&c, 1, "src/main.rs", "nope");
+        assert_eq!(bad.content, None);
+        assert_eq!(bad.label, "commit nope not found");
+
+        // A path that is not in project_files, and a file the commit
+        // does not touch, are the same case: no file state.
+        assert_eq!(at(&c, 1, "no/such.rs", "C1").label, "file not in commit C1");
+        let untouched = at(&c, 1, "README.md", "C1");
+        assert_eq!(untouched.content, None);
+        assert_eq!(untouched.label, "file not in commit C1");
+
+        // A content_hash naming a blob that is not there: the label is
+        // the ordinary hash, because Python only discovers the absence
+        // after it has committed to one.
+        let orphan = at(&c, 2, "orphan.txt", "CAFE0001");
+        assert_eq!(orphan.content, None);
+        assert_eq!(orphan.label, "CAFE0001");
+
+        // A blob that is not text. This is the one that produces a wrong
+        // answer downstream — `vcs show` prints "No differences" for a
+        // file that did change — and it is Python's answer. See
+        // `blob_text` and handoff #20.
+        let binary = at(&c, 2, "logo.png", "B1");
+        assert_eq!(binary.content, None);
+        assert_eq!(binary.label, "B1");
     }
 
-    /// The lookup is scoped to the project on both sides of the join, so
-    /// one project's commit cannot read another's file.
+    /// A NULL `content_hash` on a non-deleted row is its own label.
+    #[test]
+    fn a_null_hash_reports_content_unavailable() {
+        let c = testdb::fixture();
+        c.execute(
+            "INSERT INTO vcs_file_states
+                 (commit_id, file_id, change_type, content_hash, file_size, line_count)
+             VALUES (11, 2, 'modified', NULL, NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        let r = at(&c, 1, "notes.md", "C1");
+        assert_eq!(r.content, None);
+        assert_eq!(r.label, "content unavailable at C1");
+    }
+
+    /// The lookup is scoped to the project, so one project's commit
+    /// cannot read another's file.
     #[test]
     fn content_at_commit_is_scoped_to_the_project() {
         let c = testdb::fixture();
-        // src/main.rs is project 1's, C1 is project 1's commit.
-        assert!(content_at_commit(&c, 2, "src/main.rs", "C1")
-            .unwrap()
-            .is_none());
+        // src/main.rs is project 1's, C1 is project 1's commit, so
+        // asking project 2 resolves neither.
+        assert_eq!(at(&c, 2, "src/main.rs", "C1").content, None);
     }
 
     /// The same unescaped-LIKE injection as `commit_detail`, in a second
@@ -882,13 +1048,54 @@ mod tests {
     #[test]
     fn a_wildcard_commit_ref_is_literal() {
         let c = testdb::fixture();
-        assert_eq!(content_at_commit(&c, 1, "src/main.rs", "%").unwrap(), None);
-        assert_eq!(content_at_commit(&c, 1, "src/main.rs", "_").unwrap(), None);
+        assert_eq!(at(&c, 1, "src/main.rs", "%").label, "commit % not found");
+        assert_eq!(at(&c, 1, "src/main.rs", "_").label, "commit _ not found");
         // A prefix still works, so the escape has not broken resolution.
         assert_eq!(
-            content_at_commit(&c, 1, "src/main.rs", "C2").unwrap(),
-            Some("fn main() {}\nsecond\nthird\n".to_string())
+            at(&c, 1, "src/main.rs", "C2").content.as_deref(),
+            Some("fn main() {}\nsecond\nthird\n")
         );
+    }
+
+    #[test]
+    fn current_content_reads_the_is_current_row() {
+        let c = testdb::fixture();
+        // file 1's current content is h-main, three lines.
+        assert_eq!(
+            current_content(&c, 1).unwrap().as_deref(),
+            Some("fn main() {}\nsecond\nthird\n")
+        );
+        // file 2 is active with no content row at all.
+        assert_eq!(current_content(&c, 2).unwrap(), None);
+        // file 7's current blob is binary, so no text.
+        assert_eq!(current_content(&c, 7).unwrap(), None);
+    }
+
+    #[test]
+    fn content_versions_returns_the_two_newest() {
+        let c = testdb::fixture();
+        let vs = content_versions(&c, 1).unwrap();
+        // The fixture gives file 1 two versions; newest first.
+        assert_eq!(vs.len(), 2);
+        assert!(vs[0].version > vs[1].version, "{vs:?}");
+        assert_eq!(
+            version_text(&c, &vs[0]).unwrap().as_deref(),
+            Some("fn main() {}\nsecond\nthird\n")
+        );
+        assert_eq!(
+            version_text(&c, &vs[1]).unwrap().as_deref(),
+            Some("fn main() {}\n")
+        );
+    }
+
+    /// One version means no diff is possible, which the caller reports
+    /// rather than rendering an empty one.
+    #[test]
+    fn a_file_with_one_version_yields_one_row() {
+        let c = testdb::fixture();
+        assert_eq!(content_versions(&c, 5).unwrap().len(), 1);
+        // And a file with no content rows yields none.
+        assert!(content_versions(&c, 2).unwrap().is_empty());
     }
 
     #[test]

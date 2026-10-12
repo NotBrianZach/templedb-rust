@@ -143,6 +143,9 @@ const TABLES: &[TableSpec] = &[
             "line_count",
             "is_current",
             "updated_at",
+            // For `vcs diff <proj> <file>`, which orders by it. Added
+            // to the live table by ALTER TABLE, hence `DEFAULT 1`.
+            "version",
         ],
         types: &[
             Type::INT8,
@@ -152,6 +155,7 @@ const TABLES: &[TableSpec] = &[
             Type::INT8,
             Type::INT4,
             Type::TEXT,
+            Type::INT8,
         ],
         key: &["id"],
         page: 2000,

@@ -77,6 +77,11 @@ CREATE TABLE file_contents (
     line_count      INTEGER,
     is_current      BOOLEAN DEFAULT 1,
     updated_at      TEXT NOT NULL,
+    version         INTEGER DEFAULT 1,
+    -- The live constraint, reproduced including its flaw: with
+    -- `is_current` as 1/0 this permits one current row and one
+    -- non-current row, so it caps a file at two revisions rather than
+    -- constraining how many are current. See the Postgres DDL.
     UNIQUE(file_id, is_current)
 );
 
@@ -258,6 +263,19 @@ VALUES
     ('h-png',      NULL, X'89504E47', 'binary', 4);
 -- 'h-missing' is deliberately absent from content_blobs.
 
+-- File 1 is the one file given a *prior* revision, so the
+-- `vcs diff <proj> <file>` path has two rows to compare. The live
+-- database cannot exercise that path at all — all 2,095 of its files
+-- have exactly one row, every row is is_current = 1, and `version`
+-- increments in place rather than keeping the old row — so this fixture
+-- is the only thing that reaches the code. Exactly one non-current row
+-- is possible here, because UNIQUE(file_id, is_current) permits one of
+-- each; a third revision could not be inserted.
+INSERT INTO file_contents
+    (file_id, content_hash, file_size_bytes, line_count, is_current, updated_at, version)
+VALUES
+    (1, 'h-main-old', 13, 1,    0, '2026-10-04 00:00:00', 1);
+
 INSERT INTO file_contents
     (file_id, content_hash, file_size_bytes, line_count, is_current, updated_at)
 VALUES
@@ -268,6 +286,12 @@ VALUES
     (6, 'h-axb',       4, 1,    1, '2026-10-05 00:00:00'),
     (7, 'h-png',       4, NULL, 1, '2026-10-05 00:00:00'),
     (8, 'h-readme-b',  7, 1,    1, '2026-10-05 00:00:00');
+
+-- `version` defaults to 1, so file 1's current row has to be moved past
+-- the prior revision inserted above or the two would tie and the
+-- `ORDER BY version DESC` would be decided by the id tie-break instead
+-- of by the thing it names.
+UPDATE file_contents SET version = 2 WHERE file_id = 1 AND is_current = 1;
 
 -- rowid = project_files.id, which is what migration 110 established and
 -- what the Python query failed to use. Two projects own a 'README.md';

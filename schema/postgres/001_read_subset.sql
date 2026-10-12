@@ -177,6 +177,22 @@ CREATE TABLE file_contents (
     -- See convention 2 above: integer, not boolean.
     is_current      integer DEFAULT 1,
     updated_at      text COLLATE "C" NOT NULL,
+    -- `vcs diff <proj> <file>` orders by this. DEFAULT 1 because the
+    -- live column was appended by ALTER TABLE.
+    version         bigint DEFAULT 1,
+    -- Mirrors the live constraint, whose comment reads "Only one
+    -- current version per file" -- which is not what it says. With
+    -- `is_current` as 1/0 it permits one current row AND one
+    -- non-current row, so it caps the table at two revisions per file
+    -- rather than constraining how many are current. Expressing the
+    -- stated intent needs a partial index
+    -- (`UNIQUE (file_id) WHERE is_current = 1`).
+    --
+    -- Moot in practice today: the table holds no history at all. All
+    -- 2,095 files have exactly one row, every row is is_current = 1,
+    -- and `version` increments in place (observed up to 14) rather
+    -- than a prior row being retained. Reproduced as-is because the
+    -- mirror has to accept the rows the live database produces.
     UNIQUE (file_id, is_current)
 );
 

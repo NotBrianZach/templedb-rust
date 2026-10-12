@@ -32,6 +32,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs log <proj> [-n] [--branch] [--all-sessions]` | byte-identical; Python's session-scoped default not ported |
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
+| `templedb-rs vcs diff <proj> <file> [c1] [c2] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -61,7 +62,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-171 unit tests, run by `cargo test`: 162 in `templedb-db` and 9 in
+185 unit tests, run by `cargo test`: 176 in `templedb-db` and 9 in
 `templedb-cli` for the formatting the SQL layer cannot see. Three more
 are `#[ignore]`d because they need `python3`: they drive CPython's
 `difflib` as a reference oracle, and are described under *Porting
@@ -765,16 +766,52 @@ Writes last, and only once the read layer is trusted.
    `vcs show`'s per-file diffs. This was listed as a decision rather
    than a command and the decision was to reimplement; see below.
    `vcs_commit_parents` is the eleventh mirrored table.
-9. **Next** — `vcs diff`, which now needs no new algorithm. Three forms:
-   `vcs diff <proj> <file>` (newest two revisions), `vcs diff <proj>
-   <file> <c1> <c2>`, and `--context` for `difflib.context_diff`, which
-   is a renderer over the same `grouped_opcodes` this port already has.
-   `vcs status` stays out: staging is session-scoped and `--refresh`
-   writes working state.
-10. **Last, and not without a design document** — any write path, and
+9. **Done** — the fuzzy *file* matcher, and `vcs diff`'s three
+   deterministic forms. `file_contents.version` is the one column the
+   mirror gained. See below for the form that cannot work.
+10. **Next** — `--side-by-side`, which is `difflib.context_diff`: a
+    different renderer over the `grouped_opcodes` this port already has,
+    and the last output format in the `vcs` family. After that the read
+    layer is as complete as it can get without sessions.
+11. **Last, and not without a design document** — any write path, and
     with it the rest of the Postgres schema. Postgres becoming the
     primary store is the same project as porting the writes; the mirror
     is a read replica and does not change that.
+
+### `vcs diff <proj> <file>` cannot ever show a diff
+
+With no commit arguments the command diffs a file's two newest
+`file_contents` rows. That table holds **no history**, so there is never
+a second row:
+
+| | |
+|---|---|
+| files with a `file_contents` row | 2,095 |
+| files with more than one | **0** |
+| rows where `is_current = 1` | all of them |
+| highest `version` observed | 14 |
+
+`version` climbs to 14 while the row count stays at one, which says the
+writer updates in place and the previous content is not retained here.
+(It is not lost — it lives in `vcs_file_states` and `content_blobs`,
+which is what the other two forms read.) So `LIMIT 2` returns one row
+and the command always prints `Only one version exists, no diff
+available`, despite `--help` advertising "Show diff between file
+versions".
+
+Ported faithfully anyway, because that message *is* the command's
+answer, and the fixture carries a two-revision file so the comparison
+path is covered by a test even though live data cannot reach it. Noted
+rather than fixed: making the form work means retaining history, which
+is a write-path decision.
+
+`UNIQUE(file_id, is_current)` is related and also worth recording. Its
+comment reads "Only one current version per file", which is not what it
+says: with `is_current` as 1/0 it permits one current row *and* one
+non-current row, so it caps the table at two revisions per file rather
+than constraining how many are current. Expressing the stated intent
+needs a partial index. Reproduced in both schemas, because the mirror
+has to accept the rows the live database produces.
 
 ### difflib, reimplemented rather than approximated
 

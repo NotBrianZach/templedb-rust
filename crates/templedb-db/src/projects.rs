@@ -1,7 +1,8 @@
 //! `templedb project ...` reads.
 
+use crate::store::Store;
+use crate::value::Value;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -24,32 +25,187 @@ pub struct Project {
 /// those projects, because its query has no `COALESCE` and it formats
 /// the NULL straight into the table. `0` is the honest answer and is
 /// what this returns; it is a deliberate divergence, not a mismatch.
-pub fn list_projects(conn: &Connection) -> Result<Vec<Project>> {
-    let mut stmt = conn.prepare(
-        "SELECT p.id,
-                p.slug,
-                p.name,
-                COUNT(DISTINCT pf.id)                      AS files,
-                COALESCE(SUM(fc.line_count), 0)            AS lines
-           FROM projects p
-      LEFT JOIN project_files pf
-             ON pf.project_id = p.id AND pf.status = 'active'
-      LEFT JOIN file_contents fc
-             ON fc.file_id = pf.id AND fc.is_current = 1
-          GROUP BY p.id
-          ORDER BY lines DESC, p.slug",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(Project {
-            id: r.get(0)?,
-            slug: r.get(1)?,
-            name: r.get(2)?,
-            files: r.get(3)?,
-            lines: r.get(4)?,
+///
+/// Two details are load-bearing for cross-backend agreement:
+///
+/// * **The `CAST(... AS BIGINT)`.** SQLite's `sum()` over an integer
+///   column returns an integer; Postgres's `sum(bigint)` returns
+///   `numeric`, which this crate deliberately does not map. `CAST` is
+///   understood by both — SQLite applies INTEGER affinity to any type
+///   name containing `INT` — so one string serves both engines.
+///
+/// * **`GROUP BY p.id, p.slug, p.name`** rather than `GROUP BY p.id`.
+///   SQLite permits bare columns in the select list, and Postgres
+///   permits them too when the grouping key is a declared primary key.
+///   Naming all three stops that from depending on the mirror's DDL
+///   getting the `PRIMARY KEY` right.
+///
+/// `ORDER BY ... p.slug` is where the backends can silently disagree:
+/// SQLite compares TEXT with BINARY collation, Postgres with the
+/// database's. The Postgres schema declares these columns `COLLATE "C"`
+/// for that reason — see `schema/postgres/001_read_subset.sql`.
+pub fn list_projects(store: &dyn Store) -> Result<Vec<Project>> {
+    let rows = store
+        .query(
+            "SELECT p.id,
+                    p.slug,
+                    p.name,
+                    COUNT(DISTINCT pf.id)                              AS files,
+                    CAST(COALESCE(SUM(fc.line_count), 0) AS BIGINT)    AS lines
+               FROM projects p
+          LEFT JOIN project_files pf
+                 ON pf.project_id = p.id AND pf.status = 'active'
+          LEFT JOIN file_contents fc
+                 ON fc.file_id = pf.id AND fc.is_current = 1
+              GROUP BY p.id, p.slug, p.name
+              ORDER BY lines DESC, p.slug",
+            &[],
+        )
+        .context("listing projects")?;
+
+    rows.iter()
+        .map(|r| {
+            Ok(Project {
+                id: r.get_i64(0)?,
+                slug: r.get_string(1)?,
+                name: r.get_opt_string(2)?,
+                files: r.get_i64(3)?,
+                lines: r.get_i64(4)?,
+            })
         })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("listing projects")
+        .collect()
+}
+
+/// Everything `project show` prints about one project.
+///
+/// Three queries' worth, kept together because the command prints them
+/// as one block and the shapes are small.
+#[derive(Debug, Clone)]
+pub struct ProjectDetail {
+    pub slug: String,
+    pub name: Option<String>,
+    pub repo_url: Option<String>,
+    pub git_branch: Option<String>,
+    /// Every row in `project_files`, not just the active ones.
+    pub file_count: i64,
+    /// `SUM(lines_of_code)`, which is NULL when no row has one. Carried
+    /// as an `Option` because that is the case Python crashes on — see
+    /// [`project_detail`].
+    pub total_lines: Option<i64>,
+    pub file_types: i64,
+    pub branch_count: i64,
+    pub commit_count: i64,
+}
+
+/// One project's detail, by exact slug.
+///
+/// # Exact, not fuzzy
+///
+/// Every other command that takes a project fuzzy-matches it. This one
+/// does not, in Python either: `project show` calls
+/// `get_by_slug(args.slug, required=True)` where the rest call
+/// `fuzzy_match_project`, and its own `--help` says "Project slug"
+/// rather than "Project name or pattern". Reproduced rather than
+/// unified, because making it fuzzy would change which project an
+/// existing script resolves to.
+///
+/// # The NULL that crashes Python
+///
+/// The statistics query is
+/// `SELECT COUNT(*), SUM(lines_of_code), COUNT(DISTINCT file_type_id)`,
+/// and `SUM` over no non-NULL values returns NULL. Python then formats
+/// it with a thousands separator — `f"Lines of code: {stats['total_lines']:,}"`
+/// — and `format(None, ',')` raises:
+///
+/// ```text
+/// $ templedb project show cathedraldb
+/// Error: unsupported format string passed to NoneType.__format__
+///
+/// Project: cathedraldb
+/// Name: CathedralDB - Share TempleDB Projects
+/// Repository: templedb://cathedraldb
+/// Branch: None
+///
+/// Files: 0
+/// ```
+///
+/// Six of the eight lines, then exit 1. This is not an edge case: **10
+/// of the 30 projects** in the live database have a NULL sum, and they
+/// are not all empty — `prediction_dashboards` has 32 files and no
+/// `lines_of_code` on any of them. It is the same shape as the
+/// `source revisions` crash the README records, partial output and all.
+///
+/// Carried as `Option<i64>` so the caller decides; the CLI prints `0`.
+///
+/// # Two oddities reproduced rather than fixed
+///
+/// `COUNT(*)` counts every `project_files` row regardless of `status`,
+/// so a project's `Files:` here includes deleted ones and disagrees
+/// with `project list`, which filters `status = 'active'`. And
+/// `commit_count` is counted through `vcs_branches`, so it counts
+/// commits on this project's *branches* rather than commits with this
+/// project's id — the two differ if a commit's `branch_id` points at
+/// another project's branch. Both are Python's behaviour and both are
+/// on stdout, so both are kept.
+pub fn project_detail(store: &dyn Store, slug: &str) -> Result<Option<ProjectDetail>> {
+    let Some(row) = store
+        .query_opt(
+            "SELECT id, slug, name, repo_url, git_branch
+               FROM projects WHERE slug = ?1",
+            &[Value::from(slug)],
+        )
+        .context("looking up project")?
+    else {
+        return Ok(None);
+    };
+    let id = row.get_i64(0)?;
+
+    // `CAST(... AS BIGINT)` on the SUM for the same reason
+    // `list_projects` needs it: Postgres's `sum(bigint)` is `numeric`.
+    // The cast preserves NULL, which is the point — wrapping it in
+    // `COALESCE` here would hide the very case this function exists to
+    // report.
+    let stats = store
+        .query_opt(
+            "SELECT COUNT(*),
+                    CAST(SUM(lines_of_code) AS BIGINT),
+                    COUNT(DISTINCT file_type_id)
+               FROM project_files WHERE project_id = ?1",
+            &[Value::from(id)],
+        )
+        .context("reading project statistics")?;
+    // An aggregate with no `GROUP BY` always yields one row, so the
+    // `else` is unreachable; it costs nothing and avoids an `unwrap`.
+    let (file_count, total_lines, file_types) = match &stats {
+        Some(r) => (r.get_i64(0)?, r.get_opt_i64(1)?, r.get_i64(2)?),
+        None => (0, None, 0),
+    };
+
+    let vcs = store
+        .query_opt(
+            "SELECT COUNT(DISTINCT vb.id), COUNT(DISTINCT vc.id)
+               FROM vcs_branches vb
+          LEFT JOIN vcs_commits vc ON vc.branch_id = vb.id
+              WHERE vb.project_id = ?1",
+            &[Value::from(id)],
+        )
+        .context("reading vcs counts")?;
+    let (branch_count, commit_count) = match &vcs {
+        Some(r) => (r.get_i64(0)?, r.get_i64(1)?),
+        None => (0, 0),
+    };
+
+    Ok(Some(ProjectDetail {
+        slug: row.get_string(1)?,
+        name: row.get_opt_string(2)?,
+        repo_url: row.get_opt_string(3)?,
+        git_branch: row.get_opt_string(4)?,
+        file_count,
+        total_lines,
+        file_types,
+        branch_count,
+        commit_count,
+    }))
 }
 
 #[cfg(test)]
@@ -76,5 +232,73 @@ mod tests {
         // NULL SUM becomes 0, not a missing row and not "None".
         let empty = projects.iter().find(|p| p.slug == "empty").unwrap();
         assert_eq!((empty.files, empty.lines), (0, 0));
+    }
+
+    #[test]
+    fn detail_carries_metadata_and_counts() {
+        let c = testdb::fixture();
+        let d = super::project_detail(&c, "alpha").unwrap().unwrap();
+        assert_eq!(d.name.as_deref(), Some("Alpha Project"));
+        assert_eq!(d.repo_url.as_deref(), Some("git@example:alpha.git"));
+        assert_eq!(d.git_branch.as_deref(), Some("main"));
+        // Four `project_files` rows, including the deleted `gone.txt` —
+        // this count does not filter on status, unlike `project list`.
+        assert_eq!(d.file_count, 4);
+        assert_eq!(d.total_lines, Some(42));
+        // Two distinct `file_type_id` values across those four rows.
+        assert_eq!(d.file_types, 2);
+        // Two branches, and the commits reached through them.
+        assert_eq!(d.branch_count, 2);
+        assert_eq!(d.commit_count, 5);
+    }
+
+    /// The case Python crashes on. `empty` has no files, so
+    /// `SUM(lines_of_code)` is NULL — Python formats that with `{:,}`
+    /// and raises `TypeError` after printing six of its eight lines.
+    /// Ten of the thirty live projects are in this state.
+    #[test]
+    fn a_null_line_sum_is_none_not_a_crash() {
+        let c = testdb::fixture();
+        let d = super::project_detail(&c, "empty").unwrap().unwrap();
+        assert_eq!(d.file_count, 0);
+        assert_eq!(d.total_lines, None);
+        assert_eq!(d.file_types, 0);
+        // No branches, so the caller omits the VCS block entirely.
+        assert_eq!(d.branch_count, 0);
+    }
+
+    /// The more interesting half of that bug: a project with files whose
+    /// `lines_of_code` are all NULL. `prediction_dashboards` has 32
+    /// files and still crashes Python.
+    #[test]
+    fn files_with_no_line_counts_still_sum_to_none() {
+        let c = testdb::fixture();
+        let d = super::project_detail(&c, "beta").unwrap().unwrap();
+        assert_eq!(d.file_count, 6);
+        assert_eq!(d.total_lines, None);
+        // And no row carries a type either.
+        assert_eq!(d.file_types, 0);
+    }
+
+    /// NULL metadata stays NULL so the caller can render Python's two
+    /// different placeholders — `None` for the name, `N/A` for the
+    /// repository.
+    #[test]
+    fn null_metadata_is_carried_not_defaulted() {
+        let c = testdb::fixture();
+        let d = super::project_detail(&c, "empty").unwrap().unwrap();
+        assert_eq!(d.name, None);
+        assert_eq!(d.repo_url, None);
+        assert_eq!(d.git_branch, None);
+    }
+
+    /// Exact slug, not fuzzy — `alph` resolves for every other command
+    /// and must not here.
+    #[test]
+    fn the_slug_is_matched_exactly() {
+        let c = testdb::fixture();
+        assert!(super::project_detail(&c, "alph").unwrap().is_none());
+        assert!(super::project_detail(&c, "ALPHA").unwrap().is_none());
+        assert!(super::project_detail(&c, "nosuch").unwrap().is_none());
     }
 }

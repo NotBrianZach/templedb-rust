@@ -1,10 +1,20 @@
-//! Database location and connection setup.
+//! Which database to open, and which backend to open it with.
 
+use crate::backend::pg::PgStore;
+use crate::backend::sqlite::SqliteStore;
+use crate::store::Store;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 
-/// Resolve the database path exactly as the Python side does:
+/// The connection URL for the Postgres backend.
+///
+/// A separate variable from `TEMPLEDB_PATH` rather than one variable
+/// holding either, because the two have different shapes and a single
+/// overloaded variable makes "which backend am I talking to" a question
+/// about string parsing. With two, the answer is which one is set.
+pub const URL_ENV: &str = "TEMPLEDB_URL";
+
+/// Resolve the SQLite database path exactly as the Python side does:
 /// `$TEMPLEDB_PATH`, else `~/.local/share/templedb/templedb.sqlite`.
 ///
 /// Matching it matters more than being clever — the two implementations
@@ -24,36 +34,58 @@ pub fn db_path() -> Result<PathBuf> {
         .join("templedb.sqlite"))
 }
 
-/// Open the database read-only with TempleDB's standard pragmas.
-pub fn open_ro() -> Result<Connection> {
-    let path = db_path()?;
-    if !path.exists() {
-        anyhow::bail!("no database at {}", path.display());
-    }
-    // READ_ONLY rather than a URI with mode=ro so the flag is visible in
-    // the type system rather than buried in a query string.
-    let conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
-    apply_standard_pragmas(&conn)?;
-    Ok(conn)
+/// Which backend the environment selects, without connecting to it.
+///
+/// Split out from [`open_ro`] so the choice is testable without a
+/// database of either kind, and so an error names the misconfiguration
+/// rather than failing later as a connection error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Sqlite(PathBuf),
+    Postgres(String),
 }
 
-/// The pragma set, kept in one function for the same reason the Python
-/// helper of this name exists: so tuning lands in one place instead of
-/// being copied inline. An inline copy there is precisely why the MCP
-/// server's long-lived connection missed `journal_size_limit`.
-pub fn apply_standard_pragmas(conn: &Connection) -> Result<()> {
-    // busy_timeout is the one that matters on a read-only handle: the
-    // writer is another process entirely and checkpoints take the lock.
-    conn.pragma_update(None, "busy_timeout", 30_000i64)?;
-    conn.pragma_update(None, "temp_store", "MEMORY")?;
-    // 64 MiB, matching the Python side. Harmless on a read-only handle
-    // and correct if this crate ever opens for write.
-    conn.pragma_update(None, "journal_size_limit", 67_108_864i64)?;
-    Ok(())
+/// Read the environment and decide what to open.
+///
+/// `TEMPLEDB_URL` wins when set, otherwise SQLite. A URL with an
+/// unrecognised scheme is an error rather than a fall-through: silently
+/// reading a different database than the caller asked for is the exact
+/// failure the empty-`TEMPLEDB_PATH` case below exists to prevent, and
+/// a typo in a scheme deserves the same treatment.
+pub fn target() -> Result<Target> {
+    if let Ok(url) = std::env::var(URL_ENV) {
+        // An exported-but-empty variable is a common shell accident and
+        // means "unset", the same way it does for `TEMPLEDB_PATH`.
+        if !url.is_empty() {
+            if url.starts_with("postgres://")
+                || url.starts_with("postgresql://")
+                // libpq keyword/value form, e.g. `host=/tmp dbname=x`.
+                || url.contains('=')
+            {
+                return Ok(Target::Postgres(url));
+            }
+            anyhow::bail!(
+                "{URL_ENV} is set but is not a Postgres connection string \
+                 (expected a `postgres://` URL or libpq `key=value` pairs); \
+                 unset it to use SQLite at {}",
+                db_path()?.display()
+            );
+        }
+    }
+    Ok(Target::Sqlite(db_path()?))
+}
+
+/// Open the database the environment selects, read-only.
+///
+/// Returns a trait object rather than a generic because the choice is
+/// made from the environment at startup: a type parameter would have to
+/// be resolved by the caller, which is the CLI, which would then need
+/// to duplicate every command body once per backend.
+pub fn open_ro() -> Result<Box<dyn Store>> {
+    match target()? {
+        Target::Sqlite(path) => Ok(Box::new(SqliteStore::open_ro(&path)?)),
+        Target::Postgres(url) => Ok(Box::new(PgStore::connect(&url)?)),
+    }
 }
 
 #[cfg(test)]
@@ -88,24 +120,85 @@ mod tests {
         });
     }
 
+    #[test]
+    fn no_url_selects_sqlite() {
+        with_scratch_env(|| {
+            std::env::remove_var(URL_ENV);
+            std::env::set_var("TEMPLEDB_PATH", "/tmp/x.sqlite");
+            assert_eq!(
+                target().unwrap(),
+                Target::Sqlite(PathBuf::from("/tmp/x.sqlite"))
+            );
+        });
+    }
+
+    #[test]
+    fn a_postgres_url_selects_postgres() {
+        with_scratch_env(|| {
+            for url in [
+                "postgres://localhost/templedb",
+                "postgresql://localhost/templedb",
+                "host=/tmp dbname=templedb",
+            ] {
+                std::env::set_var(URL_ENV, url);
+                assert_eq!(
+                    target().unwrap(),
+                    Target::Postgres(url.to_string()),
+                    "{url}"
+                );
+            }
+        });
+    }
+
+    /// The same reasoning as the empty-`TEMPLEDB_PATH` test: an
+    /// exported-but-empty variable means unset, not "open nothing".
+    #[test]
+    fn an_empty_url_falls_back_to_sqlite() {
+        with_scratch_env(|| {
+            std::env::set_var(URL_ENV, "");
+            std::env::set_var("TEMPLEDB_PATH", "/tmp/x.sqlite");
+            assert_eq!(
+                target().unwrap(),
+                Target::Sqlite(PathBuf::from("/tmp/x.sqlite"))
+            );
+        });
+    }
+
+    /// A mistyped scheme must not quietly read the SQLite database. It
+    /// would answer every query successfully against the wrong data,
+    /// which is the worst available outcome.
+    #[test]
+    fn an_unrecognised_url_is_an_error_not_a_fallback() {
+        with_scratch_env(|| {
+            std::env::set_var(URL_ENV, "postgress://localhost/templedb");
+            std::env::set_var("TEMPLEDB_PATH", "/tmp/x.sqlite");
+            let err = target().unwrap_err().to_string();
+            assert!(err.contains("not a Postgres connection string"), "{err}");
+            // And it says what to do about it.
+            assert!(err.contains("/tmp/x.sqlite"), "{err}");
+        });
+    }
+
     /// Serialise the env-mutating tests and restore what they clobber.
     /// `cargo test` runs test threads in one process, so without this
-    /// the two above race on `TEMPLEDB_PATH`.
+    /// they race on `TEMPLEDB_PATH` and `TEMPLEDB_URL`.
     fn with_scratch_env(f: impl FnOnce()) {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old_path = std::env::var("TEMPLEDB_PATH").ok();
-        let old_home = std::env::var("HOME").ok();
+        let saved: Vec<(&str, Option<String>)> = ["TEMPLEDB_PATH", URL_ENV, "HOME"]
+            .into_iter()
+            .map(|k| (k, std::env::var(k).ok()))
+            .collect();
+        // Start from a known state: a stray TEMPLEDB_URL in the
+        // developer's shell must not change what these tests assert.
+        std::env::remove_var(URL_ENV);
         f();
-        restore("TEMPLEDB_PATH", old_path);
-        restore("HOME", old_home);
-    }
-
-    fn restore(key: &str, value: Option<String>) {
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

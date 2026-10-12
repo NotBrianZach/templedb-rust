@@ -18,3 +18,14 @@ license = "MIT"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+# The synchronous client, not `tokio-postgres` and not `sqlx`. Async
+# would make all fifteen public functions in `templedb-db` `async` for a
+# CLI that exits after one query, and `sqlx` wants a live database at
+# compile time — a port whose `cargo build` fails when a server is down
+# is worse than one with unchecked SQL. See `backend/pg.rs`.
+postgres = "0.19"
+# Only for restoring the default SIGPIPE disposition, which Rust's
+# runtime sets to SIG_IGN before main — see `die_on_sigpipe`. Already
+# in the lock file via rusqlite and postgres, so it adds no new
+# dependency, only a declared one.
+libc = "0.2"

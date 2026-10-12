@@ -1,18 +1,28 @@
 //! `templedb entity ...` reads — the graph layer.
 
+use crate::dialect::Dialect;
 use crate::like::escape_like;
+use crate::store::Store;
+use crate::value::Value;
 use anyhow::{Context, Result};
-use rusqlite::{params_from_iter, Connection};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 /// Entity counts by kind — the cheapest useful probe of the graph, and
 /// a direct cross-check against `templedb entity stats`.
-pub fn entity_stats(conn: &Connection) -> Result<Vec<(String, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT kind, COUNT(*) FROM entities GROUP BY kind ORDER BY 2 DESC, kind")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("entity stats")
+///
+/// `ORDER BY 2 DESC` sorts by output ordinal, which both dialects
+/// accept; `COUNT(*)` is an integer in SQLite and `bigint` in Postgres,
+/// and both narrow to `Value::Int`.
+pub fn entity_stats(store: &dyn Store) -> Result<Vec<(String, i64)>> {
+    let rows = store
+        .query(
+            "SELECT kind, COUNT(*) FROM entities GROUP BY kind ORDER BY 2 DESC, kind",
+            &[],
+        )
+        .context("entity stats")?;
+    rows.iter()
+        .map(|r| Ok((r.get_string(0)?, r.get_i64(1)?)))
+        .collect()
 }
 
 /// Which way to walk a relation. `relations` rows are directed
@@ -72,16 +82,16 @@ pub struct Explored {
 /// as a known gap: without `label`, `source_authority` and
 /// `observed_at`, the output cannot be diffed against the Python
 /// command it replaces.
-pub fn explore(conn: &Connection, kind: &str, external_ref: &str) -> Result<Explored> {
-    let (id, label, source_authority, observed_at) = lookup_entity(conn, kind, external_ref)?;
+pub fn explore(store: &dyn Store, kind: &str, external_ref: &str) -> Result<Explored> {
+    let (id, label, source_authority, observed_at) = lookup_entity(store, kind, external_ref)?;
     Ok(Explored {
         kind: kind.to_string(),
         external_ref: external_ref.to_string(),
         label,
         source_authority,
         observed_at,
-        outbound: fetch_edges(conn, id, Direction::Out, &[], None)?,
-        inbound: fetch_edges(conn, id, Direction::In, &[], None)?,
+        outbound: fetch_edges(store, id, Direction::Out, &[], None)?,
+        inbound: fetch_edges(store, id, Direction::In, &[], None)?,
     })
 }
 
@@ -110,7 +120,7 @@ pub struct TraceHit {
 /// truncated. Ordering first makes the result reproducible and makes
 /// comparing the two implementations possible at all.
 pub fn trace(
-    conn: &Connection,
+    store: &dyn Store,
     kind: &str,
     external_ref: &str,
     depth: usize,
@@ -118,7 +128,7 @@ pub fn trace(
     via: &[String],
     fanout: i64,
 ) -> Result<Vec<TraceHit>> {
-    let (start, _, _, _) = lookup_entity(conn, kind, external_ref)?;
+    let (start, _, _, _) = lookup_entity(store, kind, external_ref)?;
 
     let mut visited: HashSet<i64> = HashSet::from([start]);
     let mut frontier: Vec<i64> = vec![start];
@@ -128,18 +138,26 @@ pub fn trace(
         if frontier.is_empty() {
             break;
         }
+        // One query per direction for the whole level, not one per
+        // node. The grouping below walks `frontier` in its own order
+        // and each node's edges in theirs, so the emission order is
+        // the same as the per-node version produced.
+        let batch = fetch_frontier(store, &frontier, direction, via, Some(fanout))?;
         let mut next = Vec::new();
-        for &eid in &frontier {
-            for (peer_id, edge) in fetch_edges_with_ids(conn, eid, direction, via, Some(fanout))? {
+        for eid in &frontier {
+            for (peer_id, edge) in batch.get(eid).into_iter().flatten() {
                 // A global visited set, matching Python: an entity is
                 // reported at the shallowest depth it is reachable at
                 // and not expanded twice. Without it, a cycle walks
                 // forever at depth > 2.
-                if !visited.insert(peer_id) {
+                if !visited.insert(*peer_id) {
                     continue;
                 }
-                hits.push(TraceHit { depth: hop, edge });
-                next.push(peer_id);
+                hits.push(TraceHit {
+                    depth: hop,
+                    edge: edge.clone(),
+                });
+                next.push(*peer_id);
             }
         }
         frontier = next;
@@ -182,8 +200,14 @@ pub struct EntityMatch {
 ///    query planner's choice and can change between runs. Ordering by
 ///    `(observed_at DESC, kind, external_ref)` makes the first page
 ///    stable and reviewable.
+///
+/// That tie-break is also where the two backends can disagree without
+/// saying so: it sorts on text, SQLite compares text with BINARY
+/// collation, and Postgres uses the database's. The Postgres schema
+/// declares `kind` and `external_ref` as `COLLATE "C"` so the two agree
+/// — see `schema/postgres/001_read_subset.sql`.
 pub fn search_entities(
-    conn: &Connection,
+    store: &dyn Store,
     query: &str,
     kind: Option<&str>,
     limit: i64,
@@ -196,6 +220,12 @@ pub fn search_entities(
     // Reproducing that rather than fixing it keeps the two outputs
     // comparable; fixing it belongs with a decision about which
     // collation the column should have.
+    //
+    // Postgres's `lower()` is *not* ASCII-only — it is locale-aware —
+    // so this is one of the places where a non-ASCII query could
+    // disagree across backends. It is recorded in the README's known
+    // gaps rather than papered over here, because the fix is a
+    // collation decision and not a query change.
     let pattern = format!("%{}%", escape_like(&query.to_lowercase()));
     let (kind_clause, limit_idx) = match kind {
         Some(_) => (" AND kind = ?2", 3),
@@ -206,28 +236,28 @@ pub fn search_entities(
            FROM entities
           WHERE (LOWER(label) LIKE ?1 ESCAPE '\\'
                  OR LOWER(external_ref) LIKE ?1 ESCAPE '\\'){kind_clause}
-          ORDER BY observed_at DESC, kind, external_ref
+          ORDER BY observed_at DESC, kind, external_ref NULLS FIRST
           LIMIT ?{limit_idx}"
     );
 
-    let mut params: Vec<rusqlite::types::Value> = vec![pattern.into()];
+    let mut params: Vec<Value> = vec![Value::from(pattern)];
     if let Some(k) = kind {
-        params.push(k.to_string().into());
+        params.push(Value::from(k));
     }
-    params.push(limit.into());
+    params.push(Value::from(limit));
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |r| {
-        Ok(EntityMatch {
-            kind: r.get(0)?,
-            external_ref: r.get(1)?,
-            label: r.get(2)?,
-            source_authority: r.get(3)?,
-            observed_at: r.get(4)?,
+    let rows = store.query(&sql, &params).context("searching entities")?;
+    rows.iter()
+        .map(|r| {
+            Ok(EntityMatch {
+                kind: r.get_string(0)?,
+                external_ref: r.get_opt_string(1)?,
+                label: r.get_opt_string(2)?,
+                source_authority: r.get_string(3)?,
+                observed_at: r.get_string(4)?,
+            })
         })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("searching entities")
+        .collect()
 }
 
 /// The outcome of a [`shortest_path`] search.
@@ -276,15 +306,15 @@ pub enum PathResult {
 /// visits each entity at most once, so the uncapped cost is bounded by
 /// the 64,562 rows of `relations` rather than by anything exponential.
 pub fn shortest_path(
-    conn: &Connection,
+    store: &dyn Store,
     from: (&str, &str),
     to: (&str, &str),
     max_depth: usize,
     direction: Direction,
     via: &[String],
 ) -> Result<PathResult> {
-    let (src, source_label, _, _) = lookup_entity(conn, from.0, from.1)?;
-    let (tgt, _, _, _) = lookup_entity(conn, to.0, to.1)?;
+    let (src, source_label, _, _) = lookup_entity(store, from.0, from.1)?;
+    let (tgt, _, _, _) = lookup_entity(store, to.0, to.1)?;
     if src == tgt {
         return Ok(PathResult::SameEntity);
     }
@@ -294,32 +324,42 @@ pub fn shortest_path(
     // Presence in the map doubles as the visited set, which is what keeps
     // a cycle from re-enqueueing.
     let mut parent: HashMap<i64, Option<(i64, Edge)>> = HashMap::from([(src, None)]);
-    let mut queue: VecDeque<(i64, usize)> = VecDeque::from([(src, 0)]);
+    // Level-synchronous rather than one-node-at-a-time, so each level
+    // costs one query per direction instead of one per node. The node
+    // order within a level is the order they were discovered in, which
+    // is exactly the order a FIFO queue would have popped them — so
+    // `parent` is populated with the same first-come-wins assignments
+    // and the reconstructed path is identical. See `fetch_frontier`.
+    let mut frontier: Vec<i64> = vec![src];
     let mut found = false;
 
-    'bfs: while let Some((cur, depth)) = queue.pop_front() {
-        if depth >= max_depth {
-            // Nodes at the cutoff are reported but not expanded, so
-            // `--max-depth N` admits paths of exactly N hops.
-            continue;
+    'bfs: for _ in 0..max_depth {
+        if frontier.is_empty() {
+            break;
         }
-        for (peer, edge) in fetch_edges_with_ids(conn, cur, direction, via, None)? {
-            if parent.contains_key(&peer) {
-                continue;
+        let batch = fetch_frontier(store, &frontier, direction, via, None)?;
+        let mut next = Vec::new();
+        for cur in &frontier {
+            for (peer, edge) in batch.get(cur).into_iter().flatten() {
+                if parent.contains_key(peer) {
+                    continue;
+                }
+                parent.insert(*peer, Some((*cur, edge.clone())));
+                if *peer == tgt {
+                    // Stop on discovery rather than on dequeue. Python
+                    // waits until the target is popped, which first
+                    // expands every node already queued ahead of it —
+                    // thousands of edge queries, for a path that cannot
+                    // change: `parent[tgt]` is written once and the
+                    // `contains_key` guard above never lets it be
+                    // overwritten.
+                    found = true;
+                    break 'bfs;
+                }
+                next.push(*peer);
             }
-            parent.insert(peer, Some((cur, edge)));
-            if peer == tgt {
-                // Stop on discovery rather than on dequeue. Python waits
-                // until the target is popped, which first expands every
-                // node already queued ahead of it — thousands of edge
-                // queries, for a path that cannot change: `parent[tgt]`
-                // is written once and the `contains_key` guard above
-                // never lets it be overwritten.
-                found = true;
-                break 'bfs;
-            }
-            queue.push_back((peer, depth + 1));
         }
+        frontier = next;
     }
 
     if !found {
@@ -337,133 +377,537 @@ pub fn shortest_path(
     Ok(PathResult::Found { source_label, hops })
 }
 
+/// One `File -imports-> File` edge with no call bridging it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeadImport {
+    pub from_ref: String,
+    pub to_ref: String,
+}
+
+/// Files that import another file without any Symbol call landing in it.
+///
+/// An investigation tool rather than an invariant, and the Python
+/// docstring is right about why: a side-effect import — plugin
+/// registration, monkeypatching — legitimately has no call edge, so
+/// this is a list to eyeball and not a list of defects.
+///
+/// The shape is three joins deep and worth reading once. For each
+/// `File -imports-> File` pair it asks whether any `Symbol` the source
+/// file `defines` has a `calls`/`inherits`/`uses` edge to a `Symbol`
+/// the target file `defines`. Every join is a `LEFT JOIN` so a pair
+/// with no symbols at all still produces a row, and the `HAVING
+/// SUM(...) = 0` is what selects the pairs where nothing bridged.
+///
+/// One divergence from Python, and it is latent rather than observed:
+/// the `--slug` filter is LIKE-escaped here. Python interpolates it
+/// raw into `fe.external_ref LIKE ? || '/%'`, so a slug containing `_`
+/// would match any character in that position. Eleven of the thirty
+/// slugs contain an underscore, but no pair of them currently collides
+/// — `templedb_backup_service` does not have a `templedbxbackup...`
+/// sibling — so the bug is reachable only by adding a project, which
+/// is exactly when nobody would connect the two. This is the fourth
+/// instance of the same mistake in this codebase; see `like.rs`.
+pub fn dead_imports(store: &dyn Store, slug: Option<&str>, limit: i64) -> Result<Vec<DeadImport>> {
+    // `CAST(?1 AS TEXT) IS NULL` rather than `?1 IS NULL`: Postgres
+    // infers a parameter's type from its use and `IS NULL` tells it
+    // nothing, so the uncast form is rejected outright. Same fix as
+    // `search.rs`.
+    let rows = store
+        .query(
+            "WITH imports AS (
+               SELECT fe.external_ref AS from_ref, fe.id AS from_id,
+                      te.external_ref AS to_ref,   te.id AS to_id
+                 FROM relations r
+                 JOIN entities fe ON fe.id = r.from_entity_id
+                 JOIN entities te ON te.id = r.to_entity_id
+                WHERE r.kind = 'imports'
+                  AND fe.kind = 'File'
+                  AND te.kind = 'File'
+                  AND (CAST(?1 AS TEXT) IS NULL
+                       OR fe.external_ref LIKE ?1 || '/%' ESCAPE '\\')
+             ),
+             calls AS (
+               SELECT imp.from_ref, imp.to_ref
+                 FROM imports imp
+            LEFT JOIN relations dr_from
+                   ON dr_from.from_entity_id = imp.from_id
+                  AND dr_from.kind = 'defines'
+            LEFT JOIN entities fsym
+                   ON fsym.id = dr_from.to_entity_id
+                  AND fsym.kind = 'Symbol'
+            LEFT JOIN relations cr
+                   ON cr.from_entity_id = fsym.id
+                  AND cr.kind IN ('calls', 'inherits', 'uses')
+            LEFT JOIN entities tsym
+                   ON tsym.id = cr.to_entity_id
+                  AND tsym.kind = 'Symbol'
+            LEFT JOIN relations dr_to
+                   ON dr_to.from_entity_id = imp.to_id
+                  AND dr_to.kind = 'defines'
+                  AND dr_to.to_entity_id = tsym.id
+                GROUP BY imp.from_ref, imp.to_ref
+               HAVING SUM(CASE WHEN dr_to.id IS NOT NULL THEN 1 ELSE 0 END) = 0
+             )
+             SELECT from_ref, to_ref FROM calls
+              ORDER BY from_ref, to_ref
+              LIMIT ?2",
+            &[Value::from(slug.map(escape_like)), Value::from(limit)],
+        )
+        .context("finding dead imports")?;
+
+    rows.iter()
+        .map(|r| {
+            Ok(DeadImport {
+                from_ref: r.get_string(0)?,
+                to_ref: r.get_string(1)?,
+            })
+        })
+        .collect()
+}
+
+/// One archived observation: what an entity's label and authority were
+/// before an update overwrote them.
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub id: i64,
+    pub observed_at: String,
+    pub label: Option<String>,
+    pub prior_label: Option<String>,
+    pub source_authority: Option<String>,
+    pub prior_source_authority: Option<String>,
+}
+
+impl Observation {
+    /// Whether this row recorded a label change. The caller prints the
+    /// before/after only when something moved, so a row that captured
+    /// an unrelated update stays quiet.
+    pub fn label_changed(&self) -> bool {
+        self.prior_label != self.label
+    }
+
+    pub fn authority_changed(&self) -> bool {
+        self.prior_source_authority != self.source_authority
+    }
+}
+
+/// Archived label and authority history for one entity.
+///
+/// `observations_archive` is written by a trigger on every update to
+/// `entities`, capturing the pre-update state. Nothing in this crate
+/// writes it; this reads it.
+///
+/// Addressed by `(entity_kind, entity_ref)` rather than by id, because
+/// the archive outlives the entity — the column is documented as
+/// "FK-ish (entity may have been deleted)" and is not joined here for
+/// that reason. An entity that was deleted and recreated shares the
+/// archive of its predecessor, which is the intended behaviour: the
+/// address is what the history is about.
+///
+/// The `id` tie-break is not decoration. Python orders on
+/// `observed_at DESC` alone and the timestamps tie — the trigger fires
+/// several times within one second, so
+/// `Symbol/templedb:src/gui_pages/projects.py:_file_rows` has 645
+/// archive rows across only 217 distinct timestamps. With a `--limit`,
+/// a tie straddling the cutoff decides *which rows you see at all*, so
+/// leaving it to the planner is the same defect the README records for
+/// `entity search`.
+///
+/// It is `ASC`, against the `DESC` of the column above it, and the data
+/// is why. Rows sharing a second are a causal chain rather than an
+/// unordered set: within `2026-10-02 04:03:11` one row records
+/// `line 1040 → line 503` and the next `line 503 → line 656`. Ascending
+/// reads as that sequence; descending reads as its reverse, where each
+/// line's "before" is the previous line's "after" and the history
+/// appears to run backwards. Symmetry with `observed_at DESC` was the
+/// first instinct here and it was wrong.
+///
+/// It also happens to match Python byte for byte, because a scan of
+/// this table arrives in rowid order. That is a consequence rather
+/// than the reason — the point is that the chain is readable.
+pub fn observations(
+    store: &dyn Store,
+    kind: &str,
+    external_ref: &str,
+    limit: i64,
+) -> Result<Vec<Observation>> {
+    let rows = store
+        .query(
+            "SELECT id, observed_at, label, prior_label,
+                    source_authority, prior_source_authority
+               FROM observations_archive
+              WHERE entity_kind = ?1 AND entity_ref = ?2
+              ORDER BY observed_at DESC, id ASC
+              LIMIT ?3",
+            &[
+                Value::from(kind),
+                Value::from(external_ref),
+                Value::from(limit),
+            ],
+        )
+        .context("reading observation history")?;
+
+    rows.iter()
+        .map(|r| {
+            Ok(Observation {
+                id: r.get_i64(0)?,
+                observed_at: r.get_string(1)?,
+                label: r.get_opt_string(2)?,
+                prior_label: r.get_opt_string(3)?,
+                source_authority: r.get_opt_string(4)?,
+                prior_source_authority: r.get_opt_string(5)?,
+            })
+        })
+        .collect()
+}
+
 /// `(id, label, source_authority, observed_at)` for one entity address.
 fn lookup_entity(
-    conn: &Connection,
+    store: &dyn Store,
     kind: &str,
     external_ref: &str,
 ) -> Result<(i64, Option<String>, String, String)> {
-    conn.query_row(
-        "SELECT id, label, source_authority, observed_at
-           FROM entities WHERE kind = ?1 AND external_ref = ?2",
-        (kind, external_ref),
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )
-    .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => {
-            anyhow::anyhow!("no entity {kind}/{external_ref}")
-        }
-        other => anyhow::Error::new(other),
-    })
+    let row = store
+        .query_opt(
+            "SELECT id, label, source_authority, observed_at
+               FROM entities WHERE kind = ?1 AND external_ref = ?2",
+            &[Value::from(kind), Value::from(external_ref)],
+        )
+        .context("looking up entity")?;
+    let Some(row) = row else {
+        anyhow::bail!("no entity {kind}/{external_ref}");
+    };
+    Ok((
+        row.get_i64(0)?,
+        row.get_opt_string(1)?,
+        row.get_string(2)?,
+        row.get_string(3)?,
+    ))
 }
 
 fn fetch_edges(
-    conn: &Connection,
+    store: &dyn Store,
     id: i64,
     direction: Direction,
     via: &[String],
     limit: Option<i64>,
 ) -> Result<Vec<Edge>> {
-    Ok(fetch_edges_with_ids(conn, id, direction, via, limit)?
+    Ok(fetch_frontier(store, &[id], direction, via, limit)?
+        .remove(&id)
+        .unwrap_or_default()
         .into_iter()
         .map(|(_, e)| e)
         .collect())
 }
 
-/// The one place relation SQL is written. Both directions use the same
-/// projection so `Edge` is populated identically whichever end the peer
-/// sat on; only the join column and the `WHERE` differ.
-fn fetch_edges_with_ids(
-    conn: &Connection,
-    id: i64,
+/// How many anchor ids one query covers.
+///
+/// Bounded because the ids become bind parameters and Postgres caps a
+/// statement at 65,535 of them; a frontier larger than this is split
+/// across several queries. 4,096 keeps the whole walk inside a handful
+/// of round-trips without going near that ceiling.
+const FRONTIER_CHUNK: usize = 4096;
+
+/// The placeholder-count buckets a chunk is padded up to.
+///
+/// Without bucketing, a frontier of 37 nodes and one of 38 would
+/// produce different SQL text, and both backends key their prepared
+/// statement cache on that text — so a BFS whose level sizes all differ
+/// would miss the cache on every level and pay to plan the query again.
+/// Padding to the next bucket gives at most seven distinct statements
+/// per shape instead of one per level size.
+///
+/// Padding is a semantic no-op: the extra slots repeat an id already in
+/// the chunk, and `IN` tests set membership.
+const BUCKETS: [usize; 7] = [1, 4, 16, 64, 256, 1024, FRONTIER_CHUNK];
+
+fn bucket_for(n: usize) -> usize {
+    BUCKETS
+        .into_iter()
+        .find(|&b| b >= n)
+        .unwrap_or(FRONTIER_CHUNK)
+}
+
+/// Edges for every node in `frontier`, grouped by the node they hang
+/// off.
+///
+/// This is the one place relation SQL is written. Both directions use
+/// the same projection so `Edge` is populated identically whichever end
+/// the peer sat on; only the join column and the `WHERE` differ.
+///
+/// # Why a frontier and not a node
+///
+/// The previous version took one node and was called once per visited
+/// node per direction — for `entity paths` exhausting the reachable
+/// component, upwards of a hundred thousand queries. On SQLite that is
+/// a function call into an embedded library and the cost hid inside the
+/// 19 ms the whole search took. On Postgres each one is a socket
+/// round-trip, and the same search cost 59 ms.
+///
+/// Fetching a whole BFS level at a time turns that into one query per
+/// level per direction — around a dozen for a depth-6 walk, plus one
+/// more per [`FRONTIER_CHUNK`] of a wide level. Nothing about the walk
+/// moved into SQL: the visited set, the ordering and the per-node cap
+/// are all still decided here, which is what keeps the output
+/// identical. A recursive CTE would have pushed the traversal into the
+/// database and with it the visited-set and emission-order semantics
+/// that `trace` matches Python on, which is a much larger behavioural
+/// risk for the same latency win.
+///
+/// # Ordering
+///
+/// Per anchor, outbound edges are yielded before inbound ones, because
+/// `Direction::Both` collects the two passes in that order. Within a
+/// pass they are ordered `(r.kind, e.kind, e.external_ref)`. Both
+/// matter: the first decides whether a hop prints as `→` or `←`, and
+/// the second is what makes the fan-out cap reproducible instead of
+/// being whatever the query planner felt like.
+fn fetch_frontier(
+    store: &dyn Store,
+    frontier: &[i64],
     direction: Direction,
     via: &[String],
     limit: Option<i64>,
-) -> Result<Vec<(i64, Edge)>> {
-    let mut rows = Vec::new();
+) -> Result<HashMap<i64, Vec<(i64, Edge)>>> {
+    let mut out: HashMap<i64, Vec<(i64, Edge)>> = HashMap::new();
     if direction.includes_out() {
-        rows.extend(one_direction(
-            conn,
-            id,
+        collect_direction(
+            store,
+            frontier,
             Direction::Out,
             "r.to_entity_id",
             "r.from_entity_id",
             via,
             limit,
-        )?);
+            &mut out,
+        )?;
     }
     if direction.includes_in() {
-        rows.extend(one_direction(
-            conn,
-            id,
+        collect_direction(
+            store,
+            frontier,
             Direction::In,
             "r.from_entity_id",
             "r.to_entity_id",
             via,
             limit,
-        )?);
+            &mut out,
+        )?;
     }
-    Ok(rows)
+    Ok(out)
 }
 
-fn one_direction(
-    conn: &Connection,
-    id: i64,
+/// A `col IN <set>` predicate, plus the parameters that fill it and the
+/// next free placeholder index.
+///
+/// How a set of ids is handed to the server is the one place the two
+/// dialects genuinely differ here, and the fork is worth it because the
+/// alternative was measured and was worse. The first version used the
+/// `IN`-list form for both backends, on the theory that one SQL string
+/// is safer than two — and it made Postgres *slower* than the per-node
+/// version it replaced, 74 ms against 61 ms, because padding a 300-id
+/// level up to a 1,024-placeholder bucket makes the server probe the
+/// index 724 times for ids that are not in the set. (That was not the
+/// whole story: the join was costing more than either form. See
+/// [`collect_direction`].)
+///
+/// Both forms are set membership over the same ids and neither decides
+/// anything about which rows come back or in what order — the ordering
+/// moved to Rust (see [`collect_direction`]) — so this is the kind of
+/// dialect difference that is safe to fork. The cross-backend diff is
+/// what checks the claim.
+fn membership(dialect: Dialect, col: &str, ids: &[i64]) -> (String, usize, Vec<Value>) {
+    match dialect {
+        // One parameter whatever the width, so the SQL text never
+        // changes and the prepared statement is reused on every level.
+        Dialect::Postgres => (
+            format!("{col} = ANY(?1::bigint[])"),
+            2,
+            vec![Value::IntSet(ids.to_vec())],
+        ),
+        // SQLite has no array type, so one placeholder per id, padded
+        // up to a bucket so the statement cache has a handful of
+        // entries rather than one per distinct width. Padding repeats
+        // an id already present and `IN` is set membership, so it adds
+        // no rows.
+        Dialect::Sqlite => {
+            let width = bucket_for(ids.len());
+            let marks: Vec<String> = (1..=width).map(|i| format!("?{i}")).collect();
+            let padded = (0..width)
+                .map(|i| Value::from(ids[i.min(ids.len() - 1)]))
+                .collect();
+            (format!("{col} IN ({})", marks.join(",")), width + 1, padded)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_direction(
+    store: &dyn Store,
+    frontier: &[i64],
     direction: Direction,
     peer_col: &str,
     anchor_col: &str,
     via: &[String],
     limit: Option<i64>,
-) -> Result<Vec<(i64, Edge)>> {
-    // `via` is interpolated as placeholders, never as values — the
-    // relation kinds come from a `--via` flag on the command line.
-    let placeholders = if via.is_empty() {
-        String::new()
-    } else {
-        format!(" AND r.kind IN ({})", vec!["?"; via.len()].join(","))
-    };
-    let sql = format!(
-        "SELECT e.id, r.kind, e.kind, e.external_ref, e.label
-           FROM relations r
-           JOIN entities e ON e.id = {peer_col}
-          WHERE {anchor_col} = ?{placeholders}
-          ORDER BY r.kind, e.kind, e.external_ref
-          {}",
-        match limit {
-            Some(_) => "LIMIT ?",
-            None => "",
+    out: &mut HashMap<i64, Vec<(i64, Edge)>>,
+) -> Result<()> {
+    // Edges and peer details are two queries, not one join, and the
+    // ordering happens here rather than in SQL. Both choices come from
+    // the same measurement.
+    //
+    // The joined form asked Postgres for
+    // `relations JOIN entities ... ORDER BY r.kind, e.kind,
+    // e.external_ref`, and Postgres answered it by sequentially
+    // scanning all 60,719 entities to build a hash table: 22.7 ms of a
+    // 25.4 ms query, against 0.26 ms for the index-only scan that found
+    // the 1,625 edges. The planner is not wrong by its own cost model —
+    // 4,410 estimated index probes do look dearer than one scan of a
+    // small table — it is just that the hash build is the whole cost
+    // and the probes would all have been cache hits. `ANALYZE` and
+    // `random_page_cost = 1.1` were both tried and neither changed the
+    // plan.
+    //
+    // Asking for the edges alone keeps that index-only scan, and
+    // fetching the peers by primary key is the plan the join was trying
+    // to avoid, made explicit. It also fetches each distinct peer once
+    // rather than once per edge pointing at it.
+    //
+    // Sorting in Rust is the part that is better rather than merely
+    // faster. `str`'s ordering is byte ordering, which is exactly what
+    // SQLite's BINARY collation and Postgres's `COLLATE "C"` give, so
+    // the neighbour order is now identical across backends by
+    // construction instead of by two `ORDER BY` clauses agreeing. It
+    // also retires a latent divergence: the engines disagree on where
+    // NULLs sort (SQLite first on ASC, Postgres last), which no amount
+    // of live data would have revealed because no row has a NULL
+    // `external_ref` today.
+    // Accumulated locally, not straight into `out`, because the sort
+    // below must only see this direction's edges. `Direction::Both`
+    // calls this twice and the outbound pass has to stay entirely ahead
+    // of the inbound one: that grouping is what decides whether a hop
+    // prints as `→` or `←`, and sorting the merged list would reorder
+    // across it. Sorting the whole of `out` is exactly the bug the
+    // `paths_direction_and_via_restrict_the_walk` test caught — with
+    // both passes merged first, `installs` sorts ahead of `used-by` and
+    // the reported path changes.
+    let mut mine: HashMap<i64, Vec<(i64, Edge)>> = HashMap::new();
+
+    for chunk in frontier.chunks(FRONTIER_CHUNK) {
+        let (pred, next_param, mut params) = membership(store.dialect(), anchor_col, chunk);
+
+        // Every placeholder is numbered. rusqlite accepts a bare `?`
+        // and would let this file mix the two forms; Postgres has no
+        // anonymous placeholder at all, so `Dialect::bind` rejects one
+        // rather than guessing an index. `via` follows the anchors.
+        let via_clause = if via.is_empty() {
+            String::new()
+        } else {
+            let marks: Vec<String> = (0..via.len())
+                .map(|i| format!("?{}", next_param + i))
+                .collect();
+            format!(" AND r.kind IN ({})", marks.join(","))
+        };
+        for v in via {
+            params.push(Value::from(v.as_str()));
         }
-    );
 
-    let mut params: Vec<rusqlite::types::Value> = vec![id.into()];
-    for v in via {
-        params.push(v.clone().into());
-    }
-    if let Some(n) = limit {
-        params.push(n.into());
-    }
+        let edges = store
+            .query(
+                &format!(
+                    "SELECT {anchor_col}, {peer_col}, r.kind
+                       FROM relations r
+                      WHERE {pred}{via_clause}"
+                ),
+                &params,
+            )
+            .context("fetching relations")?;
+        if edges.is_empty() {
+            continue;
+        }
 
-    // `prepare_cached`, not `prepare`: a BFS calls this once per visited
-    // node per direction — tens of thousands of times for a deep
-    // `entity paths` — while the SQL text varies only over
-    // (direction, via.len(), capped or not), a handful of shapes. Without
-    // the cache the query planner re-runs on every hop.
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let out = stmt
-        .query_map(params_from_iter(params), |r| {
-            Ok((
-                r.get(0)?,
+        // `(anchor, peer, relkind)` with the peer's own columns still
+        // to come.
+        let mut pending: Vec<(i64, i64, String)> = Vec::with_capacity(edges.len());
+        let mut peers: Vec<i64> = Vec::with_capacity(edges.len());
+        for r in &edges {
+            let (anchor, peer) = (r.get_i64(0)?, r.get_i64(1)?);
+            pending.push((anchor, peer, r.get_string(2)?));
+            peers.push(peer);
+        }
+        peers.sort_unstable();
+        peers.dedup();
+
+        let details = fetch_entity_details(store, &peers)?;
+
+        for (anchor, peer, relkind) in pending {
+            // A relation naming an entity that is not there is dropped,
+            // which is what the `JOIN` this replaced did. SQLite does
+            // not enforce foreign keys unless `PRAGMA foreign_keys` is
+            // on, and it is not, so a dangling edge is possible in the
+            // live data rather than merely in theory.
+            let Some((peer_kind, peer_ref, peer_label)) = details.get(&peer) else {
+                continue;
+            };
+            mine.entry(anchor).or_default().push((
+                peer,
                 Edge {
-                    relkind: r.get(1)?,
-                    peer_kind: r.get(2)?,
-                    peer_ref: r.get(3)?,
-                    peer_label: r.get(4)?,
+                    relkind: relkind.clone(),
+                    peer_kind: peer_kind.clone(),
+                    peer_ref: peer_ref.clone(),
+                    peer_label: peer_label.clone(),
                     direction,
                 },
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("fetching relations")?;
+            ));
+        }
+    }
+
+    // Order and cap per anchor, once every chunk of this direction has
+    // contributed. The cap is per node *per direction*, which is what
+    // the `LIMIT` on the old per-node-per-direction query did.
+    //
+    // `sort_by` is stable, but the key is unique anyway:
+    // `UNIQUE(from_entity_id, kind, to_entity_id)` fixes the peer for a
+    // given anchor and relation kind, and `UNIQUE(kind, external_ref)`
+    // fixes the entity, so no two edges off one anchor share
+    // `(relkind, peer_kind, peer_ref)`.
+    for (anchor, mut edges) in mine {
+        edges.sort_by(|(_, a), (_, b)| {
+            (&a.relkind, &a.peer_kind, &a.peer_ref).cmp(&(&b.relkind, &b.peer_kind, &b.peer_ref))
+        });
+        if let Some(n) = limit {
+            edges.truncate(n.max(0) as usize);
+        }
+        out.entry(anchor).or_default().extend(edges);
+    }
+    Ok(())
+}
+
+/// The peer columns an [`Edge`] needs beyond the relation itself:
+/// `(kind, external_ref, label)`.
+type PeerDetail = (String, String, Option<String>);
+
+/// [`PeerDetail`] for a set of entity ids, by primary key.
+///
+/// Separate from the relation query on purpose — see the long note in
+/// [`collect_direction`] — and deduplicated by the caller, so an entity
+/// that twenty edges point at is fetched once.
+fn fetch_entity_details(store: &dyn Store, ids: &[i64]) -> Result<HashMap<i64, PeerDetail>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(FRONTIER_CHUNK) {
+        let (pred, _, params) = membership(store.dialect(), "id", chunk);
+        let rows = store
+            .query(
+                &format!("SELECT id, kind, external_ref, label FROM entities WHERE {pred}"),
+                &params,
+            )
+            .context("fetching entity details")?;
+        for r in &rows {
+            out.insert(
+                r.get_i64(0)?,
+                (r.get_string(1)?, r.get_string(2)?, r.get_opt_string(3)?),
+            );
+        }
+    }
     Ok(out)
 }
 
@@ -565,6 +1009,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(both.len(), 4);
+    }
+
+    /// Multiple `--via` values mean multiple placeholders, which is the
+    /// case that catches an off-by-one in the numbering: the `LIMIT`
+    /// parameter has to land after the last `via` one. With the index
+    /// wrong, SQLite binds a relation kind as the limit and returns
+    /// nothing.
+    #[test]
+    fn via_and_limit_placeholders_are_numbered_consistently() {
+        let c = testdb::fixture();
+        let hits = trace(
+            &c,
+            "Machine",
+            "box1",
+            1,
+            Direction::Out,
+            &[
+                "ran".to_string(),
+                "installs".to_string(),
+                "used-by".to_string(),
+            ],
+            2,
+        )
+        .unwrap();
+        // Three `via` values, so the limit is `?5`; the cap of 2 has to
+        // still apply to box1's three `ran` edges.
+        assert_eq!(hits.len(), 2, "{hits:?}");
     }
 
     fn refs(hits: &[EntityMatch]) -> Vec<&str> {
@@ -813,13 +1284,13 @@ mod tests {
             c.execute(
                 "INSERT INTO entities (kind, external_ref, source_authority, label, observed_at)
                  VALUES ('Generation', ?1, 'nix', NULL, '2026-10-01 00:00:00')",
-                [format!("bulk-{i:03}")],
+                &[Value::from(format!("bulk-{i:03}"))],
             )
             .unwrap();
             c.execute(
                 "INSERT INTO relations (from_entity_id, to_entity_id, kind, source_authority)
                  VALUES (1, last_insert_rowid(), 'ran', 'nix')",
-                [],
+                &[],
             )
             .unwrap();
         }
@@ -833,6 +1304,279 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path_of(&r), ["ran:Generation/bulk-149"]);
+    }
+
+    /// Padding rounds up to a bucket, never down — truncating would
+    /// silently drop anchors from the level and turn a reachable node
+    /// into an unreachable one, which is the same class of bug as
+    /// Python's fan-out cap.
+    #[test]
+    fn frontier_buckets_round_up_and_are_bounded() {
+        assert_eq!(bucket_for(1), 1);
+        assert_eq!(bucket_for(2), 4);
+        assert_eq!(bucket_for(4), 4);
+        assert_eq!(bucket_for(5), 16);
+        assert_eq!(bucket_for(1024), 1024);
+        assert_eq!(bucket_for(1025), FRONTIER_CHUNK);
+        // A chunk is never larger than the chunker produces, so the
+        // bind-parameter count stays well under Postgres's 65,535.
+        assert_eq!(bucket_for(FRONTIER_CHUNK), FRONTIER_CHUNK);
+        for n in 1..=FRONTIER_CHUNK {
+            assert!(bucket_for(n) >= n, "bucket_for({n}) truncates");
+        }
+    }
+
+    /// The batched fetch has to give every anchor in the frontier its
+    /// own edges, and give an anchor with none no entry at all rather
+    /// than someone else's. A single mis-grouped row would show up as a
+    /// path through an edge that does not exist.
+    #[test]
+    fn a_batched_frontier_groups_edges_by_their_own_anchor() {
+        let c = testdb::fixture();
+        // box1=1 (3 outbound), gen-1=2 (1 outbound), gen-2=3 (none),
+        // sp1=5 (1 outbound), and 99 does not exist.
+        let batch = fetch_frontier(&c, &[1, 2, 3, 5, 99], Direction::Out, &[], None).unwrap();
+        assert_eq!(batch.get(&1).map_or(0, Vec::len), 3);
+        assert_eq!(batch.get(&2).map_or(0, Vec::len), 1);
+        assert_eq!(batch.get(&3).map_or(0, Vec::len), 0);
+        assert_eq!(batch.get(&5).map_or(0, Vec::len), 1);
+        assert_eq!(batch.get(&99).map_or(0, Vec::len), 0);
+        // gen-1's single outbound edge is `installs` to sp1, not one of
+        // box1's three `ran` edges.
+        assert_eq!(batch[&2][0].1.relkind, "installs");
+    }
+
+    /// Batching must not change the per-node cap into a per-level cap.
+    /// box1 has three outbound edges and gen-1 has one; with a cap of
+    /// 2, a level-wide `LIMIT 2` would return two rows total.
+    #[test]
+    fn the_fanout_cap_is_per_node_not_per_level() {
+        let c = testdb::fixture();
+        let batch = fetch_frontier(&c, &[1, 2], Direction::Out, &[], Some(2)).unwrap();
+        assert_eq!(batch[&1].len(), 2, "box1 should be capped at 2");
+        assert_eq!(batch[&2].len(), 1, "gen-1 has only 1 and keeps it");
+        // And the cap still takes the first two by the declared order.
+        let refs: Vec<&str> = batch[&1].iter().map(|(_, e)| e.peer_ref.as_str()).collect();
+        assert_eq!(refs, ["gen-1", "gen-2"]);
+    }
+
+    /// Padding a chunk repeats an id, and `IN` is set membership, so a
+    /// duplicated anchor must not duplicate its edges. A frontier of 3
+    /// pads to the bucket of 4.
+    #[test]
+    fn padding_the_bucket_does_not_duplicate_edges() {
+        let c = testdb::fixture();
+        let batch = fetch_frontier(&c, &[1, 2, 5], Direction::Out, &[], None).unwrap();
+        assert_eq!(batch[&1].len(), 3);
+        assert_eq!(batch[&2].len(), 1);
+        assert_eq!(batch[&5].len(), 1);
+    }
+
+    /// A frontier wider than one chunk has to be split and re-merged
+    /// without losing or double-counting anyone. 150 nodes against a
+    /// chunk size of 4,096 would never split, so the chunking is
+    /// exercised by walking the ids in slices here instead — the same
+    /// `collect_direction` loop, driven past its boundary.
+    #[test]
+    fn a_frontier_wider_than_a_chunk_is_split_and_remerged() {
+        let c = testdb::fixture();
+        for i in 0..150 {
+            c.execute(
+                "INSERT INTO entities (kind, external_ref, source_authority, label, observed_at)
+                 VALUES ('Generation', ?1, 'nix', NULL, '2026-10-01 00:00:00')",
+                &[Value::from(format!("wide-{i:03}"))],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO relations (from_entity_id, to_entity_id, kind, source_authority)
+                 VALUES (1, last_insert_rowid(), 'ran', 'nix')",
+                &[],
+            )
+            .unwrap();
+        }
+        // box1 now has 153 outbound edges; fetched in one batch they
+        // must all arrive, and the walk must see every one of them.
+        let batch = fetch_frontier(&c, &[1], Direction::Out, &[], None).unwrap();
+        assert_eq!(batch[&1].len(), 153);
+
+        let hits = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 500).unwrap();
+        assert_eq!(hits.len(), 153);
+        let mut peers: Vec<_> = hits.iter().map(|h| h.edge.peer_ref.clone()).collect();
+        peers.sort();
+        peers.dedup();
+        assert_eq!(peers.len(), 153, "a peer was reported twice");
+    }
+
+    /// The two engines disagree on where NULLs sort by default —
+    /// SQLite first on ASC, Postgres last — and `external_ref` is
+    /// nullable. `NULLS FIRST` is declared explicitly so the backends
+    /// agree; this pins the SQLite behaviour that was there first.
+    ///
+    /// No row in the live database has a NULL `external_ref`, so the
+    /// cross-backend diff cannot catch a regression here. This test is
+    /// the only thing that can.
+    #[test]
+    fn a_null_external_ref_sorts_first_in_search() {
+        let c = testdb::fixture();
+        c.execute(
+            "INSERT INTO entities (kind, external_ref, source_authority, label, observed_at)
+             VALUES ('Zephyr', NULL, 'nix', 'nullref o', '2026-10-03 00:00:00')",
+            &[],
+        )
+        .unwrap();
+        let hits = search_entities(&c, "o", None, 30).unwrap();
+        // Newest first puts the 2026-10-03 row ahead of everything, and
+        // its NULL ref must render as absent rather than as "None".
+        assert_eq!(hits[0].kind, "Zephyr");
+        assert_eq!(hits[0].external_ref, None);
+
+        // Within one timestamp, a NULL ref sorts before a present one.
+        c.execute(
+            "INSERT INTO entities (kind, external_ref, source_authority, label, observed_at)
+             VALUES ('Zephyr', 'zzz-o', 'nix', NULL, '2026-10-03 00:00:00')",
+            &[],
+        )
+        .unwrap();
+        let hits = search_entities(&c, "o", None, 30).unwrap();
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.kind == "Zephyr")
+                .map(|h| h.external_ref.clone())
+                .collect::<Vec<_>>(),
+            [None, Some("zzz-o".to_string())]
+        );
+    }
+
+    fn dead(hits: &[DeadImport]) -> Vec<String> {
+        hits.iter()
+            .map(|h| format!("{} -> {}", h.from_ref, h.to_ref))
+            .collect()
+    }
+
+    /// The three shapes the query distinguishes. `app.py -> used.py` is
+    /// bridged by `caller` calling `callee` and must not be reported;
+    /// `app.py -> dead.py` has symbols on both ends and no call between
+    /// them; `bare.py -> used.py` has no symbols on the source side at
+    /// all, which is the case the chain of `LEFT JOIN`s exists for.
+    #[test]
+    fn dead_imports_reports_only_unbridged_edges() {
+        let c = testdb::fixture_with_imports();
+        assert_eq!(
+            dead(&dead_imports(&c, None, 50).unwrap()),
+            [
+                "proj_a/app.py -> proj_a/dead.py",
+                "proj_a/bare.py -> proj_a/used.py",
+                "projxa/app.py -> projxa/dead.py",
+            ]
+        );
+    }
+
+    /// `--slug` must be a literal prefix. `proj_a` and `projxa` differ
+    /// only in the character Python's unescaped filter would treat as a
+    /// wildcard, so without the escape the first would pull in the
+    /// second's import too.
+    #[test]
+    fn dead_imports_slug_underscore_is_literal() {
+        let c = testdb::fixture_with_imports();
+        assert_eq!(
+            dead(&dead_imports(&c, Some("proj_a"), 50).unwrap()),
+            [
+                "proj_a/app.py -> proj_a/dead.py",
+                "proj_a/bare.py -> proj_a/used.py",
+            ]
+        );
+        assert_eq!(
+            dead(&dead_imports(&c, Some("projxa"), 50).unwrap()),
+            ["projxa/app.py -> projxa/dead.py"]
+        );
+        // A slug that matches nothing is empty, not everything — the
+        // `CAST(?1 AS TEXT) IS NULL` branch must not fire for a value
+        // that is merely absent from the data.
+        assert!(dead_imports(&c, Some("nosuch"), 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dead_imports_respects_the_limit_in_a_stable_order() {
+        let c = testdb::fixture_with_imports();
+        assert_eq!(
+            dead(&dead_imports(&c, None, 1).unwrap()),
+            ["proj_a/app.py -> proj_a/dead.py"]
+        );
+    }
+
+    /// A database with no `imports` edges at all answers empty rather
+    /// than erroring on the CTE.
+    #[test]
+    fn dead_imports_on_a_graph_with_no_imports_is_empty() {
+        let c = testdb::fixture();
+        assert!(dead_imports(&c, None, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn observations_are_newest_first_with_a_total_order() {
+        let c = testdb::fixture();
+        let rows = observations(&c, "Machine", "box1", 50).unwrap();
+        // 2026-10-03 has three rows; `id ASC` orders them 3, 4, 5
+        // where Python leaves the three to the planner.
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [3, 4, 5, 2, 1]
+        );
+    }
+
+    /// The tie-break is what makes `--limit` mean something. With three
+    /// rows sharing a timestamp, a limit of 2 has to cut the same two
+    /// every run.
+    #[test]
+    fn observations_limit_cuts_a_tie_deterministically() {
+        let c = testdb::fixture();
+        let rows = observations(&c, "Machine", "box1", 2).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [3, 4]);
+    }
+
+    /// Each change is reported only when that field actually moved: row
+    /// 2 changed only the authority, row 4 only the label.
+    #[test]
+    fn observations_distinguish_label_from_authority_changes() {
+        let c = testdb::fixture();
+        let rows = observations(&c, "Machine", "box1", 50).unwrap();
+        let by_id = |id: i64| rows.iter().find(|r| r.id == id).unwrap();
+
+        let authority_only = by_id(2);
+        assert!(!authority_only.label_changed());
+        assert!(authority_only.authority_changed());
+
+        let label_only = by_id(4);
+        assert!(label_only.label_changed());
+        assert!(!label_only.authority_changed());
+
+        // Row 3 moved neither; it captured some other update.
+        assert!(!by_id(3).label_changed());
+        assert!(!by_id(3).authority_changed());
+    }
+
+    /// A NULL label is a change from a present one and must survive as
+    /// `None` rather than becoming an empty string, because the caller
+    /// renders it as Python's bare `None`.
+    #[test]
+    fn observations_keep_a_null_label_null() {
+        let c = testdb::fixture();
+        let rows = observations(&c, "Machine", "box1", 50).unwrap();
+        let cleared = rows.iter().find(|r| r.id == 5).unwrap();
+        assert_eq!(cleared.label, None);
+        assert_eq!(cleared.prior_label.as_deref(), Some("box one"));
+        assert!(cleared.label_changed());
+    }
+
+    #[test]
+    fn observations_for_an_unarchived_entity_are_empty() {
+        let c = testdb::fixture();
+        assert!(observations(&c, "Machine", "nope", 50).unwrap().is_empty());
+        // The archive is addressed by kind and ref, so the right ref
+        // under the wrong kind is also empty.
+        assert!(observations(&c, "Generation", "box1", 50)
+            .unwrap()
+            .is_empty());
     }
 
     /// A cycle must terminate. `sp1 -used-by-> box1` closes the loop

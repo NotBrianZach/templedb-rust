@@ -40,6 +40,16 @@
             # the parity work gets done.
             sqlite
 
+            # The reference oracle, not a build input either. The
+            # implementation this port is diffed against is written in
+            # Python, and `crates/templedb-db/tests/difflib_parity.rs`
+            # drives `difflib` directly to check the SequenceMatcher
+            # port against the real thing. Plain `python3` with no
+            # packages: difflib is in the standard library, and the
+            # version matters less than having one at all — difflib's
+            # algorithm has been stable for many releases.
+            python3
+
             git
             just
           ];

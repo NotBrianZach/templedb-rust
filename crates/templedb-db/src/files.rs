@@ -1,8 +1,9 @@
 //! `templedb file ...` reads.
 
 use crate::like::escape_like;
+use crate::store::Store;
+use crate::value::Value;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -11,32 +12,39 @@ pub struct FileEntry {
 }
 
 /// Active files under `prefix` for a project, with line counts.
-pub fn list_files(conn: &Connection, slug: &str, prefix: &str) -> Result<Vec<FileEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT pf.file_path, COALESCE(fc.line_count, 0)
-           FROM project_files pf
-           JOIN projects p ON p.id = pf.project_id
-      LEFT JOIN file_contents fc
-             ON fc.file_id = pf.id AND fc.is_current = 1
-          WHERE p.slug = ?1
-            AND pf.status = 'active'
-            AND pf.file_path LIKE ?2 || '%' ESCAPE '\\'
-          ORDER BY pf.file_path",
-    )?;
+///
+/// `?2 || '%'` concatenates in both dialects, and both treat `ESCAPE`
+/// on `LIKE` the same way — neither has a default escape character, so
+/// the clause is required rather than optional in both.
+pub fn list_files(store: &dyn Store, slug: &str, prefix: &str) -> Result<Vec<FileEntry>> {
     // The prefix is a literal path fragment, not a pattern: `_` is in
     // half the slugs in this database (`proj_a`, `system_config`) and
     // LIKE would treat it as "any character", so `file ls x proj_a`
     // would also list `proj-a`. Escape the three LIKE metacharacters
-    // and declare the escape above.
-    let pattern = escape_like(prefix);
-    let rows = stmt.query_map((slug, pattern), |r| {
-        Ok(FileEntry {
-            path: r.get(0)?,
-            lines: r.get(1)?,
+    // and declare the escape in the SQL.
+    let rows = store
+        .query(
+            "SELECT pf.file_path, COALESCE(fc.line_count, 0)
+               FROM project_files pf
+               JOIN projects p ON p.id = pf.project_id
+          LEFT JOIN file_contents fc
+                 ON fc.file_id = pf.id AND fc.is_current = 1
+              WHERE p.slug = ?1
+                AND pf.status = 'active'
+                AND pf.file_path LIKE ?2 || '%' ESCAPE '\\'
+              ORDER BY pf.file_path",
+            &[Value::from(slug), Value::from(escape_like(prefix))],
+        )
+        .context("listing files")?;
+
+    rows.iter()
+        .map(|r| {
+            Ok(FileEntry {
+                path: r.get_string(0)?,
+                lines: r.get_i64(1)?,
+            })
         })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("listing files")
+        .collect()
 }
 
 /// Current contents of one tracked file.
@@ -46,27 +54,26 @@ pub fn list_files(conn: &Connection, slug: &str, prefix: &str) -> Result<Vec<Fil
 /// shape is what `reports.py` uses. `content_text` is NULL for binary
 /// blobs, which is reported as an error rather than an empty file —
 /// silently printing nothing for a PNG is how you lose an afternoon.
-pub fn read_file(conn: &Connection, slug: &str, path: &str) -> Result<String> {
-    let mut stmt = conn.prepare(
-        "SELECT cb.content_text
-           FROM project_files pf
-           JOIN projects p ON p.id = pf.project_id
-           JOIN file_contents fc
-             ON fc.file_id = pf.id AND fc.is_current = 1
-           JOIN content_blobs cb ON cb.hash_sha256 = fc.content_hash
-          WHERE p.slug = ?1 AND pf.file_path = ?2 AND pf.status = 'active'",
-    )?;
-    let text: Option<Option<String>> = stmt
-        .query_row((slug, path), |r| r.get(0))
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
-    match text {
+pub fn read_file(store: &dyn Store, slug: &str, path: &str) -> Result<String> {
+    let row = store
+        .query_opt(
+            "SELECT cb.content_text
+               FROM project_files pf
+               JOIN projects p ON p.id = pf.project_id
+               JOIN file_contents fc
+                 ON fc.file_id = pf.id AND fc.is_current = 1
+               JOIN content_blobs cb ON cb.hash_sha256 = fc.content_hash
+              WHERE p.slug = ?1 AND pf.file_path = ?2 AND pf.status = 'active'",
+            &[Value::from(slug), Value::from(path)],
+        )
+        .context("reading file")?;
+
+    match row {
         None => anyhow::bail!("{slug}: no active file at {path}"),
-        Some(None) => anyhow::bail!("{slug}: {path} has no text content (binary blob?)"),
-        Some(Some(s)) => Ok(s),
+        Some(r) => match r.get_opt_string(0)? {
+            None => anyhow::bail!("{slug}: {path} has no text content (binary blob?)"),
+            Some(s) => Ok(s),
+        },
     }
 }
 

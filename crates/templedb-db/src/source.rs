@@ -8,10 +8,17 @@
 //! `content_hash` whose blob is gone — and `vcs_file_states.content_hash`
 //! is itself nullable, which is how a `deleted` change type is recorded.
 //! Both cases are handled explicitly here; see `SnapshotBody`.
+//!
+//! Every query here is portable as written. `UNION ALL`, `UPPER`, `||`
+//! and `LIKE ... ESCAPE` mean the same thing to both engines, and so
+//! does the `(revision = 'current') DESC` sort key: SQLite yields 1/0
+//! and Postgres a boolean, and `DESC` puts the true case first either
+//! way.
 
 use crate::like::escape_like;
+use crate::store::Store;
+use crate::value::{Row, Value};
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 /// Metadata for one snapshot. Deliberately does not carry the content:
 /// `--meta` has no use for a 5 MB blob, and the body is fetched
@@ -51,44 +58,41 @@ pub enum SnapshotBody {
 /// case-insensitively by prefix, newest first, because the hashes are
 /// bimodal in case and length and the user types whatever prefix they
 /// saw in `vcs log`.
-pub fn snapshot(conn: &Connection, slug: &str, path: &str, rev: Option<&str>) -> Result<Snapshot> {
+pub fn snapshot(store: &dyn Store, slug: &str, path: &str, rev: Option<&str>) -> Result<Snapshot> {
     let row = match rev {
-        None | Some("current") => conn
-            .query_row(
-                "SELECT revision, content_hash, file_size_bytes, line_count,
-                        observed_at, source_authority
-                   FROM source_snapshots
-                  WHERE project_slug = ?1
-                    AND file_path = ?2
-                    AND revision = 'current'
-                  LIMIT 1",
-                (slug, path),
-                read_snapshot_row,
-            )
-            .optional_row()?,
-        Some(r) => conn
-            .query_row(
-                // The prefix is escaped for LIKE: a commit hash is hex,
-                // but the user's input is not validated anywhere and a
-                // `%` would otherwise match every revision and silently
-                // return the newest one.
-                "SELECT revision, content_hash, file_size_bytes, line_count,
-                        observed_at, source_authority
-                   FROM source_snapshots
-                  WHERE project_slug = ?1
-                    AND file_path = ?2
-                    AND revision != 'current'
-                    AND UPPER(revision) LIKE UPPER(?3) || '%' ESCAPE '\\'
-                  ORDER BY observed_at DESC, revision
-                  LIMIT 1",
-                (slug, path, escape_like(r)),
-                read_snapshot_row,
-            )
-            .optional_row()?,
+        None | Some("current") => store.query_opt(
+            "SELECT revision, content_hash, file_size_bytes, line_count,
+                    observed_at, source_authority
+               FROM source_snapshots
+              WHERE project_slug = ?1
+                AND file_path = ?2
+                AND revision = 'current'
+              LIMIT 1",
+            &[Value::from(slug), Value::from(path)],
+        )?,
+        Some(r) => store.query_opt(
+            // The prefix is escaped for LIKE: a commit hash is hex,
+            // but the user's input is not validated anywhere and a
+            // `%` would otherwise match every revision and silently
+            // return the newest one.
+            "SELECT revision, content_hash, file_size_bytes, line_count,
+                    observed_at, source_authority
+               FROM source_snapshots
+              WHERE project_slug = ?1
+                AND file_path = ?2
+                AND revision != 'current'
+                AND UPPER(revision) LIKE UPPER(?3) || '%' ESCAPE '\\'
+              ORDER BY observed_at DESC, revision
+              LIMIT 1",
+            &[
+                Value::from(slug),
+                Value::from(path),
+                Value::from(escape_like(r)),
+            ],
+        )?,
     };
 
-    let Some((revision, content_hash, file_size_bytes, line_count, observed_at, authority)) = row
-    else {
+    let Some(row) = row else {
         match rev {
             Some(r) => anyhow::bail!(
                 "no snapshot for {slug}/{path} at revision {r:?} \
@@ -104,12 +108,12 @@ pub fn snapshot(conn: &Connection, slug: &str, path: &str, rev: Option<&str>) ->
     Ok(Snapshot {
         project_slug: slug.to_string(),
         file_path: path.to_string(),
-        revision: normalise_revision(&revision),
-        content_hash,
-        file_size_bytes,
-        line_count,
-        observed_at,
-        source_authority: authority,
+        revision: normalise_revision(&row.get_string(0)?),
+        content_hash: row.get_opt_string(1)?,
+        file_size_bytes: row.get_opt_i64(2)?,
+        line_count: row.get_opt_i64(3)?,
+        observed_at: row.get_string(4)?,
+        source_authority: row.get_string(5)?,
     })
 }
 
@@ -120,7 +124,7 @@ pub fn snapshot(conn: &Connection, slug: &str, path: &str, rev: Option<&str>) ->
 /// and writes nothing with exit status 0, so a missing blob is
 /// indistinguishable from an empty file — the single worst outcome for
 /// a command whose output gets piped into `sha256sum` or a patch.
-pub fn snapshot_body(conn: &Connection, snap: &Snapshot) -> Result<SnapshotBody> {
+pub fn snapshot_body(store: &dyn Store, snap: &Snapshot) -> Result<SnapshotBody> {
     let Some(hash) = snap.content_hash.as_deref() else {
         anyhow::bail!(
             "{}/{} at {} records no content hash \
@@ -130,16 +134,15 @@ pub fn snapshot_body(conn: &Connection, snap: &Snapshot) -> Result<SnapshotBody>
             snap.revision
         );
     };
-    let row: Option<(Option<String>, Option<Vec<u8>>, String)> = conn
-        .query_row(
+    let row: Option<Row> = store
+        .query_opt(
             "SELECT content_text, content_blob, content_type
                FROM content_blobs WHERE hash_sha256 = ?1",
-            [hash],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            &[Value::from(hash)],
         )
-        .optional_row()?;
+        .context("fetching blob")?;
 
-    let Some((text, blob, content_type)) = row else {
+    let Some(row) = row else {
         anyhow::bail!(
             "{}/{} at {}: blob {} is not in content_blobs \
              (pruned or never ingested)",
@@ -149,6 +152,10 @@ pub fn snapshot_body(conn: &Connection, snap: &Snapshot) -> Result<SnapshotBody>
             &hash[..hash.len().min(12)]
         );
     };
+
+    let text = row.get_opt_string(0)?;
+    let blob = row.get_opt_blob(1)?;
+    let content_type = row.get_string(2)?;
 
     // `content_type` is advisory; the columns are the truth. Text first,
     // matching the Python precedence, so a row mislabelled 'binary' that
@@ -179,32 +186,37 @@ pub struct Revision {
 
 /// Every known revision of a file, newest first — the prelude to
 /// `snapshot --rev`.
-pub fn revisions(conn: &Connection, slug: &str, path: &str) -> Result<Vec<Revision>> {
-    let mut stmt = conn.prepare(
-        // The tie-breaks are not decoration. A commit and the current
-        // state routinely share an `observed_at` to the second — the
-        // commit is what produced the current state — and Python orders
-        // on `observed_at DESC` alone, so which of the two prints first
-        // is up to the query planner. `current` wins a tie because it
-        // is the state the file is actually in; `revision` breaks the
-        // rest so two runs agree.
-        "SELECT revision, content_hash, observed_at, file_size_bytes, line_count
-           FROM source_snapshots
-          WHERE project_slug = ?1 AND file_path = ?2
-          ORDER BY observed_at DESC, (revision = 'current') DESC, revision",
-    )?;
-    let rows = stmt.query_map((slug, path), |r| {
-        Ok(Revision {
-            revision: normalise_revision(&r.get::<_, String>(0)?),
-            content_hash: r.get(1)?,
-            observed_at: r.get(2)?,
-            file_size_bytes: r.get(3)?,
-            line_count: r.get(4)?,
-        })
-    })?;
-    let out = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
+pub fn revisions(store: &dyn Store, slug: &str, path: &str) -> Result<Vec<Revision>> {
+    let rows = store
+        .query(
+            // The tie-breaks are not decoration. A commit and the current
+            // state routinely share an `observed_at` to the second — the
+            // commit is what produced the current state — and Python orders
+            // on `observed_at DESC` alone, so which of the two prints first
+            // is up to the query planner. `current` wins a tie because it
+            // is the state the file is actually in; `revision` breaks the
+            // rest so two runs agree.
+            "SELECT revision, content_hash, observed_at, file_size_bytes, line_count
+               FROM source_snapshots
+              WHERE project_slug = ?1 AND file_path = ?2
+              ORDER BY observed_at DESC, (revision = 'current') DESC, revision",
+            &[Value::from(slug), Value::from(path)],
+        )
         .context("listing revisions")?;
+
+    let out: Vec<Revision> = rows
+        .iter()
+        .map(|r| {
+            Ok(Revision {
+                revision: normalise_revision(&r.get_string(0)?),
+                content_hash: r.get_opt_string(1)?,
+                observed_at: r.get_string(2)?,
+                file_size_bytes: r.get_opt_i64(3)?,
+                line_count: r.get_opt_i64(4)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+
     if out.is_empty() {
         anyhow::bail!("no snapshots for {slug}/{path}");
     }
@@ -216,44 +228,6 @@ fn normalise_revision(raw: &str) -> String {
         raw.to_string()
     } else {
         raw.to_lowercase()
-    }
-}
-
-#[allow(clippy::type_complexity)]
-fn read_snapshot_row(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(
-    String,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-    String,
-    String,
-)> {
-    Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-    ))
-}
-
-/// `QueryReturnedNoRows` means "absent", not "broken". rusqlite has
-/// `OptionalExtension` for this; a local trait keeps the import list
-/// from suggesting the whole extension surface is in use.
-trait OptionalRow<T> {
-    fn optional_row(self) -> rusqlite::Result<Option<T>>;
-}
-
-impl<T> OptionalRow<T> for rusqlite::Result<T> {
-    fn optional_row(self) -> rusqlite::Result<Option<T>> {
-        match self {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
     }
 }
 
@@ -311,7 +285,12 @@ mod tests {
         let c = testdb::fixture();
         let revs = revisions(&c, "alpha", "src/main.rs").unwrap();
         let names: Vec<_> = revs.iter().map(|r| r.revision.as_str()).collect();
-        assert_eq!(names, vec!["current", "abcd1234efff"]);
+        // `current` first, then the commits newest-first: C2
+        // (2026-02-02), C1 (2026-02-01), ABCD1234EFFF (2026-01-01).
+        // Three historical rows rather than one, since the `vcs show`
+        // diff fixtures gave this file real history — which is what
+        // makes the descending order worth asserting at all.
+        assert_eq!(names, vec!["current", "c2", "c1", "abcd1234efff"]);
         assert!(revisions(&c, "alpha", "nope.txt").is_err());
     }
 

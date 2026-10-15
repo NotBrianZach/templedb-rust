@@ -1,5 +1,6 @@
-//! Differential test of [`templedb_db::unified_diff`] against CPython's
-//! `difflib`, which is the implementation it exists to match.
+//! Differential test of [`templedb_db::unified_diff`] and
+//! [`templedb_db::context_diff`] against CPython's `difflib`, which is
+//! the implementation they exist to match.
 //!
 //! # Why this is a separate test and `#[ignore]`d
 //!
@@ -47,8 +48,15 @@ const SEP: &str = "===SEP===";
 /// The oracle. Mirrors templedb's call exactly: `splitlines()` without
 /// keepends, `lineterm=''`, `n=3`, and difflib's defaults for `isjunk`
 /// (none) and `autojunk` (on).
+///
+/// The renderer is read from `argv[1]` so one script serves both
+/// `unified_diff` and `context_diff`. They take identical arguments,
+/// which is the whole reason `--side-by-side` cost a formatter and not
+/// an algorithm — and asking CPython the same question twice is how that
+/// claim is checked rather than assumed.
 const ORACLE: &str = r#"
 import sys, difflib
+render = getattr(difflib, sys.argv[1])
 CASE, SEP = "===CASE===", "===SEP==="
 blob = sys.stdin.read()
 cases = blob.split(CASE + "\n")[1:]
@@ -58,8 +66,8 @@ for case in cases:
     # The trailing newline the harness adds to delimit the section is
     # not part of the content; splitlines ignores it either way.
     a, b = a_text.splitlines(), b_text.splitlines()
-    out.append(list(difflib.unified_diff(a, b, fromfile="old",
-                                         tofile="new", lineterm="")))
+    out.append(list(render(a, b, fromfile="old", tofile="new",
+                           lineterm="")))
 for lines in out:
     sys.stdout.write(CASE + "\n")
     for l in lines:
@@ -175,8 +183,9 @@ fn join(lines: &[&str]) -> String {
     s
 }
 
-/// Ask CPython for the diff of every case, in order.
-fn oracle(cases: &[(String, String)]) -> Vec<Vec<String>> {
+/// Ask CPython for the diff of every case, in order, through the named
+/// `difflib` renderer.
+fn oracle(cases: &[(String, String)], render: &str) -> Vec<Vec<String>> {
     let mut input = String::new();
     for (a, b) in cases {
         input.push_str(CASE);
@@ -190,6 +199,7 @@ fn oracle(cases: &[(String, String)]) -> Vec<Vec<String>> {
     let mut child = Command::new("python3")
         .arg("-c")
         .arg(ORACLE)
+        .arg(render)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -210,26 +220,42 @@ fn oracle(cases: &[(String, String)]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Run every case through both implementations and compare.
+/// Run every case through both renderers and compare each against
+/// CPython.
+///
+/// Both, not just the unified one, because the two share the matcher and
+/// the hunk grouping but not the line format — and the line format is
+/// where the differences hide. A context range names both endpoints
+/// rather than a start and a length, and a hunk with no changes on one
+/// side prints that side's header with nothing under it. Neither is
+/// visible through `unified_diff`.
 fn compare(cases: Vec<(String, String)>, label: &str) {
-    let expected = oracle(&cases);
-    assert_eq!(
-        expected.len(),
-        cases.len(),
-        "{label}: the oracle returned {} diffs for {} cases",
-        expected.len(),
-        cases.len()
-    );
-
-    for (i, ((a_text, b_text), want)) in cases.iter().zip(&expected).enumerate() {
-        let a = templedb_db::splitlines(a_text);
-        let b = templedb_db::splitlines(b_text);
-        let got = templedb_db::unified_diff(&a, &b, "old", "new", 3);
+    for (render, name) in [
+        (
+            templedb_db::unified_diff as fn(&[&str], &[&str], &str, &str, usize) -> Vec<String>,
+            "unified_diff",
+        ),
+        (templedb_db::context_diff, "context_diff"),
+    ] {
+        let expected = oracle(&cases, name);
         assert_eq!(
-            &got, want,
-            "{label}: case {i} disagrees with CPython difflib\n\
-             --- a ---\n{a_text}\n--- b ---\n{b_text}"
+            expected.len(),
+            cases.len(),
+            "{label}/{name}: the oracle returned {} diffs for {} cases",
+            expected.len(),
+            cases.len()
         );
+
+        for (i, ((a_text, b_text), want)) in cases.iter().zip(&expected).enumerate() {
+            let a = templedb_db::splitlines(a_text);
+            let b = templedb_db::splitlines(b_text);
+            let got = render(&a, &b, "old", "new", 3);
+            assert_eq!(
+                &got, want,
+                "{label}/{name}: case {i} disagrees with CPython difflib\n\
+                 --- a ---\n{a_text}\n--- b ---\n{b_text}"
+            );
+        }
     }
 }
 

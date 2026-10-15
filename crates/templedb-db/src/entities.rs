@@ -7,22 +7,60 @@ use crate::value::Value;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
-/// Entity counts by kind — the cheapest useful probe of the graph, and
-/// a direct cross-check against `templedb entity stats`.
+/// Both halves of `entity stats`: counts by kind for `entities` and for
+/// `relations`.
+///
+/// Python prints both sections — an earlier revision of this port read
+/// only `entities` and silently dropped the second half, so the command
+/// agreed on every number it printed and omitted nineteen of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphStats {
+    pub entities: Vec<(String, i64)>,
+    pub relations: Vec<(String, i64)>,
+}
+
+impl GraphStats {
+    /// Python counts the table rather than summing the groups
+    /// (`SELECT COUNT(*) FROM entities`). The two agree — `GROUP BY
+    /// kind` partitions the table and `kind` is `NOT NULL` — so this
+    /// sums instead of issuing two more queries.
+    pub fn entity_total(&self) -> i64 {
+        self.entities.iter().map(|(_, n)| n).sum()
+    }
+    pub fn relation_total(&self) -> i64 {
+        self.relations.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Entity and relation counts by kind — the cheapest useful probe of the
+/// graph, and a direct cross-check against `templedb entity stats`.
 ///
 /// `ORDER BY 2 DESC` sorts by output ordinal, which both dialects
 /// accept; `COUNT(*)` is an integer in SQLite and `bigint` in Postgres,
 /// and both narrow to `Value::Int`.
-pub fn entity_stats(store: &dyn Store) -> Result<Vec<(String, i64)>> {
-    let rows = store
-        .query(
-            "SELECT kind, COUNT(*) FROM entities GROUP BY kind ORDER BY 2 DESC, kind",
-            &[],
-        )
-        .context("entity stats")?;
-    rows.iter()
-        .map(|r| Ok((r.get_string(0)?, r.get_i64(1)?)))
-        .collect()
+///
+/// The `, kind` tie-break is this port's and Python has none. It is free
+/// here rather than a divergence: no two kinds currently share a count
+/// in either table, so the orders agree today, and without it a future
+/// tie would be resolved by the planner. That is the same reasoning
+/// `vcs log`'s tie-break was chosen under — pick the total order that
+/// also matches the implementation being replaced.
+pub fn entity_stats(store: &dyn Store) -> Result<GraphStats> {
+    let count_by_kind = |table: &str| -> Result<Vec<(String, i64)>> {
+        let rows = store
+            .query(
+                &format!("SELECT kind, COUNT(*) FROM {table} GROUP BY kind ORDER BY 2 DESC, kind"),
+                &[],
+            )
+            .with_context(|| format!("entity stats: {table}"))?;
+        rows.iter()
+            .map(|r| Ok((r.get_string(0)?, r.get_i64(1)?)))
+            .collect()
+    };
+    Ok(GraphStats {
+        entities: count_by_kind("entities")?,
+        relations: count_by_kind("relations")?,
+    })
 }
 
 /// Which way to walk a relation. `relations` rows are directed
@@ -106,6 +144,22 @@ pub struct TraceHit {
     pub edge: Edge,
 }
 
+/// A whole `entity trace` walk: the edges it emitted, and whether the
+/// fan-out cap dropped any.
+///
+/// `truncated` is here rather than inferred by the caller because it
+/// cannot be inferred: a node with exactly `--limit` edges and a node
+/// with a thousand produce the same number of hits, and the walk is the
+/// only place that knows the difference. Python prints an advisory line
+/// when it is set — without it a truncated list looks complete, which is
+/// how `entity paths` came to report "no path" across an edge that
+/// existed.
+#[derive(Debug, Clone)]
+pub struct Traced {
+    pub hits: Vec<TraceHit>,
+    pub truncated: bool,
+}
+
 /// Breadth-first walk out from one entity, in emission order.
 ///
 /// `via` filters on relation kind (empty = all). `fanout` caps edges
@@ -127,12 +181,13 @@ pub fn trace(
     direction: Direction,
     via: &[String],
     fanout: i64,
-) -> Result<Vec<TraceHit>> {
+) -> Result<Traced> {
     let (start, _, _, _) = lookup_entity(store, kind, external_ref)?;
 
     let mut visited: HashSet<i64> = HashSet::from([start]);
     let mut frontier: Vec<i64> = vec![start];
     let mut hits: Vec<TraceHit> = Vec::new();
+    let mut truncated = false;
 
     for hop in 1..=depth {
         if frontier.is_empty() {
@@ -142,7 +197,10 @@ pub fn trace(
         // node. The grouping below walks `frontier` in its own order
         // and each node's edges in theirs, so the emission order is
         // the same as the per-node version produced.
-        let batch = fetch_frontier(store, &frontier, direction, via, Some(fanout))?;
+        let (batch, cut) = fetch_frontier(store, &frontier, direction, via, Some(fanout))?;
+        // Sticky across levels, as Python's `any_truncated` is: the
+        // advisory is about the walk, not about one node.
+        truncated |= cut;
         let mut next = Vec::new();
         for eid in &frontier {
             for (peer_id, edge) in batch.get(eid).into_iter().flatten() {
@@ -162,7 +220,7 @@ pub fn trace(
         }
         frontier = next;
     }
-    Ok(hits)
+    Ok(Traced { hits, truncated })
 }
 
 /// One `entity search` row: the header fields, no edges.
@@ -337,7 +395,10 @@ pub fn shortest_path(
         if frontier.is_empty() {
             break;
         }
-        let batch = fetch_frontier(store, &frontier, direction, via, None)?;
+        // `None` for the cap, so the truncation flag is always false
+        // here — `entity paths` does not cap, which is the whole point
+        // of the divergence recorded above.
+        let (batch, _) = fetch_frontier(store, &frontier, direction, via, None)?;
         let mut next = Vec::new();
         for cur in &frontier {
             for (peer, edge) in batch.get(cur).into_iter().flatten() {
@@ -592,6 +653,7 @@ fn fetch_edges(
     limit: Option<i64>,
 ) -> Result<Vec<Edge>> {
     Ok(fetch_frontier(store, &[id], direction, via, limit)?
+        .0
         .remove(&id)
         .unwrap_or_default()
         .into_iter()
@@ -661,16 +723,22 @@ fn bucket_for(n: usize) -> usize {
 /// matter: the first decides whether a hop prints as `→` or `←`, and
 /// the second is what makes the fan-out cap reproducible instead of
 /// being whatever the query planner felt like.
+/// One level of the batched walk: each anchor's edges keyed by anchor
+/// id, with the peer id alongside each [`Edge`] so the caller can mark
+/// it visited without a second lookup.
+type FrontierEdges = HashMap<i64, Vec<(i64, Edge)>>;
+
 fn fetch_frontier(
     store: &dyn Store,
     frontier: &[i64],
     direction: Direction,
     via: &[String],
     limit: Option<i64>,
-) -> Result<HashMap<i64, Vec<(i64, Edge)>>> {
-    let mut out: HashMap<i64, Vec<(i64, Edge)>> = HashMap::new();
+) -> Result<(FrontierEdges, bool)> {
+    let mut out: FrontierEdges = HashMap::new();
+    let mut truncated = false;
     if direction.includes_out() {
-        collect_direction(
+        truncated |= collect_direction(
             store,
             frontier,
             Direction::Out,
@@ -682,7 +750,7 @@ fn fetch_frontier(
         )?;
     }
     if direction.includes_in() {
-        collect_direction(
+        truncated |= collect_direction(
             store,
             frontier,
             Direction::In,
@@ -693,7 +761,7 @@ fn fetch_frontier(
             &mut out,
         )?;
     }
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// A `col IN <set>` predicate, plus the parameters that fill it and the
@@ -749,8 +817,8 @@ fn collect_direction(
     anchor_col: &str,
     via: &[String],
     limit: Option<i64>,
-    out: &mut HashMap<i64, Vec<(i64, Edge)>>,
-) -> Result<()> {
+    out: &mut FrontierEdges,
+) -> Result<bool> {
     // Edges and peer details are two queries, not one join, and the
     // ordering happens here rather than in SQL. Both choices come from
     // the same measurement.
@@ -870,16 +938,25 @@ fn collect_direction(
     // given anchor and relation kind, and `UNIQUE(kind, external_ref)`
     // fixes the entity, so no two edges off one anchor share
     // `(relkind, peer_kind, peer_ref)`.
+    let mut truncated = false;
     for (anchor, mut edges) in mine {
         edges.sort_by(|(_, a), (_, b)| {
             (&a.relkind, &a.peer_kind, &a.peer_ref).cmp(&(&b.relkind, &b.peer_kind, &b.peer_ref))
         });
         if let Some(n) = limit {
-            edges.truncate(n.max(0) as usize);
+            let n = n.max(0) as usize;
+            // Python asks the server for `limit + 1` rows and discards
+            // the extra, because a bare `LIMIT` renders "exactly limit
+            // edges exist" and "more than limit exist" identically. This
+            // port already has every edge in memory — the cap is applied
+            // here, not in SQL — so the same distinction is a length
+            // comparison and costs nothing.
+            truncated |= edges.len() > n;
+            edges.truncate(n);
         }
         out.entry(anchor).or_default().extend(edges);
     }
-    Ok(())
+    Ok(truncated)
 }
 
 /// The peer columns an [`Edge`] needs beyond the relation itself:
@@ -919,12 +996,42 @@ mod tests {
     #[test]
     fn stats_count_every_kind() {
         let c = testdb::fixture();
-        let stats = entity_stats(&c);
-        let stats = stats.unwrap();
-        let total: i64 = stats.iter().map(|(_, n)| n).sum();
-        assert_eq!(total, 7);
+        let stats = entity_stats(&c).unwrap();
+        assert_eq!(stats.entity_total(), 7);
         // Ordered by count descending, then kind for a stable tie-break.
-        assert_eq!(stats[0], ("Generation".to_string(), 3));
+        assert_eq!(stats.entities[0], ("Generation".to_string(), 3));
+    }
+
+    /// Both halves, because an earlier revision read only `entities` and
+    /// printed nothing at all for `relations` — every number it did
+    /// print agreed with Python, which is why the gap survived a diff
+    /// that only compared counts.
+    #[test]
+    fn stats_count_relations_as_well_as_entities() {
+        let c = testdb::fixture();
+        let stats = entity_stats(&c).unwrap();
+        assert_eq!(stats.relation_total(), 5);
+        assert!(
+            !stats.relations.is_empty(),
+            "the relations section must not be empty"
+        );
+        // Descending by count, and the fixture's `ran` edges outnumber
+        // the rest.
+        let counts: Vec<i64> = stats.relations.iter().map(|(_, n)| *n).collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] >= w[1]),
+            "not descending: {counts:?}"
+        );
+        // Summing the groups equals counting the table, which is what
+        // lets this avoid Python's two extra COUNT(*) queries.
+        let direct = c
+            .query("SELECT COUNT(*) FROM relations", &[])
+            .unwrap()
+            .first()
+            .unwrap()
+            .get_i64(0)
+            .unwrap();
+        assert_eq!(stats.relation_total(), direct);
     }
 
     #[test]
@@ -955,11 +1062,15 @@ mod tests {
     fn trace_walks_breadth_first_and_respects_depth() {
         let c = testdb::fixture();
         // box1 -ran-> gen-1, gen-2, gen-3; gen-1 -installs-> StorePath/sp1
-        let d1 = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 10).unwrap();
+        let d1 = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 10)
+            .unwrap()
+            .hits;
         assert_eq!(d1.len(), 3);
         assert!(d1.iter().all(|h| h.depth == 1));
 
-        let d2 = trace(&c, "Machine", "box1", 2, Direction::Out, &[], 10).unwrap();
+        let d2 = trace(&c, "Machine", "box1", 2, Direction::Out, &[], 10)
+            .unwrap()
+            .hits;
         assert_eq!(d2.len(), 4);
         let deep: Vec<_> = d2.iter().filter(|h| h.depth == 2).collect();
         assert_eq!(deep.len(), 1);
@@ -968,13 +1079,16 @@ mod tests {
         // depth 0 reports nothing; the root is the caller's to print.
         assert!(trace(&c, "Machine", "box1", 0, Direction::Out, &[], 10)
             .unwrap()
+            .hits
             .is_empty());
     }
 
     #[test]
     fn trace_fanout_cap_is_ordered_not_arbitrary() {
         let c = testdb::fixture();
-        let hits = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 2).unwrap();
+        let hits = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 2)
+            .unwrap()
+            .hits;
         let refs: Vec<_> = hits.iter().map(|h| h.edge.peer_ref.as_str()).collect();
         // The first two by (relkind, peer kind, peer ref) — stable
         // across runs, which the Python `LIMIT` without `ORDER BY` is
@@ -994,7 +1108,8 @@ mod tests {
             &["installs".to_string()],
             10,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
         // Nothing leaves box1 via `installs`, so the walk stops at once.
         assert!(only_installs.is_empty(), "{only_installs:?}");
 
@@ -1007,7 +1122,8 @@ mod tests {
             &["ran".to_string(), "installs".to_string()],
             10,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
         assert_eq!(both.len(), 4);
     }
 
@@ -1035,7 +1151,8 @@ mod tests {
         .unwrap();
         // Three `via` values, so the limit is `?5`; the cap of 2 has to
         // still apply to box1's three `ran` edges.
-        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits.hits.len(), 2, "{:?}", hits.hits);
+        assert!(hits.truncated, "the cap dropped box1's third `ran` edge");
     }
 
     fn refs(hits: &[EntityMatch]) -> Vec<&str> {
@@ -1335,7 +1452,7 @@ mod tests {
         let c = testdb::fixture();
         // box1=1 (3 outbound), gen-1=2 (1 outbound), gen-2=3 (none),
         // sp1=5 (1 outbound), and 99 does not exist.
-        let batch = fetch_frontier(&c, &[1, 2, 3, 5, 99], Direction::Out, &[], None).unwrap();
+        let (batch, _) = fetch_frontier(&c, &[1, 2, 3, 5, 99], Direction::Out, &[], None).unwrap();
         assert_eq!(batch.get(&1).map_or(0, Vec::len), 3);
         assert_eq!(batch.get(&2).map_or(0, Vec::len), 1);
         assert_eq!(batch.get(&3).map_or(0, Vec::len), 0);
@@ -1352,12 +1469,51 @@ mod tests {
     #[test]
     fn the_fanout_cap_is_per_node_not_per_level() {
         let c = testdb::fixture();
-        let batch = fetch_frontier(&c, &[1, 2], Direction::Out, &[], Some(2)).unwrap();
+        let (batch, truncated) = fetch_frontier(&c, &[1, 2], Direction::Out, &[], Some(2)).unwrap();
         assert_eq!(batch[&1].len(), 2, "box1 should be capped at 2");
         assert_eq!(batch[&2].len(), 1, "gen-1 has only 1 and keeps it");
         // And the cap still takes the first two by the declared order.
         let refs: Vec<&str> = batch[&1].iter().map(|(_, e)| e.peer_ref.as_str()).collect();
         assert_eq!(refs, ["gen-1", "gen-2"]);
+        // box1 lost an edge, so the advisory must fire.
+        assert!(truncated);
+    }
+
+    /// The truncation flag must distinguish "exactly `limit` edges
+    /// exist" from "more than `limit` exist" — a bare count cannot,
+    /// because both produce `limit` rows. box1 has exactly three
+    /// outbound edges, so a cap of 3 drops nothing and a cap of 2 does.
+    #[test]
+    fn a_cap_that_exactly_fits_is_not_truncation() {
+        let c = testdb::fixture();
+        let at = |n: i64| {
+            let (batch, truncated) =
+                fetch_frontier(&c, &[1], Direction::Out, &[], Some(n)).unwrap();
+            (batch[&1].len(), truncated)
+        };
+        assert_eq!(at(3), (3, false), "a cap equal to the fan-out is not a cut");
+        assert_eq!(at(4), (3, false), "nor is a cap above it");
+        assert_eq!(at(2), (2, true));
+
+        // And no cap at all never reports truncation, which is what
+        // `entity paths` relies on.
+        let (_, truncated) = fetch_frontier(&c, &[1], Direction::Out, &[], None).unwrap();
+        assert!(!truncated);
+    }
+
+    /// The flag is sticky across levels, as Python's `any_truncated` is:
+    /// a cut at depth 1 is still reported after an uncut depth 2.
+    #[test]
+    fn truncation_at_any_depth_is_reported() {
+        let c = testdb::fixture();
+        let cut = |depth: usize, limit: i64| {
+            trace(&c, "Machine", "box1", depth, Direction::Out, &[], limit)
+                .unwrap()
+                .truncated
+        };
+        assert!(cut(1, 2));
+        assert!(cut(3, 2), "still set after deeper, uncapped levels");
+        assert!(!cut(3, 50));
     }
 
     /// Padding a chunk repeats an id, and `IN` is set membership, so a
@@ -1366,7 +1522,7 @@ mod tests {
     #[test]
     fn padding_the_bucket_does_not_duplicate_edges() {
         let c = testdb::fixture();
-        let batch = fetch_frontier(&c, &[1, 2, 5], Direction::Out, &[], None).unwrap();
+        let (batch, _) = fetch_frontier(&c, &[1, 2, 5], Direction::Out, &[], None).unwrap();
         assert_eq!(batch[&1].len(), 3);
         assert_eq!(batch[&2].len(), 1);
         assert_eq!(batch[&5].len(), 1);
@@ -1396,10 +1552,12 @@ mod tests {
         }
         // box1 now has 153 outbound edges; fetched in one batch they
         // must all arrive, and the walk must see every one of them.
-        let batch = fetch_frontier(&c, &[1], Direction::Out, &[], None).unwrap();
+        let (batch, _) = fetch_frontier(&c, &[1], Direction::Out, &[], None).unwrap();
         assert_eq!(batch[&1].len(), 153);
 
-        let hits = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 500).unwrap();
+        let hits = trace(&c, "Machine", "box1", 1, Direction::Out, &[], 500)
+            .unwrap()
+            .hits;
         assert_eq!(hits.len(), 153);
         let mut peers: Vec<_> = hits.iter().map(|h| h.edge.peer_ref.clone()).collect();
         peers.sort();
@@ -1584,7 +1742,9 @@ mod tests {
     #[test]
     fn trace_terminates_on_cycles() {
         let c = testdb::fixture();
-        let hits = trace(&c, "Machine", "box1", 20, Direction::Both, &[], 50).unwrap();
+        let hits = trace(&c, "Machine", "box1", 20, Direction::Both, &[], 50)
+            .unwrap()
+            .hits;
         // Four entities besides the root, each reported exactly once.
         assert_eq!(hits.len(), 4);
         let mut seen: Vec<_> = hits.iter().map(|h| h.edge.peer_address()).collect();

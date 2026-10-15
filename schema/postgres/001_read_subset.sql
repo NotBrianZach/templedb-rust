@@ -90,6 +90,13 @@ CREATE TABLE project_files (
     -- `COUNT(DISTINCT file_type_id)`, which needs the value, not the row.
     file_type_id  bigint,
     lines_of_code bigint,
+    -- migration 106. Read by `file ls -l`, which renders NULL as the
+    -- word `immutable`, and filtered on by `--edit-mode`. Nullable and
+    -- NULL on all 2,491 live rows, so the column is a constant today and
+    -- the mirror has nothing to prove — but `--edit-mode non-immutable`
+    -- distinguishes NULL from the literal 'immutable', so the NULL has
+    -- to survive the copy rather than be coalesced into it.
+    edit_mode     text COLLATE "C",
     UNIQUE (project_id, file_path)
 );
 

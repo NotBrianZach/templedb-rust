@@ -222,11 +222,14 @@ mod tests {
         assert_eq!(slugs, vec!["alpha", "beta", "empty"]);
 
         let alpha = &projects[0];
-        // alpha has four rows in project_files; `gone.txt` is status
+        // alpha has seven rows in project_files; `gone.txt` is status
         // 'deleted' so it counts for neither files nor lines, even
         // though it has a current content row. `notes.md` is active
-        // with no content row, so it counts as a file and zero lines.
-        assert_eq!(alpha.files, 3);
+        // with no content row, so it counts as a file and zero lines —
+        // and so do the three `edit_mode` rows, which is why `files`
+        // grew by three and `lines` did not grow at all. `lines` sums
+        // `file_contents.line_count`, not `project_files.lines_of_code`.
+        assert_eq!(alpha.files, 6);
         assert_eq!(alpha.lines, 4);
 
         // NULL SUM becomes 0, not a missing row and not "None".
@@ -241,11 +244,14 @@ mod tests {
         assert_eq!(d.name.as_deref(), Some("Alpha Project"));
         assert_eq!(d.repo_url.as_deref(), Some("git@example:alpha.git"));
         assert_eq!(d.git_branch.as_deref(), Some("main"));
-        // Four `project_files` rows, including the deleted `gone.txt` —
+        // Seven `project_files` rows, including the deleted `gone.txt` —
         // this count does not filter on status, unlike `project list`.
-        assert_eq!(d.file_count, 4);
-        assert_eq!(d.total_lines, Some(42));
-        // Two distinct `file_type_id` values across those four rows.
+        assert_eq!(d.file_count, 7);
+        // `SUM(lines_of_code)`, so the three `edit_mode` rows' 7 + 8 + 9
+        // land here even though they have no `file_contents` row and
+        // therefore contribute nothing to `project list`'s `lines`.
+        assert_eq!(d.total_lines, Some(66));
+        // Still two distinct `file_type_id` values: the new rows reuse 1.
         assert_eq!(d.file_types, 2);
         // Two branches, and the commits reached through them.
         assert_eq!(d.branch_count, 2);
@@ -274,7 +280,7 @@ mod tests {
     fn files_with_no_line_counts_still_sum_to_none() {
         let c = testdb::fixture();
         let d = super::project_detail(&c, "beta").unwrap().unwrap();
-        assert_eq!(d.file_count, 6);
+        assert_eq!(d.file_count, 8);
         assert_eq!(d.total_lines, None);
         // And no row carries a type either.
         assert_eq!(d.file_types, 0);

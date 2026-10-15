@@ -16,23 +16,23 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | Command | Status |
 |---|---|
 | `templedb-rs project list` | same 30 projects and counts; **output format differs** — see below |
-| `templedb-rs project show <slug>` | byte-identical where Python does not crash — see below |
+| `templedb-rs project show <slug>` | byte-identical |
 | `templedb-rs file cat <proj> <path>` | byte-identical output |
-| `templedb-rs file ls <proj> [prefix] [-l]` | matches |
-| `templedb-rs entity stats` | identical counts, TOTAL 35,012 |
-| `templedb-rs search content <pat> [-p] [--limit]` | **deliberately different** — substring, not stemmed; see below |
-| `templedb-rs entity explore <kind>/<ref>` | byte-identical, header included |
-| `templedb-rs entity trace <kind>/<ref> [--depth] [--direction] [--via] [--limit]` | byte-identical |
+| `templedb-rs file ls <proj> [prefix] [-l] [--edit-mode]` | byte-identical |
+| `templedb-rs entity stats` | byte-identical, both sections |
+| `templedb-rs search content <pat> [-p] [--limit]` | **deliberately different** — substring, not stemmed, and a different layout; see below |
+| `templedb-rs entity explore <kind>/<ref>` | same edge set; **ordering differs on purpose** — see below |
+| `templedb-rs entity trace <kind>/<ref> [--depth] [--direction] [--via] [--limit]` | byte-identical, truncation advisory included |
 | `templedb-rs source snapshot <proj> <path> [--rev] [--meta]` | byte-identical |
-| `templedb-rs source revisions <proj> <path>` | byte-identical where Python does not crash |
-| `templedb-rs entity search <query> [--kind] [--limit]` | same hit set; ordering differs on purpose |
+| `templedb-rs source revisions <proj> <path>` | byte-identical |
+| `templedb-rs entity search <query> [--kind] [--limit]` | byte-identical, ordering included |
 | `templedb-rs entity paths FROM TO [--max-depth] [--direction] [--via]` | byte-identical, exit codes included |
 | `templedb-rs entity dead-imports [--slug] [--limit]` | byte-identical across 5 variants |
 | `templedb-rs entity observations <kind>/<ref> [--limit]` | byte-identical across 6 variants |
 | `templedb-rs vcs log <proj> [-n] [--branch] [--all-sessions]` | byte-identical; Python's session-scoped default not ported |
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
-| `templedb-rs vcs diff <proj> <file> [c1] [c2] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
+| `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -48,11 +48,12 @@ depth cutoff, each `--direction`, a matching `--via` and a bogus one.
 All eight agree byte for byte, and so do the exit codes: 0 for a path,
 3 for "no path within depth N".
 
-`entity search` agrees on *which* entities match and deliberately
-disagrees on the order they are listed in.
-`entity search zMothership` matches 1,064 rows; the two outputs are
-byte-identical once sorted, and differ unsorted because Python's
-`ORDER BY` has no tie-break. See *Bugs found while porting*.
+`entity search` used to agree on *which* entities match and
+deliberately disagree on their order, because Python's `ORDER BY` had no
+tie-break. Python has one now, and the two outputs are byte-identical
+unsorted — the port's one intentional ordering divergence has closed by
+the other side converging on it. `entity explore`, which has no
+`ORDER BY` in Python at all, has opened in its place; see below.
 
 The `label` / `source_authority` / `observed_at` header that
 `entity explore` used to omit is now printed; that gap is closed.
@@ -62,11 +63,11 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-185 unit tests, run by `cargo test`: 176 in `templedb-db` and 9 in
+200 unit tests, run by `cargo test`: 187 in `templedb-db` and 13 in
 `templedb-cli` for the formatting the SQL layer cannot see. Three more
 are `#[ignore]`d because they need `python3`: they drive CPython's
-`difflib` as a reference oracle, and are described under *Porting
-order* below. The 95 added
+`difflib` as a reference oracle for *both* renderers, and are described
+under *Porting order* below. The 95 added
 since the backend split cover the parts that have no database behind
 them and would otherwise only be exercised by running against a server —
 placeholder rewriting (including a `?` inside a string literal, a
@@ -188,6 +189,64 @@ commit rather than the preceding attempt — so the claim is end-to-end,
 not a chain of pairwise comparisons that could have drifted together.
 `search content` is deliberately excluded from the regression axis,
 because changing its answer was the point.
+
+Both axes are now run over **one sweep of 40 invocations covering every
+implemented command**, and it is committed as
+`scripts/parity-sweep.sh` rather than retyped each time:
+
+```bash
+cargo build --release
+scripts/parity-sweep.sh python                  # vs the Python templedb
+scripts/parity-sweep.sh backends 'postgres:///templedb_mirror'
+scripts/parity-sweep.sh regress ./old/templedb-rs
+```
+
+It exits non-zero on the count of *unexpected* differences. The
+deliberate ones are a list in the script, matched by prefix and reported
+separately — which means a divergence that **closes** also shows up,
+printed as `expected` for something that now agrees. That is not a
+detail: it is how `entity search`'s ordering was discovered to have
+converged, and a script that simply filtered those rows out would have
+hidden it.
+
+stdout and the exit code are the contract; stderr is counted but not
+failed on. Python routes diagnostics through `logging`, so they arrive
+prefixed `ERROR` / `INFO` where this port writes them plain, and
+`file ls` prints a `N file(s)` count to stderr precisely so stdout stays
+diffable. Five rows differ on stderr alone today and the summary says
+so.
+
+Committing the sweep is the audit's main deliverable. Three commands had
+drifted *because* each harness was written during one command's port and
+retired when that command was declared done.
+
+- **Python axis**: 34 of 40 stdout-identical, 6 deliberate, 0
+  unexpected.
+- **Regression axis**, pre-audit binary against new: 25 identical, 15
+  changed, every one on purpose — `entity stats`'s layout and new
+  `relations:` section, `file ls -l`'s `edit_mode` column and width,
+  `entity trace`'s truncation advisory, `source revisions` and
+  `--meta`'s NULL rendering, three `vcs show` commits from the blob fix,
+  and the two `-s` renderings.
+- **Backend axis**, SQLite against a freshly mirrored Postgres: **all
+  identical**, exit codes included.
+
+The blob classification fix is the one that needed the second axis: it
+asks the database `content_blob IS NOT NULL` through a `CASE`, which
+SQLite types as an integer and Postgres as a boolean, so the expression
+is wrapped rather than selected raw. That difference is invisible to a
+diff against Python.
+
+One honest note on how the backend axis behaves against a live
+database. The first run of the 38 disagreed on one row — `project list`
+reported 29 files for `math` against the mirror's 27 — and the cause was
+staleness, not a defect: the live SQLite file is being written by the
+Python implementation while the sweep runs, and the mirror is as current
+as the last `mirror` call. Re-mirroring and re-running agreed on all of
+them.
+Worth recording because the failure mode looks exactly like a
+translation bug, and the earlier runs of this axis used a *frozen* copy
+of the database for that reason.
 
 The cluster used for that diff was deliberately initialised
 `en_US.UTF-8`, not `C`. Under that collation Postgres sorts
@@ -470,6 +529,66 @@ Two bugs from the Python side are already designed out here:
   `rusqlite::Statement` finalizes when it leaves scope. This is arguably
   the strongest argument for the port after startup time.
 
+## The audit: almost every bug below is now fixed upstream
+
+**Read this before the next section.** The list that follows was written
+as a bug report against the Python implementation. On 2026-10-14 every
+item in it was re-probed against the live `templedb`, and **nine of the
+twelve are fixed there**. The section is kept because it records what
+the port found and why each divergence was taken, but it is history, not
+a description of the current Python. The status column says which:
+
+| Reported bug | Python today |
+|---|---|
+| `search content` attributed matches to the wrong project | **fixed** (`1DB323BCFDDF1DBA`) |
+| `source revisions` crashes on a deleted file | **fixed** — prints `(deleted)`, exits 0, lists all 14 |
+| `source snapshot` silent + exit 0 on a missing blob | **fixed** — errors, names the blob, exits 1 |
+| Fuzzy project matching rejects projects as ambiguous against themselves | **fixed** — `qa-run` resolves |
+| A NULL project name is searchable as the literal `None` | **fixed** — `None` matches no project |
+| `entity paths` reports "no path" across an edge (`limit=100`) | **fixed** — the 1-hop path is found |
+| `entity search` treats the query as a LIKE pattern | **fixed** — `deploy_` is literal |
+| `entity search`'s `ORDER BY` has no tie-break | **fixed** — byte-identical, ordering included |
+| `entity trace`'s fan-out cap is `LIMIT` with no `ORDER BY` | **fixed** — same `ORDER BY`, plus a truncation advisory |
+| `vcs show`'s commit lookup is a LIKE injection | **fixed** — escaped, with `ORDER BY` |
+| `project show` crashes on a third of the projects | **fixed** — prints `0` |
+| `file ls <prefix>` treated the prefix as a LIKE pattern | **fixed** — filtered in Python, not SQL |
+
+Two of those were fixed *to what this port does*, which is the most
+useful thing in this file. `entity trace` now carries the same
+`ORDER BY (relation kind, peer kind, peer ref)` the port added, and
+`entity search` now has a tie-break — so the one ordering divergence the
+port deliberately carried has closed, and the status table says
+byte-identical where it used to say "ordering differs on purpose".
+`entity trace` went further than the port had: it added a
+`(fan-out capped at N …)` advisory for the exact complaint recorded
+below, that "nothing in the output says it truncated". The port did not
+have that line and now does.
+
+**And the traffic is not one-way.** Three commands were silently behind
+Python when the audit ran, which is the real finding:
+
+| Command | What was wrong |
+|---|---|
+| `entity stats` | the entire `relations:` section was missing — 19 kinds and a total, never printed. Every number the command *did* print agreed, which is why a diff of counts never caught it |
+| `file ls -l` | no `edit_mode` column (migration 106), and the line-count field was one space too wide on every row |
+| `source revisions` / `snapshot --meta` | NULL rendered as `?` and `(none)` where Python renders `-` and `None` |
+
+Plus the blob-classification regression written up under *The one place
+this port fell behind Python*. All four are fixed here now, and all four
+were invisible to the verification this port had been doing, for the
+same reason: **the harnesses only covered the command being worked on.**
+The blob bug surfaced from a `--side-by-side` sweep that happened to
+also run the unified renderer; the other three surfaced only once every
+implemented command was diffed in one pass.
+
+So that is now the method: a single sweep over all 40 invocations
+(`scripts/parity-sweep.sh`), run against Python and across both
+backends, rather than a per-command harness retired when the command is
+declared done. Six differences remain and every one is deliberate and
+documented — `project list`'s layout, `entity explore`'s ordering,
+`vcs log`'s session default, `entity paths`'s exit code, and two
+`search content` invocations.
+
 ## Bugs found while porting
 
 Reimplementing a query means reading the schema it runs against, which is
@@ -577,10 +696,15 @@ a different kind of attention than using it.
   limit, *which* 30 rows you are shown is the query planner's choice;
   the command can answer differently on two identical runs, and the
   first page is not the newest 30 in any meaningful sense. This port
-  orders by `(observed_at DESC, kind, external_ref)`. That is the one
-  intentional output difference in `entity search`: the hit sets agree
-  exactly (1,064 rows for `zMothership`, byte-identical once sorted),
-  the order does not.
+  orders by `(observed_at DESC, kind, external_ref)`.
+
+  This was the port's one intentional output difference, and it is
+  **gone**: Python added a tie-break and the two are now byte-identical
+  unsorted. Worth keeping the entry because of what it shows — the
+  divergence closed by convergence, not by either side conceding, and
+  the port's own README-recorded reasoning ("between two fixes, the one
+  that also agrees with the implementation being replaced is strictly
+  better") is the argument the other side appears to have reached too.
 
 - **`entity trace`'s fan-out cap is `LIMIT` with no `ORDER BY`.** Which
   ten of `Machine/zMothership2`'s 156 `ran` edges you see is up to the
@@ -589,6 +713,21 @@ a different kind of attention than using it.
   `(relation kind, peer kind, peer ref)` before the cap. On current data
   the planner happens to agree, which is why the trace outputs above are
   byte-identical — that is luck, not a guarantee.
+
+  **Also fixed upstream, and then some.** Python now carries the same
+  `ORDER BY (r.kind, e.kind, e.external_ref)`, so the agreement is by
+  construction rather than by luck. It also answered the second half of
+  this complaint, which the port had not: it prints
+  `(fan-out capped at N per node and direction; some edges not shown —
+  raise with --limit N)` when the cap bit, detecting that by asking for
+  `limit + 1` rows and discarding the extra. The port now prints the
+  same line. It needs no `limit + 1` trick, because it holds every edge
+  in memory and applies the cap in Rust, so "more than `limit` exist" is
+  a length comparison.
+
+  The luck ran out elsewhere, though — on `entity explore`, whose query
+  Python still does not order. See *`entity explore` orders its edges
+  and Python does not*.
 
 Two more, found in this repository rather than in Python:
 
@@ -609,6 +748,23 @@ Two more, found in this repository rather than in Python:
 
 Differences that are not deliberate and are not yet closed.
 
+- **The sweep is a shell script, not a test.** `cargo test` does not run
+  it, so nothing fails if it is never invoked. It needs a live database
+  and the Python binary, which is why it is not a `#[test]` — but a CI
+  entry point or a `nix flake check` would close the rest of the gap.
+- **`search content`'s layout differs too**, not only its hit set.
+  Python prints a padded `project_slug / file_path / snippet` table with
+  `<b>`-delimited terms; this prints a two-line form per hit with
+  `[term]` brackets. The README previously documented only the
+  semantics difference, which left the impression the two were
+  comparable line-for-line once the hit sets were allowed to differ.
+  They are not, and `search content` therefore joins `project list` as a
+  command that is not a byte-diff candidate at all.
+- **`search content`'s flags do not match.** Python has `-i` /
+  `--ignore-case` and `--no-fts`, which this does not; this has
+  `--limit`, which Python does not. Both directions, and nothing checks
+  that flag surfaces agree — the audit found this by passing `--limit`
+  to Python and getting exit 2.
 - **Error exits are all `1`.** Python distinguishes a malformed
   `<kind>/<ref>` (1) from an entity that does not exist (2); every error
   here leaves through one `anyhow` path and exits 1. The messages differ
@@ -678,6 +834,49 @@ pre-arranged drift.
 
 No Postgres server is needed to build or to run `cargo test`.
 
+### Checks
+
+```bash
+just check             # the full gate: tests, difflib oracle, parity sweep
+nix flake check        # the hermetic half only
+```
+
+`just check` is what to run before publishing. It is three things in
+order: `cargo test --workspace`, the CPython `difflib` oracle, and
+`scripts/parity-sweep.sh python` — all 40 implemented invocations diffed
+against the Python `templedb`. The sweep exits with the number of
+*unexpected* differences, so the six deliberate divergences do not fail
+it and a new one does.
+
+The split between the two commands is not organisational, it is about
+what needs the live database:
+
+| | `nix flake check` | `just check` |
+|---|---|---|
+| unit tests (200) | yes | yes |
+| difflib oracle vs CPython | yes | yes |
+| 40-invocation parity sweep | **no** | yes |
+
+`nix flake check` builds in a sandbox with no live SQLite file and no
+Python `templedb` installed, so the sweep cannot run there and is not
+wired in pretending otherwise. What it *can* do it now does: the
+`checkPhase` runs the unit tests and then re-runs the three
+`#[ignore]`d oracle tests with `--ignored`, from the crate directory,
+because `cargo test` alone skips them and the one that reads this
+repository's own source needs that working directory. Verified running
+rather than merely compiling: 187 + 13 unit tests and 3 oracle tests
+pass inside the sandbox.
+
+Both `checks` and `packages` build with the same `rust-bin` toolchain
+the dev shell pins, through `makeRustPlatform`. The nixpkgs default
+would have been a second compiler, which is the failure the comment on
+`rustToolchain` in `flake.nix` already records once.
+
+The sweep recipes invoke `bash scripts/parity-sweep.sh` rather than
+executing the script. This tree is materialised out of TempleDB, which
+does not carry the execute bit, so the shebang is unreachable and a
+direct call fails with `Permission denied` in every fresh workspace.
+
 ## Layout
 
 A workspace from the start, rather than one crate split later — the
@@ -707,6 +906,10 @@ crates/templedb-db/    data layer, one module per command family
   testdb.rs            in-memory fixture (cfg(test))
 schema/postgres/       the DDL the mirror targets
 crates/templedb-cli/   clap binary `templedb-rs`, formatting only
+scripts/
+  parity-sweep.sh      all 40 invocations, against Python / the other
+                       backend / a previous build. Not run by
+                       `cargo test` — it needs the live database.
 ```
 
 Nothing from `rusqlite` or `postgres` is re-exported. The previous
@@ -769,14 +972,100 @@ Writes last, and only once the read layer is trusted.
 9. **Done** — the fuzzy *file* matcher, and `vcs diff`'s three
    deterministic forms. `file_contents.version` is the one column the
    mirror gained. See below for the form that cannot work.
-10. **Next** — `--side-by-side`, which is `difflib.context_diff`: a
-    different renderer over the `grouped_opcodes` this port already has,
-    and the last output format in the `vcs` family. After that the read
-    layer is as complete as it can get without sessions.
-11. **Last, and not without a design document** — any write path, and
-    with it the rest of the Postgres schema. Postgres becoming the
+10. **Done** — `vcs diff --side-by-side`, which is
+    `difflib.context_diff`: a second renderer over the
+    `grouped_opcodes` this port already had, and the last output format
+    in the `vcs` family. The read layer is now as complete as it can
+    get without sessions. See below for what the flag is actually
+    called for.
+11. **Done** — the all-commands audit. Every implemented command
+    diffed against Python in one sweep, rather than per-command
+    harnesses retired on completion. Nine of the twelve bugs this
+    README reported are fixed upstream; three commands had silently
+    drifted behind and are fixed here. See *The audit* above. The
+    lesson is a method change, not a command: the sweep replaces the
+    per-command harness. It is now wired in rather than sitting in
+    `scripts/` waiting to be remembered — `just check` runs it, and
+    `nix flake check` runs the half that needs no live database. See
+    *Checks* above.
+12. **Last, and not without a design document** — any write path, and
+    with it the rest of the Postgres schema. The design document now
+    exists, as the TempleDB report
+    *The write path: what porting it actually requires*
+    (2026-10-15). Its conclusion is that neither blocker is SQL: the
+    byte-diff method cannot verify a mutation, and `Store` — two
+    methods, `query` and `dialect`, over a `READ_ONLY` handle — has no
+    way to perform one. It recommends a clock seam, closing the
+    error-exit gap and a state-diff harness *before* any command, a
+    separate concrete `SqliteWriter` rather than a widened trait, and
+    `file set` rather than `commit` as the first write. It also records
+    two boundaries not to cross by accident: 58 of the live database's
+    61 triggers are cr-sqlite's, calling functions from an extension
+    this port never loads, and the bundled SQLite (3.50.2) is not the
+    one Python uses (3.53.3) — which first matters when a write fires
+    the FTS5 triggers. Postgres becoming the
     primary store is the same project as porting the writes; the mirror
     is a read replica and does not change that.
+
+### `entity explore` orders its edges and Python does not
+
+The one divergence the audit *created* rather than closed, and it is the
+`entity trace` story with the luck run out.
+
+`explore`'s edge query has no `ORDER BY` in Python, so the rows arrive
+in whatever order the planner produces — which for
+`Machine/zMothership2` is `gen-321, gen-322, gen-323, gen-325,
+gen-324, gen-326`. Stable across runs today, and not sorted. This port
+sorts by `(relation kind, peer kind, peer ref)`, the same key it uses
+in `trace`, so `gen-324` comes before `gen-325`.
+
+The README used to call `explore` byte-identical, and it was: the
+planner happened to agree. It no longer does on one row out of 173.
+Nothing about the port changed — the data did, which is precisely the
+risk the `trace` note already recorded ("that is luck, not a
+guarantee") and the reason the note was written.
+
+Not fixed by removing the sort, for the reason `vcs log`'s tie-break
+was chosen the other way: there, one total order both fixed the
+nondeterminism *and* matched Python, so taking it was free. Here no
+order matches Python, because Python has no order — matching it would
+mean reproducing the absence of an `ORDER BY` and inheriting a command
+whose output the query planner picks. The edge *set* is identical, which
+is the part a caller can depend on.
+
+### `--side-by-side` is not side by side
+
+The flag selects `difflib.context_diff`. A context diff prints each
+hunk twice — the old file's version of it under a `*** 1,4 ****`
+header, then the new file's under `--- 1,4 ----` — one above the other.
+There are no columns. Nothing in Python's `--help` ("Side-by-side
+diff") or in the `_display_diff(unified=False)` call site says so; the
+only way to find out is to read `difflib`.
+
+Ported under the misleading name, because the name is the contract:
+`-s` is the short form, it is in `templedb vcs diff --help`, and
+renaming it here would mean the two binaries disagree about their own
+CLI. The Rust doc comment and `--help` text say what it actually does,
+which is the most that can be fixed from this side.
+
+Three things about the format are easy to get wrong and all three are
+visible in the output:
+
+- **A context range names both endpoints**, `first,last`, where a
+  unified range is `start,length`. The same four-line hunk is `10,13`
+  here and `10,4` there, and both read as a comma-separated pair. They
+  coincide only when the hunk starts at line 1 — which is exactly what
+  CPython's docstring example does, so the published case cannot catch
+  this.
+- **An empty range is a bare number** — the line *before* the range —
+  where unified prints `N,0`.
+- **A side with no changes prints its header and no body.** A hunk that
+  only inserts emits `*** 1,2 ****` followed directly by
+  `--- 1,3 ----`. Implementing it as "print the lines anyway" produces
+  output that looks right on every hunk that both deletes and inserts.
+
+Each of those is a unit test and each was confirmed non-vacuous by
+mutation; see *How it is verified*.
 
 ### `vcs diff <proj> <file>` cannot ever show a diff
 
@@ -839,9 +1128,9 @@ so neither can close it.
 
 `crates/templedb-db/src/difflib.rs` is therefore a port of
 `find_longest_match`, the recursive block search, adjacent-block
-merging, `get_opcodes`, `get_grouped_opcodes` and `unified_diff`.
-`isjunk` is left out: the call site passes `None`, which makes two of
-`find_longest_match`'s four extension loops dead.
+merging, `get_opcodes`, `get_grouped_opcodes`, `unified_diff` and
+`context_diff`. `isjunk` is left out: the call site passes `None`, which
+makes two of `find_longest_match`'s four extension loops dead.
 
 **Autojunk is the part that matters.** Past 200 elements, any line
 occupying more than 1% of positions is dropped from the index, so it can
@@ -872,25 +1161,102 @@ decides the answer, and this repo's own source files with lines dropped,
 blocks moved and the whole file reversed. All agree byte for byte with
 difflib on CPython 3.14.7.
 
+Every case runs through **both** renderers — the oracle takes the
+difflib function name as an argument — because `unified_diff` and
+`context_diff` share the matcher and the hunk grouping but not the line
+format, and the format is where the differences hide. Asking CPython
+the same question twice is cheaper than reasoning about which of the
+two could diverge.
+
 That harness was then checked against itself by mutation, because a
 parity test that passes on its first run may be vacuous. Disabling
 autojunk fails 2 of its 3 cases; inverting the longest-match tie-break
-from `>` to `>=` fails all 3.
+from `>` to `>=` fails all 3. For the context renderer: printing a
+context range as `start,length` instead of `first,last` fails all 3 and
+one unit test; printing each hunk's old side unconditionally instead of
+only when it has deletions fails all 3 and one unit test.
 
 End to end, `templedb-rs vcs show` is byte-identical to
 `templedb vcs show` across 39 commits in 6 projects, with colour on and
 off, the largest being a 15,171-line diff. Root commits are included:
 they have no parent row, so the file is diffed against the empty string
 and the header reads `∅`, which is Python's marker. A 4,816-line
-whole-file addition agrees exactly.
+whole-file addition agrees exactly. A later sweep added 164 more
+`vcs show` invocations — every commit in the database touching a binary
+or a misclassified blob, plus 60 by id — including a 52,848-line output
+carrying 24 binary notices.
 
-One reproduced wrongness worth naming, because it is on stdout: a
-**binary** file in a commit diffs as `No differences`. Python's content
-lookup returns nothing for any blob whose `content_type` is not `text`,
-the caller turns that into the empty string, and empty-against-empty is
-no change — so a binary file that did change reports that it did not.
-This port does the same thing, and `content_at_commit`'s doc comment
-records why.
+`vcs diff` is diffed across 200 invocations: 10 files with the most
+revisions, consecutive commit pairs from each, every pair run through
+both renderers with colour on and off and through `-s` as well as
+`--side-by-side`. Plus 18 edge cases — the one-commit and no-commit
+forms, a `%` and a `_` as the commit ref, a nonexistent commit, an
+8-character prefix, a binary file and a file deleted in one of the two
+revisions. Exit codes included.
+
+An earlier revision of this file recorded a reproduced wrongness here: a
+**binary** file in a commit diffed as `No differences`, because Python's
+content lookup returned nothing for any blob whose `content_type` was
+not the literal `text`, the caller coerced that to the empty string, and
+empty-against-empty is no change. That is fixed on both sides now — see
+*The one place this port fell behind Python* below — and `vcs show`
+names the three cases apart.
+
+### The one place this port fell behind Python
+
+Every divergence above is this port moving ahead of the implementation
+it replaces. This one went the other way, and it is the most useful
+entry in this file for anyone maintaining a port against a moving
+target.
+
+`content_blobs.content_type` is documented in the schema as `'text' or
+'binary'` and is not two-valued. Alongside 4,219 `text` and 35 genuinely
+binary rows the live database holds **9 `text/plain`, 5
+`text/x-shellscript` and 2 `binary_asset`**. An exact `content_type =
+'text'` test therefore calls 14 ordinary source files binary. Both
+implementations had that test; this port reproduced it deliberately,
+because it was on stdout and the README said so, filed it as handoff
+#20, and wrote in `blob_text`'s doc comment that "the two
+implementations have to agree until it is fixed there".
+
+It was fixed there. Python's `_get_content_by_hash` now decides on the
+data — `content_text is not None` — and returns one of `text`, `binary`
+or `missing`, and `vcs show` prints a different line for each. So
+reproducing the old test stopped being the parity and became the
+divergence, and the port followed. The decision is now
+`content_text IS NOT NULL`, with `content_blob IS NOT NULL` telling
+binary from a hash that names nothing. `content_type` says what the file
+*is*, not which column holds it.
+
+**What it was costing**, and neither symptom was subtle:
+
+| command | before | after |
+|---|---|---|
+| `vcs show templedb 40E93339139FA809` | `No differences` three times, under `✨ added src/services/env_logic.pl (125 lines)` | the three diffs, 364 lines |
+| `vcs diff templedb src/gui_pages/README.md <c1> <c2>` | exit 1, `Could not retrieve old version` | the 9-line addition Python prints |
+| `vcs show bza FBC7ECF45AE34942` | `No differences` ×24 for 24 changed SVGs | `binary file, no textual diff` ×24 |
+| `vcs show nixos_anywhere_vultr_woofs 1C04E7EF81BD7A3C` | `No differences` ×68 | `content not stored for this revision (hash present, blob absent) — cannot diff` ×68 |
+
+The last two are the part that is not just "the bug is gone". Python
+grew two new messages with the fix, because empty-against-empty rendered
+"unchanged", "binary" and "the bytes are gone" identically — three
+different facts and one output, right for one of them. Those messages
+are ported, which is why `BlobKind` exists rather than
+`Option<String>`: `None` cannot answer *why*.
+
+**How it was found is the point.** Not by reading Python again — by the
+parity harness for an unrelated feature. The 200-invocation sweep built
+for `--side-by-side` failed 4 cases, all one file, and all four failed
+on the *unified* renderer too. A harness that only exercised the thing
+being added would have passed.
+
+`file cat` and `source snapshot` read blobs through their own queries
+and were checked against Python on all three live misclassified files;
+they already agreed, so the fix stayed in `vcs.rs`. The fixture gained a
+`text/x-shellscript` blob holding real text and one with neither column
+populated, because no row in it could reach either case — the fixture
+labelled all its text `text`, so the old and new tests passed
+identically on it.
 
 ### Two bugs found porting it
 

@@ -58,6 +58,10 @@ CREATE TABLE project_files (
     status        TEXT DEFAULT 'active',
     file_type_id  INTEGER,
     lines_of_code INTEGER,
+    -- migration 106. NULL on every live row, so the fixture is the only
+    -- place a non-NULL value exists and therefore the only thing that
+    -- can test `--edit-mode`.
+    edit_mode     TEXT,
     UNIQUE(project_id, file_path)
 );
 
@@ -227,6 +231,19 @@ INSERT INTO projects (id, slug, name, repo_url, git_branch, active_branch_id) VA
 -- count, so `SUM` is non-NULL and `COUNT(DISTINCT file_type_id)` is
 -- more than one. beta's are all NULL, which is the shape that makes
 -- Python's `f"{None:,}"` raise.
+-- `edit_mode` is NULL unless named. Three of alpha's files carry a
+-- value so `--edit-mode` has something to select and something to
+-- reject: `hot-reload` is a genuine opt-out, the explicit `'immutable'`
+-- is the case `non-immutable` must exclude *and* that
+-- `--edit-mode immutable` must match where a NULL row does not, and the
+-- rest are NULL like every live row.
+INSERT INTO project_files
+    (id, project_id, file_path, status, file_type_id, lines_of_code, edit_mode)
+VALUES
+    (13, 1, 'src/hot.rs',  'active', 1, 7, 'hot-reload'),
+    (14, 1, 'src/live.rs', 'active', 1, 8, 'live-symlink'),
+    (15, 1, 'src/pin.rs',  'active', 1, 9, 'immutable');
+
 INSERT INTO project_files
     (id, project_id, file_path, status, file_type_id, lines_of_code)
 VALUES
@@ -246,7 +263,16 @@ VALUES
     -- history only, and its blob is missing.
     (9,  2, 'orphan.txt',  'active', NULL, NULL),
     -- history only, recorded as a deletion with a NULL content_hash.
-    (10, 2, 'removed.txt', 'active', NULL, NULL);
+    (10, 2, 'removed.txt', 'active', NULL, NULL),
+    -- Its blob holds real text under a content_type that is not the
+    -- literal 'text'. 14 live blobs are like this and an exact
+    -- `content_type = 'text'` test calls every one of them binary,
+    -- which is the bug both implementations had and Python fixed first.
+    (11, 2, 'script.sh',   'active', NULL, NULL),
+    -- Its blob row exists with neither content column populated: a hash
+    -- that names nothing. Distinct from a missing row and from binary,
+    -- and `vcs show` prints a different line for each.
+    (12, 2, 'hollow.txt',  'active', NULL, NULL);
 
 INSERT INTO content_blobs
     (hash_sha256, content_text, content_blob, content_type, file_size_bytes)
@@ -260,7 +286,18 @@ VALUES
     ('h-axb',      'axb' || char(10), NULL, 'text', 4),
     -- binary: content_text is NULL, which must read as an error rather
     -- than an empty file.
-    ('h-png',      NULL, X'89504E47', 'binary', 4);
+    ('h-png',      NULL, X'89504E47', 'binary', 4),
+    -- Text under a content_type that is not the literal 'text'.
+    -- `content_type` says what the file *is*, not which column holds
+    -- it, so this must read as text. The live database has 9
+    -- 'text/plain' and 5 'text/x-shellscript' rows shaped exactly like
+    -- this; there is no way to reach the behaviour from a fixture that
+    -- only labels its text 'text'.
+    ('h-shell',    '#!/bin/sh' || char(10) || 'exit 0' || char(10),
+                   NULL, 'text/x-shellscript', 17),
+    -- Neither column populated. Not binary and not text: the row exists
+    -- and carries nothing, which is a third answer.
+    ('h-hollow',   NULL, NULL, 'text', 0);
 -- 'h-missing' is deliberately absent from content_blobs.
 
 -- File 1 is the one file given a *prior* revision, so the
@@ -349,11 +386,13 @@ VALUES
     -- rather than a whole-file addition.
     (11, 1, 'modified', 'h-main-old', 13, 1),
     (12, 1, 'modified', 'h-main',     26, 3),
-    -- A binary file in a commit. Python's content lookup rejects
-    -- anything whose content_type is not 'text', so both sides of the
-    -- diff come back empty and the command says "No differences" — a
-    -- wrong answer that is reproduced because it is on stdout.
-    (20, 7, 'modified', 'h-png',      4,  NULL);
+    -- A binary file in a commit: `vcs show` names it as binary rather
+    -- than diffing two empty sides and calling it "No differences".
+    (20, 7, 'modified', 'h-png',      4,  NULL),
+    -- The two blobs that distinguish "binary" from "text under an
+    -- unexpected content_type" from "the row carries nothing".
+    (20, 11, 'modified', 'h-shell',   17, 2),
+    (20, 12, 'modified', 'h-hollow',  0,  NULL);
 
 -- Parent edges. C1 is a root commit (absent here), C2's parent is C1,
 -- C4's is C2.

@@ -126,9 +126,17 @@ enum FileCmd {
         project: String,
         #[arg(default_value = "")]
         prefix: String,
-        /// Show line counts
+        /// Show detailed info (lines of code)
         #[arg(short, long)]
         long: bool,
+        /// Filter by edit_mode (migration 106).
+        ///
+        /// `non-immutable` matches anything opted out of the default —
+        /// which on current data is nothing, because all 2,491 live
+        /// rows have a NULL `edit_mode`. So does `immutable`: Python
+        /// compares the raw column, and NULL is not the string.
+        #[arg(long, value_enum, value_name = "MODE")]
+        edit_mode: Option<EditMode>,
     },
 }
 
@@ -262,6 +270,15 @@ enum VcsCmd {
         commit1: Option<String>,
         /// Commit hash or prefix
         commit2: Option<String>,
+        /// Render as a context diff rather than a unified one.
+        ///
+        /// The name is Python's and it is wrong: this prints each hunk's
+        /// old block and then its new block, one above the other, not in
+        /// two columns. `difflib.context_diff` is what the flag selects.
+        /// Kept because the flag name is the contract — `-s` is in
+        /// scripts and in `templedb vcs diff --help`.
+        #[arg(long, short = 's')]
+        side_by_side: bool,
         /// Print the diff without ANSI colour.
         #[arg(long)]
         no_color: bool,
@@ -317,6 +334,32 @@ impl From<Dir> for Direction {
             Dir::Out => Direction::Out,
             Dir::In => Direction::In,
             Dir::Both => Direction::Both,
+        }
+    }
+}
+
+/// `file ls --edit-mode`'s four accepted values, which are Python's
+/// `choices=` list verbatim. The first three are `edit_mode` values;
+/// `non-immutable` is the catch-all.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum EditMode {
+    Immutable,
+    #[value(name = "hot-reload")]
+    HotReload,
+    #[value(name = "live-symlink")]
+    LiveSymlink,
+    #[value(name = "non-immutable")]
+    NonImmutable,
+}
+
+impl From<EditMode> for templedb_db::EditModeFilter {
+    fn from(m: EditMode) -> Self {
+        use templedb_db::EditModeFilter as F;
+        match m {
+            EditMode::Immutable => F::Exactly("immutable"),
+            EditMode::HotReload => F::Exactly("hot-reload"),
+            EditMode::LiveSymlink => F::Exactly("live-symlink"),
+            EditMode::NonImmutable => F::NonImmutable,
         }
     }
 }
@@ -459,12 +502,27 @@ fn run() -> Result<i32> {
                 project,
                 prefix,
                 long,
+                edit_mode,
             } => {
                 let slug = resolve_project(&store, &project)?;
-                let files = templedb_db::list_files(&store, &slug, &prefix)?;
+                let keep: Option<templedb_db::EditModeFilter> = edit_mode.map(Into::into);
+                let files: Vec<_> = templedb_db::list_files(&store, &slug, &prefix)?
+                    .into_iter()
+                    .filter(|f| keep.is_none_or(|k| k.keeps(f.edit_mode.as_deref())))
+                    .collect();
                 for f in &files {
                     if long {
-                        println!("{:>7} loc  {}", f.lines, f.path);
+                        // `{:>6}`, not `{:>7}`: Python's width is 6 and
+                        // this printed one space wider on every row of
+                        // every `-l` listing. The `edit_mode` column was
+                        // missing outright — NULL renders as the word
+                        // `immutable`, which is what the column means.
+                        println!(
+                            "{:>6} loc  {:<13}  {}",
+                            f.lines,
+                            f.edit_mode.as_deref().unwrap_or("immutable"),
+                            f.path
+                        );
                     } else {
                         println!("{}", f.path);
                     }
@@ -519,10 +577,11 @@ fn run() -> Result<i32> {
             } => {
                 let (kind, eref) = split_entity(&entity)?;
                 let via = parse_via(via.as_deref());
-                let hits =
+                let traced =
                     templedb_db::trace(&store, kind, eref, depth, direction.into(), &via, limit)?;
+                let hits = &traced.hits;
                 println!("● {kind}/{eref}");
-                for hit in &hits {
+                for hit in hits {
                     let arrow = match hit.edge.direction {
                         Direction::In => format!("←[{}]─", hit.edge.relkind),
                         // `Both` is a traversal mode, never an edge's
@@ -539,6 +598,18 @@ fn run() -> Result<i32> {
                 }
                 if hits.is_empty() {
                     eprintln!("no edges within depth {depth}");
+                }
+                // Say so when the cap bit. A capped list that looks
+                // complete is the defect that made `entity paths`
+                // report "no path" across an existing edge; the cap
+                // itself is fine here, because in `trace` the fan-out
+                // *is* the output.
+                if traced.truncated {
+                    println!();
+                    println!(
+                        "  (fan-out capped at {limit} per node and direction; \
+                         some edges not shown — raise with --limit N)"
+                    );
                 }
             }
             EntityCmd::Search { query, kind, limit } => {
@@ -620,12 +691,26 @@ fn run() -> Result<i32> {
                 }
             }
             EntityCmd::Stats => {
+                // Python's layout, which this command did not previously
+                // reproduce: a `kind: total` line, then the kinds
+                // indented two spaces and padded to 20 with the count
+                // unpadded after one space. The old form right-aligned
+                // the counts in a wider column and added a `TOTAL` row,
+                // which reads better and is not what the other binary
+                // prints.
                 let stats = templedb_db::entity_stats(&store)?;
-                let total: i64 = stats.iter().map(|(_, n)| n).sum();
-                for (kind, n) in &stats {
-                    println!("{:<20} {:>8}", kind, n);
-                }
-                println!("{:<20} {:>8}", "TOTAL", total);
+                let section = |head: &str, total: i64, rows: &[(String, i64)]| {
+                    println!("{head}{total}");
+                    for (kind, n) in rows {
+                        println!("  {kind:<20} {n}");
+                    }
+                };
+                section("entities:  ", stats.entity_total(), &stats.entities);
+                println!();
+                // The second section was missing entirely. The counts
+                // the command did print all agreed with Python; the
+                // nineteen relation kinds were simply absent.
+                section("relations: ", stats.relation_total(), &stats.relations);
             }
             EntityCmd::DeadImports { slug, limit } => {
                 // Not fuzzy-resolved, unlike every other project
@@ -742,9 +827,19 @@ fn run() -> Result<i32> {
                     println!("project:           {}", snap.project_slug);
                     println!("path:              {}", snap.file_path);
                     println!("revision:          {}", snap.revision);
-                    println!("content_hash:      {}", opt(&snap.content_hash));
-                    println!("size:              {} bytes", num(snap.file_size_bytes));
-                    println!("lines:             {}", num(snap.line_count));
+                    // All three are nullable and all three are reachable
+                    // from live data: a `change_type = 'deleted'` row
+                    // has no hash, no size and no line count. Python
+                    // interpolates them raw, so each prints `None`.
+                    println!(
+                        "content_hash:      {}",
+                        py_str_opt(snap.content_hash.as_deref())
+                    );
+                    println!(
+                        "size:              {} bytes",
+                        py_str_opt(snap.file_size_bytes)
+                    );
+                    println!("lines:             {}", py_str_opt(snap.line_count));
                     println!("observed_at:       {}", snap.observed_at);
                     println!("source_authority:  {}", snap.source_authority);
                     return Ok(0);
@@ -766,20 +861,7 @@ fn run() -> Result<i32> {
                 println!("{} snapshot(s), newest first:", revs.len());
                 println!();
                 for r in &revs {
-                    let rev: String = r.revision.chars().take(12).collect();
-                    // A deletion has no content hash at all. The Python
-                    // version slices into it unconditionally and raises
-                    // a TypeError on exactly these rows.
-                    let hash: String = match &r.content_hash {
-                        Some(h) => h.chars().take(12).collect(),
-                        None => "(deleted)".to_string(),
-                    };
-                    println!(
-                        "  {rev:<14} {}  {hash:<12}  {} bytes, {} lines",
-                        r.observed_at,
-                        num(r.file_size_bytes),
-                        num(r.line_count)
-                    );
+                    println!("{}", revision_line(r));
                 }
             }
         },
@@ -852,6 +934,7 @@ fn run() -> Result<i32> {
                 file,
                 commit1,
                 commit2,
+                side_by_side,
                 no_color,
             } => {
                 let p = resolve_project_row(&store, &project)?;
@@ -930,7 +1013,16 @@ fn run() -> Result<i32> {
 
                 let (old_lines, new_lines) =
                     (templedb_db::splitlines(&old), templedb_db::splitlines(&new));
-                let diff = templedb_db::unified_diff(
+                // Same labels and same `n` either way — Python switches
+                // only the renderer, and the two take identical
+                // arguments because they consume the same grouped
+                // opcodes.
+                let render = if side_by_side {
+                    templedb_db::context_diff
+                } else {
+                    templedb_db::unified_diff
+                };
+                let diff = render(
                     &old_lines,
                     &new_lines,
                     &format!("{} ({label1})", f.file_path),
@@ -985,30 +1077,65 @@ fn run() -> Result<i32> {
                 // and is diffed against the empty string, so every line
                 // reads as an addition.
                 if !files.is_empty() && !no_diff {
+                    use templedb_db::BlobKind;
                     let parent = templedb_db::parent_hash(&store, d.id)?;
                     for f in &files {
                         // `vcs show` discards the labels and builds its
-                        // own `a/path (hash)` pair, and coerces absent
-                        // content to the empty string — which is where
-                        // the misclassified-blob bug surfaces as
-                        // "No differences". `vcs diff` treats the same
-                        // `None` as an error instead. Both are Python's.
+                        // own `a/path (hash)` pair. It coerces absent
+                        // content to the empty string, but only after
+                        // the two checks below — without them "nothing
+                        // changed", "it is binary" and "the bytes are
+                        // gone" all printed `No differences`, which is
+                        // right for one of the three. `vcs diff` treats
+                        // the same absence as an error instead. Both are
+                        // Python's.
                         let new = templedb_db::content_at_commit(
                             &store,
                             p.id,
                             &f.file_path,
                             &d.commit_hash,
-                        )?
-                        .content
-                        .unwrap_or_default();
+                        )?;
+                        // A root commit's old side is empty *text*, not
+                        // absent content — so it diffs as a whole-file
+                        // addition rather than tripping either check.
                         let old = match &parent {
                             Some(h) => {
                                 templedb_db::content_at_commit(&store, p.id, &f.file_path, h)?
-                                    .content
-                                    .unwrap_or_default()
                             }
-                            None => String::new(),
+                            None => templedb_db::CommitContent {
+                                content: Some(String::new()),
+                                label: String::new(),
+                                kind: BlobKind::Text,
+                            },
                         };
+
+                        let kinds = [old.kind, new.kind];
+                        if kinds.contains(&BlobKind::Binary) {
+                            println!();
+                            println!("  {}: binary file, no textual diff", f.file_path);
+                            continue;
+                        }
+                        // The second disjunct is Python's and is not
+                        // redundant: two `NotFound` sides are neither
+                        // missing nor binary, and would otherwise reach
+                        // the diff as empty-against-empty and print
+                        // `No differences`.
+                        if kinds.contains(&BlobKind::Missing)
+                            || (old.content.is_none() && new.content.is_none())
+                        {
+                            println!();
+                            println!(
+                                "  {}: content not stored for this revision \
+                                 (hash present, blob absent) — cannot diff",
+                                f.file_path
+                            );
+                            continue;
+                        }
+
+                        let (old, new) = (
+                            old.content.unwrap_or_default(),
+                            new.content.unwrap_or_default(),
+                        );
 
                         println!();
                         // `∅` for a root commit, matching Python.
@@ -1194,8 +1321,60 @@ fn label_suffix(label: Option<&str>) -> String {
     }
 }
 
-fn opt(v: &Option<String>) -> &str {
-    v.as_deref().unwrap_or("(none)")
+/// One row of `source revisions`, as its own function so the column
+/// widths can be tested — they are the part of this command most likely
+/// to drift, and the drift is one space.
+///
+/// Python's line is
+///
+/// ```text
+/// f"  {rev:<14} {observed_at}  "
+/// f"{h[:12] if h else '(deleted)  '}  "
+/// f"{size if size is not None else '-'} bytes, "
+/// f"{lines if lines is not None else '-'} lines"
+/// ```
+///
+/// Two details are deliberate reproductions rather than choices:
+///
+/// - **The deleted placeholder is eleven characters** where a truncated
+///   hash is twelve, so the size column sits one place left on a
+///   deletion. Padding `(deleted)` to 12 lines the table up and
+///   disagrees with Python on all 29 live rows that have no hash. This
+///   port did exactly that until it was diffed.
+/// - **A NULL size or line count is `-`**, not `None`. The same two
+///   columns print `None` under `source snapshot --meta`, because that
+///   command interpolates them with no fallback — see [`py_str_opt`].
+///   One schema, two renderings, and both are on stdout.
+fn revision_line(r: &templedb_db::Revision) -> String {
+    let rev: String = r.revision.chars().take(12).collect();
+    let hash: String = match &r.content_hash {
+        Some(h) => h.chars().take(12).collect(),
+        None => "(deleted)  ".to_string(),
+    };
+    let dash = |v: Option<i64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
+    format!(
+        "  {rev:<14} {}  {hash}  {} bytes, {} lines",
+        r.observed_at,
+        dash(r.file_size_bytes),
+        dash(r.line_count)
+    )
+}
+
+/// A nullable column the way an f-string interpolates it: `str(None)`
+/// is the bare word `None`.
+///
+/// Ugly, and it is Python's `None` leaking into the output rather than a
+/// considered choice of placeholder — but `source snapshot --meta` is a
+/// labelled dump of a row, nothing is misreported by it, and the status
+/// table claims the command is byte-identical. An earlier revision
+/// printed `(none)` and `?` here, which is nicer and was a silent,
+/// undocumented divergence in three fields.
+///
+/// This is `str`, not [`py_repr_opt`]'s `repr`: `entity observations`
+/// prints `'text'` with quotes because Python builds that line with
+/// `{!r}`, and this one has no quotes because `--meta` does not.
+fn py_str_opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "None".to_string(), |x| x.to_string())
 }
 
 /// Group digits in threes with commas, as Python's `{:,}` does.
@@ -1218,10 +1397,6 @@ fn thousands(n: i64) -> String {
         out.push(ch);
     }
     out
-}
-
-fn num(v: Option<i64>) -> String {
-    v.map_or_else(|| "?".to_string(), |n| n.to_string())
 }
 
 #[cfg(test)]
@@ -1265,6 +1440,67 @@ mod tests {
         ] {
             assert_eq!(colorize_diff_line(line, false), line);
         }
+    }
+
+    fn rev(hash: Option<&str>, size: Option<i64>, lines: Option<i64>) -> templedb_db::Revision {
+        templedb_db::Revision {
+            revision: "ed5de8b09e24".into(),
+            content_hash: hash.map(str::to_string),
+            observed_at: "2026-10-07 20:36:44".into(),
+            file_size_bytes: size,
+            line_count: lines,
+        }
+    }
+
+    /// The two lines below are copied from `templedb source revisions
+    /// templedb CHANGELOG.md`, which is why they are asserted as whole
+    /// strings rather than field by field: the thing being pinned is the
+    /// run of spaces between the columns, and a field-wise test cannot
+    /// see it.
+    #[test]
+    fn a_revision_line_matches_pythons_columns() {
+        assert_eq!(
+            revision_line(&rev(Some("f74e31da94bfaaaa"), Some(0), Some(12))),
+            "  ed5de8b09e24   2026-10-07 20:36:44  f74e31da94bf  0 bytes, 12 lines"
+        );
+    }
+
+    /// A deletion: `-` for both numbers, and the placeholder is one
+    /// character *narrower* than a hash, so the size column shifts left.
+    /// Padding `(deleted)` to 12 is the obvious thing to write and is
+    /// wrong on all 29 live rows that reach this branch.
+    #[test]
+    fn a_deleted_revision_keeps_pythons_off_by_one_padding() {
+        let line = revision_line(&rev(None, None, None));
+        assert_eq!(
+            line,
+            "  ed5de8b09e24   2026-10-07 20:36:44  (deleted)    - bytes, - lines"
+        );
+        // Four spaces after the placeholder, not five.
+        assert!(line.contains("(deleted)    -"));
+        assert!(!line.contains("(deleted)     "));
+    }
+
+    /// A NULL line count alone, which is the common case: the blob is
+    /// there and empty, so only one column falls back.
+    #[test]
+    fn a_null_line_count_alone_renders_one_dash() {
+        assert_eq!(
+            revision_line(&rev(Some("f74e31da94bf"), Some(0), None)),
+            "  ed5de8b09e24   2026-10-07 20:36:44  f74e31da94bf  0 bytes, - lines"
+        );
+    }
+
+    /// The same two columns print `None` under `--meta` and `-` here,
+    /// because Python writes the two lines differently. Asserted
+    /// together so a future simplification to one helper fails rather
+    /// than silently picking one.
+    #[test]
+    fn meta_and_revisions_render_the_same_null_differently() {
+        assert_eq!(py_str_opt(None::<i64>), "None");
+        assert_eq!(py_str_opt(Some(12)), "12");
+        assert_eq!(py_str_opt(None::<&str>), "None");
+        assert!(revision_line(&rev(None, None, None)).contains("- bytes, - lines"));
     }
 
     #[test]

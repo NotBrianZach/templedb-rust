@@ -9,6 +9,16 @@ use anyhow::{Context, Result};
 pub struct FileEntry {
     pub path: String,
     pub lines: i64,
+    /// `project_files.edit_mode` (migration 106), raw.
+    ///
+    /// NULL *is* the default and means `immutable`, but the NULL is kept
+    /// rather than coalesced here because the two readers need different
+    /// things from it: `-l` renders NULL as the word `immutable`, and
+    /// `--edit-mode non-immutable` has to exclude both NULL and the
+    /// literal `'immutable'`, which it cannot do once they are the same
+    /// value. All 2,491 live rows are NULL today, so coalescing in SQL
+    /// would have looked correct indefinitely.
+    pub edit_mode: Option<String>,
 }
 
 /// Active files under `prefix` for a project, with line counts.
@@ -24,7 +34,7 @@ pub fn list_files(store: &dyn Store, slug: &str, prefix: &str) -> Result<Vec<Fil
     // and declare the escape in the SQL.
     let rows = store
         .query(
-            "SELECT pf.file_path, COALESCE(fc.line_count, 0)
+            "SELECT pf.file_path, COALESCE(fc.line_count, 0), pf.edit_mode
                FROM project_files pf
                JOIN projects p ON p.id = pf.project_id
           LEFT JOIN file_contents fc
@@ -42,9 +52,39 @@ pub fn list_files(store: &dyn Store, slug: &str, prefix: &str) -> Result<Vec<Fil
             Ok(FileEntry {
                 path: r.get_string(0)?,
                 lines: r.get_i64(1)?,
+                edit_mode: r.get_opt_string(2)?,
             })
         })
         .collect()
+}
+
+/// Which files `file ls --edit-mode` keeps.
+///
+/// Python filters this in Python rather than in SQL, and so does this —
+/// not for symmetry but because `non-immutable` is "not NULL and not
+/// `'immutable'`", which is two conditions on a column whose NULL is
+/// meaningful, and expressing it in SQL would need an `IS NOT NULL` that
+/// is easy to drop. The set is already in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditModeFilter {
+    /// An exact `edit_mode` value. `immutable` matches only the literal
+    /// string, *not* the NULL that means the same thing — which is
+    /// Python's behaviour (`em != edit_mode_filter` with `em` as the raw
+    /// column) and matches nothing at all on current data, where every
+    /// row is NULL.
+    Exactly(&'static str),
+    /// Anything that opted out of the default: not NULL, not
+    /// `'immutable'`.
+    NonImmutable,
+}
+
+impl EditModeFilter {
+    pub fn keeps(self, edit_mode: Option<&str>) -> bool {
+        match self {
+            EditModeFilter::NonImmutable => !matches!(edit_mode, None | Some("immutable")),
+            EditModeFilter::Exactly(want) => edit_mode == Some(want),
+        }
+    }
 }
 
 /// Current contents of one tracked file.
@@ -89,12 +129,56 @@ mod tests {
         // gone.txt is status 'deleted'; notes.md is active but has no
         // current content row, so it lists with 0 lines rather than
         // vanishing.
-        assert_eq!(paths, vec!["README.md", "notes.md", "src/main.rs"]);
+        assert_eq!(
+            paths,
+            vec![
+                "README.md",
+                "notes.md",
+                "src/hot.rs",
+                "src/live.rs",
+                "src/main.rs",
+                "src/pin.rs",
+            ]
+        );
         assert_eq!(all[1].lines, 0);
-        assert_eq!(all[2].lines, 3);
+        assert_eq!(all[4].lines, 3);
 
         let under = super::list_files(&c, "alpha", "src/").unwrap();
-        assert_eq!(under.len(), 1);
+        assert_eq!(under.len(), 4);
+    }
+
+    /// `edit_mode` comes back raw, NULL included, because `-l` and
+    /// `--edit-mode non-immutable` need to tell NULL from the literal
+    /// `'immutable'` and cannot once it is coalesced. Every row in the
+    /// live database is NULL, so the fixture is the only place this is
+    /// observable.
+    #[test]
+    fn edit_mode_is_returned_raw_including_its_null() {
+        use super::EditModeFilter as F;
+        let c = testdb::fixture();
+        let all = super::list_files(&c, "alpha", "").unwrap();
+        let mode = |p: &str| all.iter().find(|f| f.path == p).unwrap().edit_mode.clone();
+        assert_eq!(mode("src/main.rs"), None);
+        assert_eq!(mode("src/hot.rs").as_deref(), Some("hot-reload"));
+        assert_eq!(mode("src/pin.rs").as_deref(), Some("immutable"));
+
+        // `non-immutable` excludes both NULL and the literal.
+        let kept: Vec<&str> = all
+            .iter()
+            .filter(|f| F::NonImmutable.keeps(f.edit_mode.as_deref()))
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(kept, vec!["src/hot.rs", "src/live.rs"]);
+
+        // And `--edit-mode immutable` matches the literal only, not the
+        // NULL that means the same thing — Python compares the raw
+        // column, so on live data this selects nothing at all.
+        let pinned: Vec<&str> = all
+            .iter()
+            .filter(|f| F::Exactly("immutable").keeps(f.edit_mode.as_deref()))
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(pinned, vec!["src/pin.rs"]);
     }
 
     /// `_` must not act as a LIKE wildcard. `beta` has `a_b.txt` and

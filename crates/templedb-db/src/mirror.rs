@@ -108,6 +108,7 @@ const TABLES: &[TableSpec] = &[
             "status",
             "file_type_id",
             "lines_of_code",
+            "edit_mode",
         ],
         types: &[
             Type::INT8,
@@ -116,6 +117,7 @@ const TABLES: &[TableSpec] = &[
             Type::TEXT,
             Type::INT8,
             Type::INT8,
+            Type::TEXT,
         ],
         key: &["id"],
         page: 2000,
@@ -523,8 +525,8 @@ mod tests {
         let src = crate::testdb::fixture();
         for (table, key, expected) in [
             ("projects", "id", 3),
-            ("project_files", "id", 10),
-            ("content_blobs", "hash_sha256", 7),
+            ("project_files", "id", 15),
+            ("content_blobs", "hash_sha256", 9),
             ("entities", "id", 7),
             ("relations", "id", 5),
         ] {

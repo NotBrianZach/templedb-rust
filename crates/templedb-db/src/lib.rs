@@ -83,12 +83,13 @@ pub use backend::pg::PgStore;
 pub use backend::sqlite::SqliteStore;
 pub use conn::{db_path, open_ro, target, Target, URL_ENV};
 pub use dialect::Dialect;
-pub use difflib::{splitlines, unified_diff, Match, Opcode, SequenceMatcher, Tag};
+pub use difflib::{context_diff, splitlines, unified_diff, Match, Opcode, SequenceMatcher, Tag};
 pub use entities::{
     dead_imports, entity_stats, explore, observations, search_entities, shortest_path, trace,
-    DeadImport, Direction, Edge, EntityMatch, Explored, Observation, PathResult, TraceHit,
+    DeadImport, Direction, Edge, EntityMatch, Explored, GraphStats, Observation, PathResult,
+    TraceHit, Traced,
 };
-pub use files::{list_files, read_file, FileEntry};
+pub use files::{list_files, read_file, EditModeFilter, FileEntry};
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
 pub use mirror::{mirror, TableReport, READ_SUBSET_DDL};
 pub use projects::{list_projects, project_detail, Project, ProjectDetail};
@@ -98,7 +99,7 @@ pub use store::Store;
 pub use value::{Row, Value};
 pub use vcs::{
     branches, commit_detail, commit_log, content_at_commit, content_versions, current_content,
-    parent_hash, version_text, BranchEntry, CommitContent, CommitDetail, CommitEntry,
+    parent_hash, version_text, BlobKind, BranchEntry, CommitContent, CommitDetail, CommitEntry,
     ContentVersion, FileChange, Visibility,
 };
 

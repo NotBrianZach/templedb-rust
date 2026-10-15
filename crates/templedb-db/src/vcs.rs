@@ -408,6 +408,34 @@ pub struct CommitContent {
     /// for a deletion, whose content at that commit really is nothing.
     pub content: Option<String>,
     pub label: String,
+    /// Why there is no content, when there is none.
+    ///
+    /// `content: None` alone cannot answer that, and `vcs show` prints a
+    /// different line for each reason — which is the whole point of
+    /// carrying it. See [`BlobKind`].
+    pub kind: BlobKind,
+}
+
+/// Why a blob produced text, or did not.
+///
+/// Python returns this as the third element of
+/// `_get_content_at_commit`'s tuple and branches `vcs show` on it, so
+/// the distinction is on stdout rather than being a diagnostic.
+/// `Text` with `content: Some("")` is a deletion; `Text` with real
+/// content is the ordinary case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobKind {
+    /// `content_text` is populated. Also the kind for a deletion and for
+    /// a root commit's empty old side, both of which are genuinely empty
+    /// text rather than absent content.
+    Text,
+    /// `content_binary` is populated and `content_text` is not.
+    Binary,
+    /// The blob row is absent, or present with neither column
+    /// populated — a hash that names nothing.
+    Missing,
+    /// The commit, or the file's state within it, was not found.
+    NotFound,
 }
 
 /// `commit_hash[:8]`, which is how Python abbreviates every hash it
@@ -447,6 +475,7 @@ pub fn content_at_commit(
         return Ok(CommitContent {
             content: None,
             label: format!("commit {commit_ref} not found"),
+            kind: BlobKind::NotFound,
         });
     };
     let (commit_id, commit_hash) = (commit.get_i64(0)?, commit.get_string(1)?);
@@ -471,60 +500,103 @@ pub fn content_at_commit(
         return Ok(CommitContent {
             content: None,
             label: format!("file not in commit {}", short(&commit_hash)),
+            kind: BlobKind::NotFound,
         });
     };
     if state.get_string(0)? == "deleted" {
         return Ok(CommitContent {
             content: Some(String::new()),
             label: format!("deleted in {}", short(&commit_hash)),
+            // Python's third element here is the string `"deleted"`,
+            // which neither of its two callers tests for: `vcs show`
+            // asks only about `binary` and `missing`, and `vcs diff`
+            // ignores the kind entirely. Folded into `Text` because the
+            // content really is empty text, and a variant no branch
+            // reads would be a distinction this port invented.
+            kind: BlobKind::Text,
         });
     }
     let Some(hash) = state.get_opt_string(1)? else {
         return Ok(CommitContent {
             content: None,
             label: format!("content unavailable at {}", short(&commit_hash)),
+            kind: BlobKind::Missing,
         });
     };
 
-    // From here the label is the hash whether or not the blob produces
-    // text, which is Python's shape: `content, _ = get_content_by_hash`
-    // then `return content, commit_hash[:8]`. A missing or non-text blob
-    // therefore yields no content under a perfectly ordinary label, and
-    // the two callers treat that differently — `vcs show` coerces it to
-    // the empty string and prints "No differences", `vcs diff` errors
-    // and exits 1. Both are reproduced.
+    // From here the label is the hash whichever column the blob turns
+    // out to hold, which is Python's shape: `content, _ =
+    // get_content_by_hash` then `return content, commit_hash[:8]`. So a
+    // binary or absent blob yields no content under a perfectly
+    // ordinary label, and the kind is what tells the callers apart.
+    let (content, kind) = blob_text(store, &hash)?;
     Ok(CommitContent {
-        content: blob_text(store, &hash)?,
+        content,
         label: short(&commit_hash),
+        kind,
     })
 }
 
-/// A blob's text, or `None` when it is absent or not text.
+/// A blob's text, and which of the three reasons it is absent when it
+/// is.
 ///
-/// The `content_type != 'text'` test is Python's, and it is **wrong** —
-/// reproduced because it is on stdout. `content_blobs.content_type` is
-/// not two-valued: alongside 4,078 `text` and 37 genuinely binary rows,
-/// the live database holds 9 `text/plain` and 5 `text/x-shellscript`
-/// blobs, all with real `content_text` and no bytes. Those 14 are
-/// ordinary source files classified as binary, which is why
-/// `templedb vcs show templedb 40E93339139FA809` reports a newly added
-/// 125-line Prolog file as having no differences. Filed as handoff #20;
-/// the two implementations have to agree until it is fixed there.
-fn blob_text(store: &dyn Store, hash: &str) -> Result<Option<String>> {
+/// **The decision is made on the data, not on `content_type`**, and
+/// that is the whole content of this function. `content_blobs.
+/// content_type` is not two-valued: alongside 4,078 `text` and 37
+/// genuinely binary rows the live database holds 9 `text/plain`, 5
+/// `text/x-shellscript` and 2 `binary_asset`. An exact `== 'text'` test
+/// calls those 14 text blobs binary — 22 `vcs_file_states` rows across
+/// 15 commits — so `vcs show templedb 40E93339139FA809` printed
+/// `No differences` directly under `✨ added src/services/env_logic.pl
+/// (125 lines)`, and `vcs diff` of any revision of
+/// `src/gui_pages/README.md` exited 1 claiming the content was deleted
+/// or corrupted. `binary_asset` only came out right by falling into the
+/// same else.
+///
+/// This port originally reproduced the `== 'text'` test, because it was
+/// on stdout and the two implementations had to agree. Python has since
+/// fixed it — `content_text is not None` decides — so reproducing it is
+/// now the divergence rather than the parity, and the port follows.
+/// `content_type` says what the file *is*, not which column holds it.
+///
+/// Worth noting that `source.rs`'s `snapshot_body` has always decided
+/// on the columns — its comment reads "`content_type` is advisory; the
+/// columns are the truth" — so the port held both answers at once, in
+/// two modules, for as long as it reproduced the bug here. The
+/// Python-parity argument was what kept them apart, and it only applied
+/// to one of them.
+fn blob_text(store: &dyn Store, hash: &str) -> Result<(Option<String>, BlobKind)> {
+    // `content_blob IS NOT NULL` rather than the column itself: the
+    // only question asked of it is whether it is populated, and
+    // selecting it would pull a binary file's bytes across the wire — up
+    // to several MB on Postgres — to be dropped. Python does fetch it,
+    // because `sqlite3` hands over the whole row either way.
+    //
+    // The cast is because the two backends type the predicate
+    // differently: SQLite gives an integer, Postgres a boolean, and
+    // `get_i64` would refuse the latter.
     let blob = store
         .query_opt(
-            "SELECT content_text, content_type FROM content_blobs
+            "SELECT content_text,
+                    CASE WHEN content_blob IS NOT NULL THEN 1 ELSE 0 END
+               FROM content_blobs
               WHERE hash_sha256 = ?1",
             &[Value::from(hash)],
         )
         .context("reading a content blob")?;
     let Some(blob) = blob else {
-        return Ok(None);
+        return Ok((None, BlobKind::Missing));
     };
-    if blob.get_opt_string(1)?.as_deref() != Some("text") {
-        return Ok(None);
+    if let Some(text) = blob.get_opt_string(0)? {
+        return Ok((Some(text), BlobKind::Text));
     }
-    blob.get_opt_string(0)
+    if blob.get_i64(1)? == 1 {
+        return Ok((None, BlobKind::Binary));
+    }
+    // The row exists and carries no content in either column. Distinct
+    // from "identical", which is what the caller would otherwise render
+    // it as.
+    Ok((None, BlobKind::Missing))
 }
 
 /// The file's current text, from whichever `file_contents` row is
@@ -546,7 +618,10 @@ pub fn current_content(store: &dyn Store, file_id: i64) -> Result<Option<String>
     let Some(hash) = row.get_opt_string(0)? else {
         return Ok(None);
     };
-    blob_text(store, &hash)
+    // The kind is dropped here because Python's `_get_current_content`
+    // drops it too: it returns `content_type or "current"` as a label
+    // its one caller ignores. Only the commit path branches on the kind.
+    Ok(blob_text(store, &hash)?.0)
 }
 
 /// One stored revision of a file's content.
@@ -589,7 +664,9 @@ pub fn content_versions(store: &dyn Store, file_id: i64) -> Result<Vec<ContentVe
 /// [`content_versions`] needs to render a diff.
 pub fn version_text(store: &dyn Store, v: &ContentVersion) -> Result<Option<String>> {
     match &v.content_hash {
-        Some(h) => blob_text(store, h),
+        // Kind dropped for the same reason as `current_content`: this
+        // form of `vcs diff` reads only Python's content element.
+        Some(h) => Ok(blob_text(store, h)?.0),
         None => Ok(None),
     }
 }
@@ -1008,13 +1085,67 @@ mod tests {
         assert_eq!(orphan.content, None);
         assert_eq!(orphan.label, "CAFE0001");
 
-        // A blob that is not text. This is the one that produces a wrong
-        // answer downstream — `vcs show` prints "No differences" for a
-        // file that did change — and it is Python's answer. See
-        // `blob_text` and handoff #20.
+        // A genuinely binary blob: no content, under the ordinary hash
+        // label, and the kind is what lets `vcs show` say so rather
+        // than printing "No differences".
         let binary = at(&c, 2, "logo.png", "B1");
         assert_eq!(binary.content, None);
         assert_eq!(binary.label, "B1");
+        assert_eq!(binary.kind, BlobKind::Binary);
+    }
+
+    /// `content_type` is not consulted at all: `content_text` being
+    /// populated is what makes a blob text.
+    ///
+    /// This is the behaviour both implementations originally got wrong
+    /// and Python fixed first — an exact `content_type = 'text'` test
+    /// called 14 live blobs binary, so `vcs show` printed
+    /// `No differences` under a 125-line addition and `vcs diff` exited
+    /// 1 claiming the content was deleted or corrupted. See
+    /// [`blob_text`].
+    #[test]
+    fn a_blob_is_text_when_it_holds_text_whatever_its_content_type_says() {
+        let c = testdb::fixture();
+        let r = at(&c, 2, "script.sh", "B1");
+        assert_eq!(r.kind, BlobKind::Text);
+        assert_eq!(r.content.as_deref(), Some("#!/bin/sh\nexit 0\n"));
+        assert_eq!(r.label, "B1");
+    }
+
+    /// A blob row with neither column populated is `Missing`, not
+    /// `Binary` and not empty text. Three facts, three kinds — and the
+    /// reason `vcs show` can tell "nothing changed" from "the bytes are
+    /// gone".
+    #[test]
+    fn a_blob_with_no_content_in_either_column_is_missing() {
+        let c = testdb::fixture();
+        let hollow = at(&c, 2, "hollow.txt", "B1");
+        assert_eq!(hollow.content, None);
+        assert_eq!(hollow.kind, BlobKind::Missing);
+
+        // And so is a hash with no row at all, which is the other way
+        // to reach the same kind under the same label shape.
+        assert_eq!(at(&c, 2, "orphan.txt", "CAFE0001").kind, BlobKind::Missing);
+
+        // A NULL content_hash on a non-deleted row, too — that one
+        // never looks a blob up.
+        assert_eq!(
+            at(&c, 2, "removed.txt", "DEAD0002").kind,
+            // ...except a deletion, which is empty *text*.
+            BlobKind::Text
+        );
+    }
+
+    /// The kinds for the two ways a lookup finds nothing to look up.
+    /// Neither is `Missing`: `vcs show` prints the same line for them
+    /// as for a missing blob, but only via its both-sides-absent
+    /// disjunct, and collapsing them here would lose that distinction.
+    #[test]
+    fn an_unresolved_commit_or_file_is_not_found() {
+        let c = testdb::fixture();
+        assert_eq!(at(&c, 1, "src/main.rs", "nope").kind, BlobKind::NotFound);
+        assert_eq!(at(&c, 1, "no/such.rs", "C1").kind, BlobKind::NotFound);
+        assert_eq!(at(&c, 1, "README.md", "C1").kind, BlobKind::NotFound);
     }
 
     /// A NULL `content_hash` on a non-deleted row is its own label.

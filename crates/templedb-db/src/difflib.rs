@@ -41,12 +41,13 @@
 //!   two suffice, and two of them dead. If a caller ever needs it, the
 //!   shape to restore is in CPython's `Lib/difflib.py`.
 //!
-//! `ratio`, `quick_ratio`, `get_close_matches`, `context_diff`,
-//! `HtmlDiff` and `Differ` are likewise absent: nothing in the ported
-//! surface calls them. `context_diff` is the one with a live Python
-//! caller (`vcs diff --context`), and porting it is a day's work on top
-//! of this module rather than a redesign, because it consumes the same
-//! [`SequenceMatcher::grouped_opcodes`].
+//! `context_diff` is here too, because `vcs diff --side-by-side` renders
+//! through it. It consumes the same [`SequenceMatcher::grouped_opcodes`]
+//! as `unified_diff` and adds only a second line format, which is why it
+//! cost a function rather than an algorithm.
+//!
+//! `ratio`, `quick_ratio`, `get_close_matches`, `HtmlDiff` and `Differ`
+//! are absent: nothing in the ported surface calls them.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -460,6 +461,111 @@ pub fn unified_diff(a: &[&str], b: &[&str], fromfile: &str, tofile: &str, n: usi
     out
 }
 
+/// One side of a `***`/`---` header, in the *other* `ed` notation.
+///
+/// This is not [`format_range_unified`] with different punctuation. A
+/// unified range is `start,length`; a context range is
+/// `first,last` — both endpoints, inclusive — so the same hunk prints
+/// `1,4` either way only when it happens to start at line 1. A four-line
+/// hunk at line 10 is `10,4` unified and `10,13` here.
+///
+/// The two degenerate cases agree with unified in spirit and differ in
+/// output: a one-line range is a bare number in both, but an *empty*
+/// range is a bare number here (the line before the range) where unified
+/// prints `N,0`.
+fn format_range_context(start: usize, stop: usize) -> String {
+    let mut beginning = start + 1;
+    let length = stop - start;
+    if length == 0 {
+        beginning -= 1;
+    }
+    if length <= 1 {
+        return beginning.to_string();
+    }
+    format!("{beginning},{}", beginning + length - 1)
+}
+
+/// `difflib.context_diff` with `lineterm=''`, which is what
+/// `vcs diff --side-by-side` prints.
+///
+/// The flag's name is a misnomer inherited from Python: nothing here is
+/// side by side. `_display_diff(unified=False)` calls `context_diff`,
+/// which prints the two files' versions of each hunk one after the
+/// other — old block, then new block — not in two columns. Reproduced
+/// under the misleading name because the name is the CLI's contract.
+///
+/// Two differences from [`unified_diff`] beyond the line prefixes, both
+/// easy to miss and both visible in the output:
+///
+/// - **A side is omitted entirely when it has no changes.** A hunk that
+///   only inserts prints its `*** r ****` header with no lines under it,
+///   because the `any(tag in {replace, delete})` test fails. The header
+///   is still printed; only the body is skipped.
+/// - **Equal lines appear on both sides**, so a hunk of context costs
+///   twice the lines a unified hunk does.
+///
+/// Returns an empty vector when the sequences are equal, as
+/// [`unified_diff`] does, so the caller's `No differences` branch is the
+/// same for both renderers.
+pub fn context_diff(a: &[&str], b: &[&str], fromfile: &str, tofile: &str, n: usize) -> Vec<String> {
+    // Python builds this as a dict keyed on the tag; the match arms
+    // below are the same table.
+    fn prefix(tag: Tag) -> &'static str {
+        match tag {
+            Tag::Insert => "+ ",
+            Tag::Delete => "- ",
+            Tag::Replace => "! ",
+            Tag::Equal => "  ",
+        }
+    }
+
+    let matcher = SequenceMatcher::new(a, b);
+    let mut out = Vec::new();
+
+    for group in matcher.grouped_opcodes(n) {
+        if out.is_empty() {
+            out.push(format!("*** {fromfile}"));
+            out.push(format!("--- {tofile}"));
+        }
+
+        let (first, last) = (group[0], group[group.len() - 1]);
+        out.push("***************".to_string());
+
+        out.push(format!(
+            "*** {} ****",
+            format_range_context(first.i1, last.i2)
+        ));
+        if group
+            .iter()
+            .any(|c| matches!(c.tag, Tag::Replace | Tag::Delete))
+        {
+            for code in &group {
+                if code.tag != Tag::Insert {
+                    let p = prefix(code.tag);
+                    out.extend(a[code.i1..code.i2].iter().map(|l| format!("{p}{l}")));
+                }
+            }
+        }
+
+        out.push(format!(
+            "--- {} ----",
+            format_range_context(first.j1, last.j2)
+        ));
+        if group
+            .iter()
+            .any(|c| matches!(c.tag, Tag::Replace | Tag::Insert))
+        {
+            for code in &group {
+                if code.tag != Tag::Delete {
+                    let p = prefix(code.tag);
+                    out.extend(b[code.j1..code.j2].iter().map(|l| format!("{p}{l}")));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `str.splitlines()`, which is not `str::lines()`.
 ///
 /// Python splits on a set of boundaries that `lines()` does not know
@@ -802,5 +908,155 @@ mod tests {
             unified_diff(&a, &b, "old", "new", 0),
             ["--- old", "+++ new", "@@ -2 +2 @@", "-b", "+X"]
         );
+    }
+
+    /// The example in `context_diff`'s own CPython docstring, which is
+    /// the one case whose expected output is published rather than
+    /// derived here. It exercises `!` on both sides and `+` on one.
+    #[test]
+    fn context_diff_matches_cpythons_documented_example() {
+        let a = lines("one\ntwo\nthree\nfour\n");
+        let b = lines("zero\none\ntree\nfour\n");
+        assert_eq!(
+            context_diff(&a, &b, "Original", "Current", 3),
+            [
+                "*** Original",
+                "--- Current",
+                "***************",
+                "*** 1,4 ****",
+                "  one",
+                "! two",
+                "! three",
+                "  four",
+                "--- 1,4 ----",
+                "+ zero",
+                "  one",
+                "! tree",
+                "  four",
+            ]
+        );
+    }
+
+    /// Equal sequences give nothing, so the caller prints
+    /// `No differences` for both renderers off the same emptiness test.
+    #[test]
+    fn context_diff_of_equal_sequences_is_empty() {
+        let a = lines("a\nb\nc\n");
+        assert!(context_diff(&a, &a, "old", "new", 3).is_empty());
+    }
+
+    /// A context range is `first,last`, not `start,length` — the one
+    /// difference between the two header formats that a reader is likely
+    /// to get wrong, because both read as a comma-separated pair. A
+    /// four-line hunk at line 10 is `10,13` here and `10,4` unified.
+    #[test]
+    fn a_context_range_names_both_endpoints() {
+        assert_eq!(format_range_context(9, 13), "10,13");
+        assert_eq!(format_range_unified(9, 13), "10,4");
+
+        let a: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        let mut b = a.clone();
+        b[12] = "changed".into();
+        let (av, bv): (Vec<&str>, Vec<&str>) = (
+            a.iter().map(String::as_str).collect(),
+            b.iter().map(String::as_str).collect(),
+        );
+        let diff = context_diff(&av, &bv, "old", "new", 3);
+        // Lines 10..16 one-based: seven lines, 13 changed with three
+        // either side.
+        assert_eq!(diff[3], "*** 10,16 ****");
+        assert_eq!(diff[11], "--- 10,16 ----");
+    }
+
+    /// An empty range is a bare number — the line *before* the range —
+    /// where the unified format prints `N,0`. Reached by appending to a
+    /// file with no trailing context, and by a brand-new file.
+    #[test]
+    fn an_empty_context_range_is_a_bare_number() {
+        assert_eq!(format_range_context(0, 0), "0");
+        assert_eq!(format_range_unified(0, 0), "0,0");
+
+        let diff = context_diff(&[], &["only"], "old", "new", 3);
+        assert_eq!(
+            diff,
+            [
+                "*** old",
+                "--- new",
+                "***************",
+                "*** 0 ****",
+                "--- 1 ----",
+                "+ only",
+            ]
+        );
+    }
+
+    /// The side with no changes prints its header and *no body*: the
+    /// `any(replace|delete)` test fails for a pure insertion, so the
+    /// `*** r ****` line is followed directly by `--- r ----`. Easy to
+    /// implement as "print the lines anyway" and the only way to notice
+    /// is a hunk that inserts without deleting.
+    #[test]
+    fn a_pure_insertion_prints_an_empty_old_side() {
+        let a = lines("a\nb\n");
+        let b = lines("a\nNEW\nb\n");
+        assert_eq!(
+            context_diff(&a, &b, "old", "new", 3),
+            [
+                "*** old",
+                "--- new",
+                "***************",
+                "*** 1,2 ****",
+                "--- 1,3 ----",
+                "  a",
+                "+ NEW",
+                "  b",
+            ]
+        );
+
+        // And the mirror image: a pure deletion prints no new side.
+        assert_eq!(
+            context_diff(&b, &a, "old", "new", 3),
+            [
+                "*** old",
+                "--- new",
+                "***************",
+                "*** 1,3 ****",
+                "  a",
+                "- NEW",
+                "  b",
+                "--- 1,2 ----",
+            ]
+        );
+    }
+
+    /// Context lines are printed on *both* sides, unlike unified, so a
+    /// hunk of mostly context costs roughly twice the lines.
+    #[test]
+    fn context_lines_appear_on_both_sides() {
+        let a = lines("a\nb\nc\nd\ne\n");
+        let b = lines("a\nb\nX\nd\ne\n");
+        let ctx = context_diff(&a, &b, "old", "new", 3);
+        assert_eq!(ctx.iter().filter(|l| l.starts_with("  ")).count(), 8);
+        let uni = unified_diff(&a, &b, "old", "new", 3);
+        assert_eq!(uni.iter().filter(|l| l.starts_with(' ')).count(), 4);
+    }
+
+    /// Two distant changes each get their own `***************`, and the
+    /// header pair is printed once for the whole diff rather than per
+    /// hunk.
+    #[test]
+    fn each_hunk_gets_its_own_separator_and_the_header_is_printed_once() {
+        let a: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        let mut b = a.clone();
+        b[2] = "early".into();
+        b[27] = "late".into();
+        let (av, bv): (Vec<&str>, Vec<&str>) = (
+            a.iter().map(String::as_str).collect(),
+            b.iter().map(String::as_str).collect(),
+        );
+        let diff = context_diff(&av, &bv, "old", "new", 3);
+        assert_eq!(diff.iter().filter(|l| *l == "***************").count(), 2);
+        assert_eq!(diff.iter().filter(|l| l.starts_with("*** old")).count(), 1);
+        assert_eq!(diff.iter().filter(|l| l.starts_with("--- new")).count(), 1);
     }
 }

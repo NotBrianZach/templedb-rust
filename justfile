@@ -18,10 +18,13 @@
 # line and only the one-liners touch the recipe.
 #
 # The sweep is invoked as `bash scripts/...` rather than executed
-# directly. This tree is materialised out of TempleDB, which does not
-# carry the execute bit, so the shebang is not reachable: a plain
-# `scripts/parity-sweep.sh` fails with "Permission denied" in every
-# fresh workspace. `chmod +x` would fix it until the next materialise.
+# directly. TempleDB's content store does not carry the execute bit, so
+# a fresh `templedb edit` workspace — which is where this file runs —
+# has the script at 644 and the shebang is unreachable: a plain
+# `scripts/parity-sweep.sh` fails with "Permission denied". `publish`
+# restores the bit from git's index in the canonical checkout, which is
+# read-only and not where the sweep gets run. `chmod +x` here works
+# until the next materialise.
 
 # Hermetic tests, then the sweep against Python.
 default: check

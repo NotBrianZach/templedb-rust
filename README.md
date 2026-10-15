@@ -873,9 +873,13 @@ would have been a second compiler, which is the failure the comment on
 `rustToolchain` in `flake.nix` already records once.
 
 The sweep recipes invoke `bash scripts/parity-sweep.sh` rather than
-executing the script. This tree is materialised out of TempleDB, which
-does not carry the execute bit, so the shebang is unreachable and a
-direct call fails with `Permission denied` in every fresh workspace.
+executing the script, because the execute bit is present in exactly the
+tree where it is not needed. TempleDB's content store does not carry the
+mode, so a fresh `templedb edit` workspace — which is where `just` runs
+— has the script at 644 and a direct call fails with `Permission
+denied`. `publish` restores it from git's index when it materialises the
+canonical checkout, which is read-only and is not where anyone runs the
+sweep. `chmod +x` in a workspace works until the next materialise.
 
 ## Layout
 

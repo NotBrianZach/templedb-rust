@@ -136,6 +136,22 @@ python)
     ;;
 backends)
     [[ -n $ARG ]] || { echo "backends mode needs a Postgres URL" >&2; exit 2; }
+    # Refuse to compare against a stale mirror.
+    #
+    # This mode diffs SQLite against Postgres, so it is only a test of
+    # *this port* while both hold the same data. The moment the live
+    # SQLite moves, it silently becomes a test of replication lag. On
+    # 2026-10-16 a `publish` added rows and this went from 40 of 40
+    # identical to six differences -- project list, entity stats,
+    # entity explore, entity trace and two entity search rows -- none of
+    # which was a bug. Six convincing parity failures is a worse outcome
+    # than a refusal, because somebody will spend an afternoon on them.
+    if ! "$RS" mirror --check --to "$ARG" >/dev/null 2>&1; then
+        echo "refusing to sweep: the mirror is stale or cannot vouch for itself" >&2
+        "$RS" mirror --check --to "$ARG" 2>&1 >/dev/null | sed 's/^/  /' >&2
+        echo "  run \`just mirror-refresh\` first" >&2
+        exit 2
+    fi
     label="postgres"
     run_b() { TEMPLEDB_URL="$ARG" "$RS" "$@"; }
     # The mirror is as current as the last `mirror` run and the live

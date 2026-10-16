@@ -91,7 +91,10 @@ pub use entities::{
 };
 pub use files::{list_files, read_file, EditModeFilter, FileEntry};
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
-pub use mirror::{mirror, TableReport, READ_SUBSET_DDL};
+pub use mirror::{
+    check_freshness, mirror, Drift, FreshnessReport, TableReport, MIRRORED_TABLES,
+    READ_SUBSET_DDL,
+};
 pub use projects::{list_projects, project_detail, Project, ProjectDetail};
 pub use search::{search_content, SearchHit};
 pub use source::{revisions, snapshot, snapshot_body, Revision, Snapshot, SnapshotBody};

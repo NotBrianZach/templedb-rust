@@ -314,6 +314,151 @@ pub struct TableReport {
     pub rows: u64,
 }
 
+/// Where the mirror records what it copied, so a later run can be asked
+/// whether it is still current.
+///
+/// Not part of `001_read_subset.sql`: that file is the *subset of
+/// TempleDB's schema* this port reads, and nothing in TempleDB has a
+/// `mirror_provenance`. It is bookkeeping this command owns, created on
+/// demand so an existing mirror gains it on its next run rather than
+/// needing the destructive `--create-schema`.
+const PROVENANCE_DDL: &str = "
+CREATE TABLE IF NOT EXISTS mirror_provenance (
+    table_name TEXT PRIMARY KEY,
+    row_count  BIGINT NOT NULL,
+    copied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+)";
+
+/// How many tables the mirror covers, for callers that want to say so
+/// without reaching into [`TABLES`].
+pub const MIRRORED_TABLES: usize = TABLES.len();
+
+/// One table whose row count no longer matches the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub table: &'static str,
+    /// What `mirror` recorded when it last copied this table.
+    pub mirrored: i64,
+    /// What the live SQLite holds now.
+    pub source: i64,
+}
+
+/// The answer to "is this mirror still a faithful copy?"
+#[derive(Debug, Clone)]
+pub struct FreshnessReport {
+    /// `None` when the mirror predates provenance tracking, which is
+    /// not the same as fresh and must not be reported as such.
+    pub copied_at: Option<String>,
+    pub drift: Vec<Drift>,
+}
+
+impl FreshnessReport {
+    pub fn is_fresh(&self) -> bool {
+        self.copied_at.is_some() && self.drift.is_empty()
+    }
+}
+
+/// Compare recorded counts against live ones.
+///
+/// Split out from [`check_freshness`] so it can be tested without a
+/// Postgres server, which is the same reason the placeholder rewriting
+/// and `Value` getters are separable.
+///
+/// **What this does and does not catch.** Row counts catch inserts and
+/// deletes, which is what actually drifts here — a `publish` adds
+/// commits, file states and entities, and that is the case observed on
+/// 2026-10-16 when the cross-backend sweep went from 40/40 identical to
+/// six differences purely because the mirror had not been re-run. It
+/// does *not* catch an update in place: a row whose `is_current` flipped
+/// leaves the count alone. A per-table checksum would, at the cost of
+/// reading every row on both sides on every check, which is the copy
+/// this is trying to avoid. Counts are the cheap 90%, and claiming more
+/// than that would be worse than claiming less.
+fn compare_counts(recorded: &[(String, i64)], live: &[(&'static str, i64)]) -> Vec<Drift> {
+    let mut drift = Vec::new();
+    for (table, source) in live {
+        // A table absent from provenance is reported as drift rather
+        // than skipped: the mirror cannot vouch for it, and silence
+        // would read as agreement.
+        let mirrored = recorded
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, n)| *n)
+            .unwrap_or(-1);
+        if mirrored != *source {
+            drift.push(Drift {
+                table,
+                mirrored,
+                source: *source,
+            });
+        }
+    }
+    drift
+}
+
+/// Ask whether `dest_url` is still a faithful copy of `src`.
+///
+/// Reads 11 counts from each side and compares them. Does not write, to
+/// either side — so it is safe to run against a mirror the port is
+/// connected to read-only, and cheap enough to run before every sweep.
+pub fn check_freshness(src: &SqliteStore, dest_url: &str) -> Result<FreshnessReport> {
+    let mut client =
+        Client::connect(dest_url, NoTls).context("connecting to the mirror target")?;
+
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables
+                             WHERE table_name = 'mirror_provenance')",
+            &[],
+        )
+        .context("looking for mirror_provenance")?
+        .get(0);
+
+    if !exists {
+        return Ok(FreshnessReport {
+            copied_at: None,
+            drift: Vec::new(),
+        });
+    }
+
+    let mut recorded = Vec::new();
+    let mut copied_at = None;
+    for row in client
+        .query(
+            "SELECT table_name, row_count, copied_at::text FROM mirror_provenance",
+            &[],
+        )
+        .context("reading mirror_provenance")?
+    {
+        recorded.push((row.get::<_, String>(0), row.get::<_, i64>(1)));
+        let at: String = row.get(2);
+        // The oldest copy time, because a mirror is only as fresh as
+        // its stalest table.
+        if copied_at.as_ref().is_none_or(|c: &String| at < *c) {
+            copied_at = Some(at);
+        }
+    }
+
+    let mut live = Vec::new();
+    for spec in TABLES {
+        let rows = src.query(&format!("SELECT COUNT(*) FROM {}", spec.name), &[])?;
+        let n = rows
+            .first()
+            .and_then(|r| r.value(0).ok())
+            .and_then(|v| match v {
+                Value::Int(i) => Some(*i),
+                _ => None,
+            })
+            .unwrap_or(0);
+        live.push((spec.name, n));
+    }
+
+    Ok(FreshnessReport {
+        copied_at,
+        drift: compare_counts(&recorded, &live),
+    })
+}
+
 /// Copy every table in the read subset from `src` into `dest_url`.
 ///
 /// Destructive on the destination and only on the destination: the
@@ -354,6 +499,22 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
             table: spec.name,
             rows,
         });
+    }
+
+    // Provenance goes in the same transaction as the copy. If it were a
+    // separate one, an interrupted run could leave counts claiming a
+    // copy that rolled back — a mirror that reports itself fresh while
+    // being empty is worse than one that cannot answer at all.
+    tx.batch_execute(PROVENANCE_DDL)
+        .context("creating mirror_provenance")?;
+    tx.execute("DELETE FROM mirror_provenance", &[])
+        .context("clearing mirror_provenance")?;
+    for report in &reports {
+        tx.execute(
+            "INSERT INTO mirror_provenance (table_name, row_count) VALUES ($1, $2)",
+            &[&report.table, &(report.rows as i64)],
+        )
+        .with_context(|| format!("recording provenance for {}", report.table))?;
     }
 
     tx.commit().context("committing the mirror")?;
@@ -448,6 +609,80 @@ fn copy_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
+        pairs.iter().map(|(t, n)| (t.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn matching_counts_are_not_drift() {
+        let drift = compare_counts(
+            &rec(&[("projects", 25), ("entities", 68403)]),
+            &[("projects", 25), ("entities", 68403)],
+        );
+        assert!(drift.is_empty(), "{drift:?}");
+    }
+
+    /// The case observed on 2026-10-16: publishing added rows, so the
+    /// mirror's counts were low and six sweep rows differed for reasons
+    /// that had nothing to do with the port.
+    #[test]
+    fn a_source_that_grew_is_drift() {
+        let drift = compare_counts(
+            &rec(&[("entities", 68403), ("relations", 77481)]),
+            &[("entities", 68403), ("relations", 77674)],
+        );
+        assert_eq!(
+            drift,
+            vec![Drift {
+                table: "relations",
+                mirrored: 77481,
+                source: 77674,
+            }]
+        );
+    }
+
+    /// Deletions drift too. Counting only growth would miss a source
+    /// that shrank, which is the shape a row removal takes.
+    #[test]
+    fn a_source_that_shrank_is_also_drift() {
+        let drift = compare_counts(&rec(&[("projects", 25)]), &[("projects", 24)]);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].source, 24);
+    }
+
+    /// A table the mirror never recorded cannot be vouched for, so it
+    /// is drift rather than a silent pass. `-1` is the sentinel for
+    /// "absent", which no real count can collide with.
+    #[test]
+    fn a_table_missing_from_provenance_is_drift() {
+        let drift = compare_counts(&rec(&[("projects", 25)]), &[("projects", 25), ("entities", 7)]);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].table, "entities");
+        assert_eq!(drift[0].mirrored, -1);
+    }
+
+    /// Provenance absent entirely — an older mirror — is reported as
+    /// not-fresh, never as fresh. The distinction matters because the
+    /// sweep refuses on it, and defaulting to fresh would make the
+    /// check worthless on exactly the mirrors that need it.
+    #[test]
+    fn a_mirror_without_provenance_is_not_fresh() {
+        let report = FreshnessReport {
+            copied_at: None,
+            drift: Vec::new(),
+        };
+        assert!(!report.is_fresh());
+    }
+
+    #[test]
+    fn a_recorded_mirror_with_no_drift_is_fresh() {
+        let report = FreshnessReport {
+            copied_at: Some("2026-10-16 10:00:00+00".to_string()),
+            drift: Vec::new(),
+        };
+        assert!(report.is_fresh());
+    }
 
     /// The DDL is compiled in, so a typo that makes it unparseable is a
     /// build-time problem rather than a problem for whoever runs the

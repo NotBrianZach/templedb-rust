@@ -63,7 +63,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-200 unit tests, run by `cargo test`: 187 in `templedb-db` and 13 in
+206 unit tests, run by `cargo test`: 193 in `templedb-db` and 13 in
 `templedb-cli` for the formatting the SQL layer cannot see. Three more
 are `#[ignore]`d because they need `python3`: they drive CPython's
 `difflib` as a reference oracle for *both* renderers, and are described
@@ -910,6 +910,46 @@ Measured 2026-10-16, with the mirror above: **40 of 40 invocations are
 stdout-identical between the SQLite and Postgres backends**, through the
 read-only role. The Postgres read path is not a plan.
 
+**The sweep refuses to run on a stale mirror**, and that guard was
+written the same afternoon it was needed. `sweep-pg` diffs SQLite
+against Postgres, so it only tests *this port* while both hold the same
+data; the moment the live SQLite moves it silently becomes a test of
+replication lag. Publishing added rows and the sweep went from 40 of 40
+to six differences — `project list`, `entity stats`, `entity explore`,
+`entity trace` and two `entity search` rows — not one of them a bug.
+Six convincing parity failures is a worse outcome than a refusal,
+because somebody will spend an afternoon on them.
+
+So `mirror` now records what it copied, in a `mirror_provenance` table
+it creates on demand and writes **inside the copy's transaction** — an
+interrupted run must not leave counts vouching for a copy that rolled
+back.
+
+```bash
+just pg-check         # fresh: all 11 tables match the source
+just mirror-refresh   # when it isn't
+just sweep-pg-fresh   # refresh, then sweep -- the form to actually use
+```
+
+`mirror --check` exits 4 on drift and names the tables with their two
+counts. A mirror predating provenance reports *cannot vouch for itself*
+rather than *fresh*, because defaulting to fresh would disarm the check
+on exactly the mirrors needing it. `sweep-pg` runs the check first and
+exits 2 rather than producing a comparison it cannot stand behind.
+
+Row counts catch inserts and deletes — what actually drifts here — and
+**not updates in place**: a row whose `is_current` flipped leaves the
+count alone. A per-table checksum would catch those, at the cost of
+reading every row on both sides on every check, which is the copy the
+check exists to avoid. Six unit tests pin the comparison, including the
+grew/shrank/absent cases and the no-provenance one, and they need no
+server because the comparison is split from the queries.
+
+Note that `sweep-pg` on its own refuses more often than it runs: any
+`templedb commit`, in any project, adds rows. `sweep-pg-fresh` is the
+convenience form, and refreshing is deliberately *not* folded into
+`sweep-pg` — that would hide the staleness the check exists to surface.
+
 **Neither the cluster nor its socket is inside the project tree**, and
 both exclusions were learned rather than designed.
 
@@ -949,7 +989,7 @@ what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (200) | yes | yes |
+| unit tests (206) | yes | yes |
 | difflib oracle vs CPython | yes | yes |
 | 40-invocation parity sweep | **no** | yes |
 
@@ -960,7 +1000,7 @@ wired in pretending otherwise. What it *can* do it now does: the
 `#[ignore]`d oracle tests with `--ignored`, from the crate directory,
 because `cargo test` alone skips them and the one that reads this
 repository's own source needs that working directory. Verified running
-rather than merely compiling: 187 + 13 unit tests and 3 oracle tests
+rather than merely compiling: 193 + 13 unit tests and 3 oracle tests
 pass inside the sandbox.
 
 Both `checks` and `packages` build with the same `rust-bin` toolchain

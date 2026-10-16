@@ -81,6 +81,21 @@ enum Command {
         /// copied, which is the right outcome for a typo'd URL.
         #[arg(long)]
         create_schema: bool,
+        /// Report whether the mirror is still current, and copy
+        /// nothing.
+        ///
+        /// Compares the row counts `mirror` recorded against the live
+        /// SQLite and exits 4 if they disagree. Exists because a stale
+        /// mirror does not announce itself: on 2026-10-16 a `publish`
+        /// added rows and the cross-backend sweep went from 40 of 40
+        /// identical to six differences, every one of them replication
+        /// lag rather than a bug in this port. Six rows of parity
+        /// failure is a very convincing way to be wrong.
+        ///
+        /// Catches inserts and deletes, not updates in place. See
+        /// `compare_counts`.
+        #[arg(long, conflicts_with = "create_schema")]
+        check: bool,
     },
 }
 
@@ -432,8 +447,44 @@ fn run() -> Result<i32> {
     // the environment's store first would make `mirror --to <url>`
     // fail whenever `TEMPLEDB_URL` happened to be set, which is
     // precisely when someone is working on the mirror.
-    if let Command::Mirror { to, create_schema } = &cli.command {
+    if let Command::Mirror {
+        to,
+        create_schema,
+        check,
+    } = &cli.command
+    {
         let src = templedb_db::SqliteStore::open_ro(&templedb_db::db_path()?)?;
+        if *check {
+            let report = templedb_db::check_freshness(&src, to)?;
+            match &report.copied_at {
+                None => {
+                    eprintln!(
+                        "mirror has no provenance: it predates `--check`, so it cannot\n\
+                         vouch for itself. Re-run `mirror` to record one."
+                    );
+                    return Ok(4);
+                }
+                Some(at) => println!("mirrored at {at}"),
+            }
+            if report.drift.is_empty() {
+                println!(
+                    "fresh: all {} tables match the source",
+                    templedb_db::MIRRORED_TABLES
+                );
+                return Ok(0);
+            }
+            eprintln!("STALE: {} table(s) have moved since the mirror", report.drift.len());
+            for d in &report.drift {
+                let was = if d.mirrored < 0 {
+                    "absent".to_string()
+                } else {
+                    d.mirrored.to_string()
+                };
+                eprintln!("  {:<20} mirrored {:>9}  source {:>9}", d.table, was, d.source);
+            }
+            eprintln!("\nRe-run `mirror` before trusting a cross-backend comparison.");
+            return Ok(4);
+        }
         let reports = templedb_db::mirror(&src, to, *create_schema)?;
         let total: u64 = reports.iter().map(|r| r.rows).sum();
         for r in &reports {

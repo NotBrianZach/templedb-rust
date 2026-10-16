@@ -210,10 +210,25 @@ mirror: build
 mirror-refresh: build
     ./target/release/templedb-rs mirror --to "{{PG_PARITY_RW}}"
 
+# Is the parity database still a faithful copy? Exits 4 if not.
+pg-check: build
+    ./target/release/templedb-rs mirror --check --to "{{PG_PARITY_RO}}"
+
 # The cross-backend sweep against the local parity database, through the
-# read-only role.
+# read-only role. Refuses to run on a stale mirror -- see the staleness
+# note in scripts/parity-sweep.sh.
 sweep-pg: build
     bash scripts/parity-sweep.sh backends "{{PG_PARITY_RO}}"
+
+# Refresh first, then sweep. The convenience form, and the one to reach
+# for in practice: any `templedb commit` anywhere adds rows and makes
+# the mirror stale, so the bare `sweep-pg` refuses more often than not.
+#
+# Deliberately NOT what `sweep-pg` does on its own. Auto-refreshing
+# would hide the staleness the check exists to surface, and a sweep that
+# silently re-copies 194k rows before every run is a different, slower
+# command wearing the same name.
+sweep-pg-fresh: mirror-refresh sweep-pg
 
 # Prove the read-only role is actually enforced rather than assumed.
 # Expected: the SELECT succeeds and the UPDATE is refused.

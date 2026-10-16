@@ -20,7 +20,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs file cat <proj> <path>` | byte-identical output |
 | `templedb-rs file ls <proj> [prefix] [-l] [--edit-mode]` | byte-identical |
 | `templedb-rs entity stats` | byte-identical, both sections |
-| `templedb-rs search content <pat> [-p] [--limit]` | **deliberately different** — substring, not stemmed, and a different layout; see below |
+| `templedb-rs search content <pat> [-p] [--limit]` | **deliberately different** — substring, not stemmed, and a different layout; Python's `-i` and `--no-fts` not ported; see below |
 | `templedb-rs entity explore <kind>/<ref>` | same edge set; **ordering differs on purpose** — see below |
 | `templedb-rs entity trace <kind>/<ref> [--depth] [--direction] [--via] [--limit]` | byte-identical, truncation advisory included |
 | `templedb-rs source snapshot <proj> <path> [--rev] [--meta]` | byte-identical |
@@ -788,6 +788,29 @@ Differences that are not deliberate and are not yet closed.
   real cost and it only buys speed, not a different answer.
 - **`search content` no longer accepts FTS5 operators.** No `OR`,
   `NEAR` or prefix `*`. Terms are ANDed, quotes group a phrase.
+- **`search content`'s flag surface differs from Python's, deliberately.**
+  Decided 2026-10-16, after reading what the two flags the port lacks
+  actually do:
+  - `--limit` is kept, and Python has no equivalent. Its FTS path
+    applies no limit at all and its fallback hardcodes `LIMIT 100`.
+    Keeping it is the one place this command is deliberately more
+    capable than the original.
+  - `-i` / `--ignore-case` is **not** ported. It is dead unless
+    `--no-fts` is passed too — `search.py:95` reads it inside the
+    `else` branch, so under the default FTS path it is ignored and
+    `search content RUSQLITE` returns the same 81 rows with or without
+    it. What it selects when it *is* live, a case-insensitive
+    substring match, is this port's default behaviour.
+  - `--no-fts` is **not** ported either. It switches Python to
+    `content_text LIKE '%pattern%'`, and this port has no FTS path to
+    turn off — its matching already *is* substring. The flag would have
+    to be accepted and ignored, which is worse than absent: a flag that
+    promises different matching and silently delivers none.
+
+  So both omissions describe behaviour the port already has. Worth
+  stating because the sweep cannot catch this class of difference at
+  all: a flag that only one implementation defines is never invoked on
+  both sides, so flag-surface drift is invisible to a diff of outputs.
 - **A freshly mirrored Postgres has no statistics.** `mirror` uses
   `COPY` and does not `ANALYZE`, so until autovacuum gets to it the
   planner works from defaults. It did not turn out to matter for the
@@ -833,6 +856,79 @@ configuration in which half the crate is invisible to `cargo test` is
 pre-arranged drift.
 
 No Postgres server is needed to build or to run `cargo test`.
+
+### The project's own Postgres
+
+```bash
+just pg-up          # initdb if absent, start, create both databases + the ro role
+just mirror         # copy the read subset from live SQLite into templedb_parity
+just sweep-pg       # the 40 invocations, SQLite vs Postgres
+just pg-verify-ro   # prove the read-only role is enforced, not assumed
+just pg-down        # stop; pg-nuke throws the cluster away
+```
+
+The server comes from this flake, not from the host and not from the
+`system_config` project. The port is a separate project that owns its
+database: the version is pinned the way the toolchain is, the scratch
+database is *meant* to be disposable rather than a persistent service,
+and changing a test database should not require `nixos system-switch`.
+
+**Two databases, because `mirror` opens with `TRUNCATE`.**
+
+| | written by | the port's access |
+|---|---|---|
+| `templedb_parity` | `mirror` only | **read-only role** (`templedb_ro`) |
+| `templedb_scratch` | the port | read-write, disposable |
+
+Sharing one database would make a sweep run after a write test report
+the port's own writes as parity failures, and the next re-mirror would
+silently destroy whatever the write tests built — each looking like a
+bug somewhere else. The read-only role is the part that makes the split
+a guarantee rather than a convention, and it is what replaces
+`SQLITE_OPEN_READ_ONLY` when the file handle goes away: the server
+refuses the write instead of the caller remembering a flag.
+`just pg-verify-ro` asserts both halves, because a role that is only
+believed to be read-only is worth nothing.
+
+**The connection strings are not in this repository.** They are
+project-scoped TempleDB variables on `templedb-rust`:
+
+```
+$ templedb var list templedb-rust
+  TEMPLEDB_URL        …dbname=templedb_parity    (read, as templedb_ro)
+  TEMPLEDB_WRITE_URL  …dbname=templedb_scratch   (write scratch)
+```
+
+`conn.rs` already reads `TEMPLEDB_URL` from the environment and falls
+back to SQLite when it is unset, so a project variable feeds the port
+with no code change at all — `templedb env direnv generate` exports them
+on entry to the directory. Keeping them there rather than in
+`flake.nix` means they are discoverable from the project they belong to
+and can differ per machine without editing tracked files.
+
+Measured 2026-10-16, with the mirror above: **40 of 40 invocations are
+stdout-identical between the SQLite and Postgres backends**, through the
+read-only role. The Postgres read path is not a plan.
+
+**Neither the cluster nor its socket is inside the project tree**, and
+both exclusions were learned rather than designed.
+
+The socket has to be short: a Unix socket path is capped at 107 bytes,
+and this project is normally checked out into a TempleDB edit workspace,
+where `.pgdata/sock/` lands at 109. The server starts, creates no
+socket, and exits `FATAL` with nothing about path depth in the message
+until you read the log. It lives in `$XDG_RUNTIME_DIR` (44 bytes), mode
+0700, with no TCP listener at all.
+
+The data directory lives under `$XDG_DATA_HOME` because a `.gitignore`
+entry does not protect it. TempleDB's importer only consults git's file
+list when the tree *is* a git repo, and an edit workspace is not one —
+so with the cluster at `.pgdata/` the scanner classified
+`postgresql.conf` and three siblings as `config_file` and
+`templedb commit` pulled them into the database. A live database
+directory inside a tree that gets scanned *and* materialised is wrong in
+both directions: cluster internals land in `content_blobs`, and a later
+materialise could write over a running server's state.
 
 ### Checks
 

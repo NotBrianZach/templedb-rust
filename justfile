@@ -77,3 +77,155 @@ check: test oracle sweep
 # Only the half `nix flake check` can run without a live database.
 check-hermetic:
     nix flake check
+
+# --- Postgres ---------------------------------------------------------
+#
+# A cluster this project owns, from the postgresql the flake pins. Not a
+# system service: the port is a separate project that owns its database,
+# the scratch half is meant to be disposable, and needing
+# `nixos system-switch` to change a test database would be miserable.
+#
+# Port 55432, not 5432, so this can never be confused with -- or collide
+# with -- a host instance. PGDATA sits under the project and is
+# gitignored; it is also not DB-tracked, so `templedb commit` will not
+# try to swallow a database cluster.
+#
+# TWO databases, because `mirror` opens with TRUNCATE:
+#
+#   templedb_parity   faithful copy, written ONLY by `mirror`, read by
+#                     the sweep. The port connects as a read-only role
+#                     so it cannot write this one by mistake -- the
+#                     server-enforced replacement for SQLite's
+#                     SQLITE_OPEN_READ_ONLY flag.
+#   templedb_scratch  the write-path target. Disposable, re-mirrored at
+#                     will, read-write.
+#
+# Sharing one database would make a sweep run after a write test report
+# the port's own writes as parity failures, and the next re-mirror would
+# silently destroy whatever the write tests built.
+
+# The cluster lives OUTSIDE the project tree, and must.
+#
+# It was under `.pgdata/` for one commit and that was a mistake: a
+# `.gitignore` entry does not protect anything here, because TempleDB's
+# importer only consults git's file list when the tree *is* a git repo,
+# and an edit workspace is not one. So the scanner classified
+# `postgresql.conf` and friends as `config_file` and `templedb commit`
+# pulled four cluster files into the database (commit 1348, removed in
+# the next one). A live database directory inside a tree that gets
+# scanned and materialised is a bad arrangement in both directions:
+# cluster internals end up in content_blobs, and a later materialise
+# could write over a running server's state.
+#
+# $XDG_DATA_HOME rather than $XDG_RUNTIME_DIR: the parity database is a
+# ~190k-row mirror that costs a `just mirror` to rebuild, so it should
+# survive a logout. Only the socket is in the runtime dir.
+PGDATA := env_var_or_default("XDG_DATA_HOME", env_var("HOME") / ".local/share") / "templedb-rs/pgdata"
+PGPORT := "55432"
+
+# The socket directory is NOT under PGDATA, and cannot be. A Unix-domain
+# socket path is capped at 107 bytes, and this project is normally
+# checked out into a TempleDB edit workspace:
+#
+#   .../edit-workspaces/templedb-rust/claude-code-agent-22526/.pgdata/sock/.s.PGSQL.55432
+#
+# is 109 bytes, so the server starts, fails to create any socket, and
+# exits FATAL. Nothing about that error mentions path depth until you
+# read the log. $XDG_RUNTIME_DIR is short (44 bytes for the same socket),
+# user-private, and cleaned up on logout.
+#
+# Socket only, no TCP: `listen_addresses=` is empty in pg-up, so trust
+# auth is reachable solely by this user through a 0700 directory rather
+# than by anyone who can open a local port.
+PGHOST := env_var_or_default("XDG_RUNTIME_DIR", "/tmp") / "templedb-rs-pg"
+
+# Initialise the cluster if absent, start it, create both databases.
+pg-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d "{{PGDATA}}" ]; then
+        echo "initdb -> {{PGDATA}}"
+        initdb --pgdata="{{PGDATA}}" --auth=trust --no-locale --encoding=UTF8 >/dev/null
+    fi
+    # Recreated every time: $XDG_RUNTIME_DIR does not survive logout, so
+    # a cluster that outlives a session would otherwise fail to restart.
+    mkdir -p "{{PGHOST}}" && chmod 700 "{{PGHOST}}"
+    if pg_ctl --pgdata="{{PGDATA}}" status >/dev/null 2>&1; then
+        echo "already running"
+    else
+        pg_ctl --pgdata="{{PGDATA}}" \
+               --options="-p {{PGPORT}} -k {{PGHOST}} -c listen_addresses=" \
+               --log="{{PGDATA}}/server.log" start
+    fi
+    # Idempotent: both may already exist.
+    createdb -h "{{PGHOST}}" -p {{PGPORT}} templedb_parity 2>/dev/null || true
+    createdb -h "{{PGHOST}}" -p {{PGPORT}} templedb_scratch 2>/dev/null || true
+    # The read-only role on the parity database. This is the part that
+    # makes "two databases" a guarantee rather than a convention: the
+    # port reads parity as templedb_ro and is refused by the server if
+    # it tries to write, which is what replaces SQLITE_OPEN_READ_ONLY.
+    # `mirror` connects as the owner instead, because it must TRUNCATE
+    # and COPY.
+    psql -h "{{PGHOST}}" -p {{PGPORT}} -d postgres -q -c \
+        "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='templedb_ro')
+         THEN CREATE ROLE templedb_ro LOGIN; END IF; END \$\$;"
+    # Applied to existing tables and, via default privileges, to the
+    # ones a later `mirror --create-schema` will create.
+    psql -h "{{PGHOST}}" -p {{PGPORT}} -d templedb_parity -q \
+        -c "GRANT CONNECT ON DATABASE templedb_parity TO templedb_ro" \
+        -c "GRANT USAGE ON SCHEMA public TO templedb_ro" \
+        -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO templedb_ro" \
+        -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO templedb_ro"
+    psql -h "{{PGHOST}}" -p {{PGPORT}} -d postgres -tAc \
+        "SELECT datname FROM pg_database WHERE datname LIKE 'templedb%' ORDER BY datname"
+
+pg-down:
+    pg_ctl --pgdata="{{PGDATA}}" stop || true
+
+pg-status:
+    pg_ctl --pgdata="{{PGDATA}}" status || true
+
+# The parity database is a copy and the scratch one is disposable by
+# design, so this loses nothing a `mirror` run cannot rebuild.
+
+# Stop the cluster and delete it.
+pg-nuke: pg-down
+    rm -rf "{{PGDATA}}"
+
+# Owner connection: only `mirror` should use this one.
+PG_PARITY_RW := "postgresql://?host=" + PGHOST + "&port=" + PGPORT + "&dbname=templedb_parity"
+# Read-only connection: everything that reads parity uses this.
+PG_PARITY_RO := "postgresql://templedb_ro@?host=" + PGHOST + "&port=" + PGPORT + "&dbname=templedb_parity"
+# The write-path target. Read-write by design, disposable.
+PG_SCRATCH := "postgresql://?host=" + PGHOST + "&port=" + PGPORT + "&dbname=templedb_scratch"
+
+# --create-schema is the destructive half, so it belongs on a first run
+# only: on an existing mirror the CREATE TABLEs fail and nothing is
+# copied, which is the right outcome for a typo'd URL.
+
+# Copy the read subset from live SQLite into templedb_parity (first run).
+mirror: build
+    ./target/release/templedb-rs mirror --to "{{PG_PARITY_RW}}" --create-schema
+
+mirror-refresh: build
+    ./target/release/templedb-rs mirror --to "{{PG_PARITY_RW}}"
+
+# The cross-backend sweep against the local parity database, through the
+# read-only role.
+sweep-pg: build
+    bash scripts/parity-sweep.sh backends "{{PG_PARITY_RO}}"
+
+# Prove the read-only role is actually enforced rather than assumed.
+# Expected: the SELECT succeeds and the UPDATE is refused.
+pg-verify-ro:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo -n "read as templedb_ro:  "
+    psql "{{PG_PARITY_RO}}" -tAc "SELECT count(*) FROM projects" || echo FAILED
+    echo -n "write as templedb_ro: "
+    if psql "{{PG_PARITY_RO}}" -q -c "UPDATE projects SET name = name" 2>/dev/null; then
+        echo "ACCEPTED -- the role is not read-only, this is a bug"
+        exit 1
+    else
+        echo "refused (correct)"
+    fi

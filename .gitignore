@@ -14,3 +14,12 @@ Cargo.lock.bak
 result
 result-*
 .direnv/
+
+# The project's own Postgres cluster used to live at /.pgdata/ and no
+# longer does — `just pg-up` puts it under $XDG_DATA_HOME. Kept as a
+# belt-and-braces entry for anyone running from a git checkout, but note
+# that this line is NOT what protects the database from the importer:
+# TempleDB's scanner only honours .gitignore when the tree is a git
+# repo, and an edit workspace is not. Four cluster config files reached
+# content_blobs that way before the cluster was moved out of the tree.
+/.pgdata/

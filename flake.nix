@@ -108,6 +108,28 @@
             # the parity work gets done.
             sqlite
 
+            # The Postgres *server*, not just the client, and pinned by
+            # this flake rather than taken from the host.
+            #
+            # It lives here rather than in the system_config project
+            # because the port is a separate project that owns its own
+            # database (see the write-path design report). Three reasons
+            # that matters: the version is pinned the same way the
+            # toolchain is, so a parity run is reproducible; the write
+            # scratch database is *meant* to be disposable and a system
+            # service would make it persistent and precious; and
+            # changing a test database should not require
+            # `nixos system-switch`, which is a path that currently
+            # fails on a read-only flake.lock.
+            #
+            # The connection strings are deliberately NOT here. They are
+            # project-scoped TempleDB variables on `templedb-rust`, so
+            # they are discoverable with `templedb var list templedb-rust`
+            # and exportable through direnv. `conn.rs` already reads
+            # `TEMPLEDB_URL` from the environment, so nothing in the
+            # crate needs to know where it came from.
+            postgresql
+
             # The reference oracle, not a build input either. The
             # implementation this port is diffed against is written in
             # Python, and `crates/templedb-db/tests/difflib_parity.rs`

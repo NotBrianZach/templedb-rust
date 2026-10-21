@@ -391,32 +391,61 @@ summary_pane() {
     awk -v p="$2" 'index($0, p) { f = 1; next } f && /──/ { exit } f { print }' "$1"
 }
 
-# Compare every claimed pane, retrying the whole capture on a difference.
+# Compare every claimed pane, over several captures.
 #
-# The retry is for the clock, not for flakiness in the usual sense: the
-# ingestion pane renders ages, so a minute boundary falling between the
-# two invocations turns `0min ago` into `1min ago` and reports a
-# difference that is only elapsed time. `TEMPLEDB_RS_NOW` cannot help —
-# it pins this port's clock and not Python's, which would make the
-# comparison worthless rather than merely noisy. A real divergence
-# survives all three attempts; a boundary crossing does not survive one.
+# Retrying is not defensiveness about a flaky test — it is the only
+# correct way to compare two processes reading a database that a third
+# is writing. Two sources of difference have nothing to do with the
+# port:
+#
+#   * **The clock.** The ingestion pane renders ages, so a minute
+#     boundary falling between the two invocations turns `0min ago` into
+#     `1min ago`. `TEMPLEDB_RS_NOW` cannot help — it pins this port's
+#     clock and not Python's, which would make the comparison worthless
+#     rather than merely noisy.
+#   * **The writers.** Seven ingest adapters run on timers and the
+#     `ok_count` column the pane prints increments on every run. During
+#     active ingestion that pane can legitimately differ on *every*
+#     attempt.
+#
+# So agreement is tracked per pane and across attempts: a pane that
+# matched on **any** attempt is agreeing, and only a pane that differed
+# on every one is reported. That is sound because a genuine divergence
+# is not intermittent — it differs every time — while a moving row
+# differs only on the attempts that straddle the write.
+#
+# An earlier version required *all* panes to agree before it stopped
+# retrying, which meant one continuously-churning pane consumed the
+# attempts and the rest were reported against whatever the last capture
+# happened to hold. It reported a false failure the first time ingestion
+# was busy during a run.
 summary_parity() {
-    local -a diffs=()
     local attempt pane a b e
+    local -A ever_agreed=()
     for attempt in 1 2 3; do
-        diffs=()
+        local outstanding=0
         "$RS" summary >"$sumfile_a" 2>/dev/null
         run_b summary >"$sumfile_b" 2>/dev/null
         for pane in "${SUMMARY_PANES[@]}"; do
+            [[ -n ${ever_agreed[$pane]:-} ]] && continue
             a=$(summary_pane "$sumfile_a" "$pane")
             b=$(summary_pane "$sumfile_b" "$pane")
-            [[ $a == "$b" ]] || diffs+=("$pane")
+            if [[ $a == "$b" ]]; then
+                ever_agreed[$pane]=yes
+            else
+                outstanding=$((outstanding + 1))
+            fi
         done
-        (( ${#diffs[@]} == 0 )) && break
+        (( outstanding == 0 )) && break
     done
 
     for pane in "${SUMMARY_UNPORTED[@]}"; do
         printf 'unported  summary %s\n' "$pane"
+    done
+
+    local -a diffs=()
+    for pane in "${SUMMARY_PANES[@]}"; do
+        [[ -n ${ever_agreed[$pane]:-} ]] || diffs+=("$pane")
     done
 
     local identical=$(( ${#SUMMARY_PANES[@]} - ${#diffs[@]} ))

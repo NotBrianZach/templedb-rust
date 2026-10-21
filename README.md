@@ -66,7 +66,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-272 unit tests, run by `cargo test`: 240 in `templedb-db` and 32 in
+280 unit tests, run by `cargo test`: 248 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -917,41 +917,14 @@ Differences that are not deliberate and are not yet closed.
   send the caller back to a `TRUNCATE`. Verified: all six
   `content_blobs` columns carry statistics after a run, against none
   for that table before.
-- **The mirror cannot represent a NUL in a TEXT column, and one live
-  row has one.** Found 2026-10-21. Postgres `TEXT` cannot store
-  U+0000; SQLite `TEXT` can. `bza/frontend/lib/suggest/normalize.ts` is
-  an ordinary TypeScript file that joins on a NUL
-  (`.join('\0')`), so the classification is right and the column is
-  genuinely text — there is no bug upstream to fix. It is one row out
-  of 4,637 with text, and it appeared between two mirror runs on the
-  same afternoon, which is how a copy that had worked all week started
-  failing.
-
-  **This blocks `mirror` and therefore `just sweep-pg` outright.** What
-  is done is the diagnosis: the server's own message is
-  `invalid byte sequence for encoding "UTF8": 0x00` with no table, no
-  column and no row, arriving from `finish()` after 104 MB has
-  streamed. `mirror` now names the column and the row's key before
-  writing. What is *not* done is the repair, because every repair is a
-  decision about what the mirror means and three of the four change
-  what a cross-backend digest compares:
-
-  - **Escape and unescape** in the Postgres read path. Readers see the
-    original text and the digest matches, but the stored bytes are no
-    longer a copy — anyone querying the mirror with `psql` sees the
-    escape.
-  - **Store `content_text` as `BYTEA`.** Faithful, and it costs every
-    text query: the `LIKE` prefilter, the lowercased search column,
-    `file cat` and the diffs all gain an encode/decode.
-  - **Move the text to `content_blob` and NULL `content_text`.** No
-    schema change, but the port's readers would then treat a text file
-    as binary, so `file cat` refuses a file Python prints.
-  - **Skip the row, loudly.** The mirror is one blob short and
-    `file cat` of that one file fails on Postgres only.
-
-  No option is free, so none has been taken. The decision belongs with
-  the write-path design document, which is where the rest of the
-  SQLite-versus-Postgres representation questions already live.
+- ~~**The mirror cannot represent a NUL in a TEXT column.**~~ **Closed
+  2026-10-21**, same day it was found. Written up under *The one place
+  the two text types are not the same type* below; the short version is
+  that the mirror now escapes text on the way in and `backend/pg.rs`
+  unescapes on the way out, so a U+0000 survives a round trip through a
+  column that cannot hold one. The cost is that the bytes in Postgres
+  are not always the bytes in SQLite — a `psql` session sees the escape
+  — and nothing reading through this crate does.
 - **`summary` is two panes short of Python's nine.** The agent-fleet
   pane needs `agent.store.fleet_rollup()`'s tables, which are outside
   the mirrored subset, so there is nothing to observe yet; the systemd
@@ -1071,15 +1044,24 @@ should look like and not what a translation bug looks like. Had the two
 backends disagreed with each other as well, the diagnosis would have
 been the other one.
 
-**This axis is blocked as of later the same day.** A blob containing a
-NUL landed in the live database between that measurement and the next
-mirror run, and `mirror` cannot represent it in Postgres `TEXT` — see
-*Known gaps*. The staleness guard behaved correctly when it happened,
-which is worth recording because it is the case it was built for:
+**This axis was blocked for several hours the same day** and is open
+again. A blob containing a NUL landed in the live database between that
+measurement and the next mirror run, which `mirror` could not represent
+in Postgres `text`; see *The one place the two text types are not the
+same type*. The staleness guard behaved correctly throughout, which is
+worth recording because it is the case it was built for:
 `mirror --check` exited 4 naming every drifted table and `sweep-pg`
 refused to run rather than producing a comparison against a mirror it
-could not vouch for. The cross-backend numbers above stand as measured;
-they cannot be reproduced until the representation decision is made.
+could not vouch for.
+
+Re-measured 2026-10-21 after the escape landed, against a mirror
+rebuilt with `--create-schema` for the two new `projects` columns:
+**50 of 50 invocations, 7 of 7 `summary` panes, 19 of 19 flag surfaces
+and 8 of 8 `project list` filters identical**, and **all 17 tables
+digest identically over 211,617 rows**. That last number is the one
+that matters for what comes next: it is the same comparison the write
+path's verification rests on, and it now holds over a column the two
+engines cannot represent the same way.
 
 **The sweep refuses to run on a stale mirror**, and that guard was
 written the same afternoon it was needed. `sweep-pg` diffs SQLite
@@ -1171,19 +1153,34 @@ templedb-rs vs python, 50 invocations: 45 stdout-identical
 
 Each of the three stages has been sabotage-tested — a deliberate
 regression introduced, then the stage confirmed to report it and the
-script to exit non-zero. That is not ceremony. The filter stage was
-wrong when first written and its failure mode was the bad one: it
-reported six failures against a port that was correct, because it
-looked for rows under a dashed rule that only Python prints. A check
-that cannot fail on demand is not evidence of anything, and one that
-fails for its own reasons is worse than none.
+script to exit non-zero. That is not ceremony. **Two of the three were
+wrong when first written, and both failed in the bad direction**: the
+filter stage reported six failures against a correct port because it
+looked for rows under a dashed rule only Python prints, and the summary
+stage required *every* pane to agree before it stopped retrying — so
+one continuously-churning pane consumed the attempts and the rest were
+judged against whatever the last capture held. It reported a false
+failure the first time an ingest ran during a sweep.
+
+The summary stage now tracks agreement **per pane across attempts**: a
+pane that matched on any attempt is agreeing, and only one that
+differed on every attempt is reported. That is sound because a real
+divergence is not intermittent. It has to be this way rather than
+simpler, because the thing being compared is two processes reading a
+database a third is actively writing — seven ingest adapters run on
+timers and the `ok_count` the pane prints increments on every run, so
+that pane can legitimately differ on every attempt. Verified stable
+over four consecutive runs.
+
+A check that cannot fail on demand is not evidence of anything, and one
+that fails for its own reasons is worse than none.
 
 The split between the two commands is not organisational, it is about
 what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (272) | yes | yes |
+| unit tests (280) | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
 | 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
@@ -1244,6 +1241,8 @@ crates/templedb-db/    data layer, one module per command family
                        that carries a non-default one
   clock.rs             one injectable instant; julianday and _age_hint,
                        reproduced to the bit. No SQL, no backend
+  pgtext.rs            the NUL escape: SQLite TEXT holds U+0000 and
+                       Postgres text cannot. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
 schema/postgres/       the DDL the mirror targets
 crates/templedb-cli/   clap binary `templedb-rs`, formatting only
@@ -2035,6 +2034,93 @@ So `project list` is the one implemented command that is **not** a
 candidate for byte-level diffing against Python, and the status table
 now says so. Nothing depends on it matching; it is listed here because
 a reader comparing the two outputs deserves to know before they try.
+
+### The one place the two text types are not the same type
+
+Found and closed 2026-10-21. `crates/templedb-db/src/pgtext.rs`.
+
+SQLite `TEXT` may contain U+0000. Postgres `text` may not, and no
+encoding, collation or cast changes that — it is a NUL-terminated
+representation at the protocol level. The live database contains
+exactly one such row and it is not a misclassified binary:
+`bza/frontend/lib/suggest/normalize.ts` contains `.join('\0')`, which
+is an ordinary thing for a TypeScript file to do. The column really is
+text, the classification is right, and there is nothing upstream to
+fix.
+
+It appeared between two mirror runs on the same afternoon, which is how
+a copy that had worked all week started failing — and it was found by
+*verifying the `ANALYZE` fix*, not by looking for it. That is the
+second time this week a repair turned up a defect next to it.
+
+**What it looked like.** `invalid byte sequence for encoding "UTF8":
+0x00`, from `finish()`, after 104 MB had already streamed, naming no
+table, no column and no row. `mirror` now checks the text columns
+itself before writing, so the message names the column and the row's
+key; that diagnostic survived the fix because the next representation
+problem will not be this one.
+
+**The decision, and the three rejected.** Escape on the way in,
+unescape in the Postgres backend, so every reader above that layer sees
+the original bytes. The alternatives each fail something the mirror
+exists for:
+
+| option | why not |
+|---|---|
+| skip the row | `file cat` fails on Postgres only, **and** `content_blobs`'s digest stops matching |
+| move the text to `content_blob` | the port would read a text file as binary; digest also moves |
+| `content_text` as `BYTEA` | faithful, but reaches the `LIKE` prefilter, `text_lower` and its trigram index, `file cat` and the diffs |
+
+The digest is the deciding criterion, and it is not a detail: it is
+what `statediff` compares and what the write path's verification is
+built on. Escaping is the only one of the four that keeps it equal,
+because the digest hashes rows read *through* `Store` and the unescape
+happens there.
+
+**The encoding.** U+0001 introduces an escape: U+0000 becomes
+`U+0001 0`, and U+0001 becomes `U+0001 1`. Two things about that are
+load-bearing.
+
+The introducer is escaped *too*. Choosing a "rare" marker and assuming
+it never occurs would have been wrong here and measurably so — the live
+`content_blobs` has 1 row containing U+0000, 2 containing U+0001, 2
+containing U+0002 and 4 containing U+001F. Control characters are not
+hypothetical in this data. Escaping the introducer makes the transform
+injective however often it appears, so rarity buys small diffs rather
+than correctness. Without it, a file that already contained the
+sequence `U+0001 0` would decode to a NUL that was never there; a test
+pins exactly that.
+
+And text containing neither character is returned untouched, as a
+borrowed `Cow`. 4,715 of the 4,718 text rows are byte-identical in the
+mirror; three are not. That keeps the transform off the hot path and
+bounds the blast radius of a mistake to rows containing control
+characters.
+
+**One place it leaks out of storage.** `search content`'s Postgres
+prefilter does `LIKE` against `text_lower`, which is
+`GENERATED ALWAYS AS (lower(content_text))` — so it is generated from
+the *escaped* text, and a search term has to be escaped the same way or
+the prefilter silently drops the candidate. Matching and ranking happen
+in Rust on the unescaped text, so the final answer would still have
+been right; what would have gone missing is a hit. `escape` is a no-op
+for every realistic term, which is exactly why this needed finding by
+reading rather than by testing.
+
+**Verified end to end**, not just round-tripped in a unit test:
+
+- `file cat bza frontend/lib/suggest/normalize.ts` is byte-identical on
+  the two backends, and the sha256 of the output equals the blob's own
+  `hash_sha256` — so the content is not merely consistent, it is right.
+  The NUL is present in both.
+- Postgres stores U+0001 at offset 10,333 of that row and no raw NUL.
+- **All 17 tables digest identically across both backends over 211,617
+  rows**, `content_blobs` included.
+- `just sweep-pg`: **50 of 50 invocations and 7 of 7 `summary` panes
+  identical**, which re-opens the cross-backend axis that this defect
+  had closed.
+- `search content` returns the same hit counts on both backends, and
+  still finds the NUL file by a term that sits after its NUL.
 
 ### Flag surfaces, and the four divergences nobody had noticed
 

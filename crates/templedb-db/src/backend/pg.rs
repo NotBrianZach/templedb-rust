@@ -162,9 +162,21 @@ fn value_from_pg(row: &postgres::Row, i: usize, ty: &Type) -> Result<Value> {
         // ::text AS revision`) so this should not arise, but reading it
         // as text is both the only sensible guess and what Postgres
         // itself would coerce it to.
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
-            row.get::<_, Option<String>>(i).map(Value::Text)
-        }
+        // Unescaped on the way out, so every caller above this layer
+        // sees the bytes SQLite holds. Postgres `text` cannot store
+        // U+0000 and SQLite's can, and one real file in the live
+        // database contains one — see `pgtext.rs` for the encoding and
+        // for why escaping beat the three alternatives. The transform
+        // is a no-op and allocation-free for text with no U+0000 and no
+        // U+0001, which is every row but three.
+        //
+        // This is also what keeps `statediff`'s cross-backend digest
+        // meaningful: the digest hashes rows read through `Store`, so it
+        // sees the original text on both backends rather than the
+        // stored form on one.
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => row
+            .get::<_, Option<String>>(i)
+            .map(|s| Value::Text(crate::pgtext::unescape(&s).into_owned())),
         Type::BYTEA => row.get::<_, Option<Vec<u8>>>(i).map(Value::Blob),
         // Deliberately unmapped, with the fix named. `numeric` is what
         // `sum()` over an integer column returns in Postgres and not in

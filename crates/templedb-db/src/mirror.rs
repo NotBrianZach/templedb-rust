@@ -625,44 +625,25 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
     Ok(reports)
 }
 
-/// The first `TEXT` column in this row holding a NUL, named along with
-/// the row's key so the offending row can be found.
+/// This row's values with every `Value::Text` escaped for Postgres.
 ///
-/// `None` for every row in the live database but one, which is why the
-/// cost that matters is the scan and not the formatting.
+/// Returns owned values because `escape` may allocate, and the
+/// `BinaryCopyInWriter` borrows what it is handed — so the escaped
+/// strings have to outlive the `write` call.
 ///
-/// Only `Value::Text` is checked. `Value::Blob` goes to a `BYTEA`
-/// column, where a NUL is an ordinary byte — `content_blob` carries
-/// plenty and must not be flagged.
-fn first_nul(row: &crate::value::Row, spec: &TableSpec) -> Option<String> {
-    for (i, name) in spec.columns.iter().enumerate() {
-        let Ok(Value::Text(s)) = row.value(i) else {
-            continue;
-        };
-        if !s.contains('\0') {
-            continue;
-        }
-        // The key, so the row is addressable. Rendered from the spec's
-        // own key columns rather than assuming an `id`, because
-        // `content_blobs` keys on a hash and `vcs_commit_parents` on a
-        // pair.
-        let key = spec
-            .key
-            .iter()
-            .filter_map(|k| {
-                let j = spec.columns.iter().position(|c| c == k)?;
-                let v = row.value(j).ok()?;
-                Some(match v {
-                    Value::Text(t) => format!("{k}={t}"),
-                    Value::Int(n) => format!("{k}={n}"),
-                    other => format!("{k}={other:?}"),
-                })
+/// Only `Value::Text` is transformed. `Value::Blob` goes to a `BYTEA`
+/// column where a NUL is an ordinary byte, and `content_blob` carries
+/// plenty of them; escaping those would corrupt every binary file in
+/// the mirror.
+fn escape_text_columns(row: &crate::value::Row, spec: &TableSpec) -> Result<Vec<Value>> {
+    (0..spec.columns.len())
+        .map(|i| {
+            Ok(match row.value(i)? {
+                Value::Text(s) => Value::Text(crate::pgtext::escape(s).into_owned()),
+                other => other.clone(),
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Some(format!("column {name} of row ({key})"));
-    }
-    None
+        })
+        .collect()
 }
 
 fn copy_table(
@@ -724,35 +705,24 @@ fn copy_table(
             break;
         }
         for row in &rows {
-            // Postgres TEXT cannot hold U+0000 and SQLite TEXT can, so
-            // one real file in the live database stops this copy dead.
-            // The server's own diagnosis is
+            // Text is escaped on the way in, and `backend/pg.rs`
+            // unescapes on the way out, so a U+0000 survives a round
+            // trip through a column that cannot store one. Postgres
+            // `text` rejects it outright — the server's own diagnosis is
             // `invalid byte sequence for encoding "UTF8": 0x00` with no
-            // table, no column and no row — and it arrives from
-            // `finish()`, after 104 MB has already streamed, so it does
-            // not even say which table was being written.
+            // table, no column and no row, arriving from `finish()`
+            // after 104 MB has already streamed — and one real file in
+            // the live database contains one. See `pgtext.rs`.
             //
-            // Checking here costs one pass over the text columns and
-            // buys a message that names the row. The condition is not
-            // repaired, deliberately: every repair is a decision about
-            // what the mirror *means* — escape and unescape, move the
-            // text to `content_blob`, store the column as BYTEA, or
-            // skip the row — and three of the four change what a
-            // cross-backend digest compares. See *Known gaps*.
-            if let Some(detail) = first_nul(row, spec) {
-                // No table name here: the caller's `with_context`
-                // already says `mirroring content_blobs`.
-                anyhow::bail!(
-                    "{detail} contains a NUL (U+0000), which Postgres TEXT \
-                     cannot store and SQLite TEXT can.\n\
-                     The mirror cannot represent this row. See the README's \
-                     *Known gaps* — the repair is a representation decision, \
-                     not a bug fix."
-                );
-            }
-            let values: Vec<&(dyn ToSql + Sync)> = (0..spec.columns.len())
-                .map(|i| row.value(i).map(|v| v as &(dyn ToSql + Sync)))
-                .collect::<Result<_>>()?;
+            // Every text column, not only `content_text`: the rule is
+            // "this crate's Postgres backend stores escaped text", and
+            // a rule with an exception list is one a future column gets
+            // added to incorrectly. `escape` is a no-op and
+            // allocation-free for text containing neither U+0000 nor
+            // U+0001, which is all but three rows of the subset.
+            let escaped = escape_text_columns(row, spec)?;
+            let values: Vec<&(dyn ToSql + Sync)> =
+                escaped.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
             writer.write(&values).context("writing a row")?;
             written += 1;
         }
@@ -794,12 +764,11 @@ mod tests {
             .expect("content_blobs is in the subset")
     }
 
-    /// A NUL in a TEXT column is named, with the row's key, so the
-    /// offending row is findable. Postgres reports only
-    /// `invalid byte sequence for encoding "UTF8": 0x00` from
-    /// `finish()`, after the whole table has streamed.
+    /// The row that forced `pgtext` to exist: a NUL in `content_text`
+    /// leaves this function with no NUL in any text column, so
+    /// `COPY` can accept it.
     #[test]
-    fn a_nul_in_a_text_column_names_the_column_and_the_row() {
+    fn a_nul_in_a_text_column_is_escaped_before_the_copy() {
         let row = crate::value::Row::new(vec![
             Value::Text("ff4938cc03ca2b40".into()),
             Value::Text("join('\0')".into()),
@@ -807,18 +776,23 @@ mod tests {
             Value::Text("text".into()),
             Value::Int(13410),
         ]);
-        let detail = first_nul(&row, blobs_spec()).expect("the NUL should be found");
-        assert_eq!(
-            detail,
-            "column content_text of row (hash_sha256=ff4938cc03ca2b40)"
-        );
+        let escaped = escape_text_columns(&row, blobs_spec()).unwrap();
+        let Value::Text(text) = &escaped[1] else {
+            panic!("content_text should still be text: {escaped:?}");
+        };
+        assert!(!text.contains('\0'), "{text:?} would be rejected");
+        assert_eq!(text, "join('\u{1}0')");
+        // And it is the inverse of what the read path does, which is
+        // the property that makes the round trip faithful.
+        assert_eq!(crate::pgtext::unescape(text), "join('\0')");
     }
 
-    /// A NUL in the BYTEA column is an ordinary byte. `content_blob`
-    /// holds binary files and most of them contain one, so flagging it
-    /// would refuse to mirror the database at all.
+    /// A NUL in the BYTEA column is an ordinary byte and must survive
+    /// untouched. `content_blob` holds binary files and nearly all of
+    /// them contain one; escaping those would corrupt every binary in
+    /// the mirror.
     #[test]
-    fn a_nul_in_a_blob_column_is_not_a_problem() {
+    fn a_nul_in_a_blob_column_is_left_alone() {
         let row = crate::value::Row::new(vec![
             Value::Text("abc".into()),
             Value::Null,
@@ -826,13 +800,16 @@ mod tests {
             Value::Text("application/octet-stream".into()),
             Value::Int(4),
         ]);
-        assert_eq!(first_nul(&row, blobs_spec()), None);
+        let escaped = escape_text_columns(&row, blobs_spec()).unwrap();
+        assert_eq!(escaped[2], Value::Blob(vec![0x7f, 0x45, 0x00, 0x00]));
+        // NULL stays NULL rather than becoming an empty string.
+        assert_eq!(escaped[1], Value::Null);
     }
 
-    /// The common case: nothing to report, which is every row in the
-    /// live database but one.
+    /// The common case: every value identical, which is all but three
+    /// rows of the live subset.
     #[test]
-    fn ordinary_text_passes() {
+    fn ordinary_rows_pass_through_unchanged() {
         let row = crate::value::Row::new(vec![
             Value::Text("abc".into()),
             Value::Text("hello\nworld".into()),
@@ -840,38 +817,37 @@ mod tests {
             Value::Text("text".into()),
             Value::Int(11),
         ]);
-        assert_eq!(first_nul(&row, blobs_spec()), None);
+        let escaped = escape_text_columns(&row, blobs_spec()).unwrap();
+        for (i, v) in escaped.iter().enumerate() {
+            assert_eq!(v, row.value(i).unwrap(), "column {i} changed");
+        }
     }
 
-    /// A composite key renders both of its columns, because
-    /// `vcs_commit_parents` has no surrogate id to fall back on.
+    /// Every text column is escaped, not just `content_text`. The rule
+    /// has no exception list, because a rule with one is a rule a
+    /// future column gets left out of.
     #[test]
-    fn a_composite_key_is_rendered_in_full() {
-        let spec = TABLES
-            .iter()
-            .find(|t| t.key.len() > 1)
-            .expect("vcs_commit_parents has a two-column key");
-        let row = crate::value::Row::new(
-            spec.columns
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    if i == 0 {
-                        Value::Int(7)
-                    } else if i == 1 {
-                        Value::Int(9)
-                    } else {
-                        Value::Text("x\0y".into())
-                    }
-                })
-                .collect(),
-        );
-        let detail = first_nul(&row, spec);
-        // Only meaningful if that table has a text column at all; if it
-        // does not, there is nothing to find and that is also correct.
-        if let Some(detail) = detail {
-            assert!(detail.contains("=7"), "{detail}");
-            assert!(detail.contains("=9"), "{detail}");
+    fn every_text_column_is_escaped_not_just_the_known_one() {
+        let spec = blobs_spec();
+        let row = crate::value::Row::new(vec![
+            // The *key* column carrying a NUL, which is the case an
+            // implementation that only escaped `content_text` would
+            // miss.
+            Value::Text("key\0hash".into()),
+            Value::Text("body".into()),
+            Value::Null,
+            Value::Text("ty\0pe".into()),
+            Value::Int(1),
+        ]);
+        let escaped = escape_text_columns(&row, spec).unwrap();
+        for (i, v) in escaped.iter().enumerate() {
+            if let Value::Text(s) = v {
+                assert!(
+                    !s.contains('\0'),
+                    "column {i} ({}) kept its NUL",
+                    spec.columns[i]
+                );
+            }
         }
     }
 

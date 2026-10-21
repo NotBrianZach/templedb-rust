@@ -73,6 +73,7 @@ mod files;
 mod fuzzy;
 mod like;
 mod mirror;
+mod pgtext;
 mod projects;
 mod search;
 mod source;

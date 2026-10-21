@@ -117,6 +117,21 @@ pub fn search_content(
         // the identifiers in this corpus and LIKE would read it as "any
         // character", which is the same bug the README records for
         // `entity search` and `file ls`.
+        //
+        // On Postgres the pattern is additionally escaped the way the
+        // *stored* text is, because `text_lower` is generated from the
+        // escaped `content_text` — so a term containing U+0000 or
+        // U+0001 has to be looked for in its stored form or the
+        // prefilter silently drops the candidate. `pgtext::escape`
+        // leaves every other term untouched, so this is a no-op for
+        // real queries and correct for the ones it is not. The LIKE
+        // escaping happens *after*, since U+0001 is not a LIKE
+        // metacharacter and the order would not matter — but reading
+        // it in one direction only is clearer.
+        let term: &str = match store.dialect() {
+            Dialect::Sqlite => term,
+            Dialect::Postgres => &crate::pgtext::escape(term),
+        };
         params.push(Value::from(format!("%{}%", escape_like(term))));
     }
 

@@ -48,7 +48,11 @@ CREATE TABLE projects (
     name             TEXT,
     repo_url         TEXT,
     git_branch       TEXT,
-    active_branch_id INTEGER
+    active_branch_id INTEGER,
+    -- `project list`'s two filters. Nullable and 0/1, as the live
+    -- column is: most rows are NULL rather than 0.
+    is_nix_project   INTEGER,
+    project_category TEXT
 );
 
 CREATE TABLE project_files (
@@ -271,10 +275,20 @@ const DATA: &str = r#"
 -- neither, and no files at all — which is the shape that makes Python's
 -- `SUM(lines_of_code)` NULL and crashes `project show` on a third of
 -- the live projects.
-INSERT INTO projects (id, slug, name, repo_url, git_branch, active_branch_id) VALUES
-    (1, 'alpha', 'Alpha Project', 'git@example:alpha.git', 'main', 2),
-    (2, 'beta',  'beta',          NULL,                    NULL,   NULL),
-    (3, 'empty', NULL,            NULL,                    NULL,   NULL);
+-- One row per combination `project list`'s filters have to tell apart:
+-- a Nix project with a category, a non-Nix project sharing that
+-- category (so `--category` alone is not `--nix-only` by accident), and
+-- a row where both columns are NULL — which is what most live rows look
+-- like, and which `is_nix_project = 1` must exclude without an
+-- `IS NOT NULL` dodge.
+INSERT INTO projects (id, slug, name, repo_url, git_branch, active_branch_id,
+                      is_nix_project, project_category) VALUES
+    (1, 'alpha', 'Alpha Project', 'git@example:alpha.git', 'main', 2,
+        1,    'package'),
+    (2, 'beta',  'beta',          NULL,                    NULL,   NULL,
+        0,    'package'),
+    (3, 'empty', NULL,            NULL,                    NULL,   NULL,
+        NULL, NULL);
 
 -- `file_type_id` and `lines_of_code` are read only by `project show`.
 -- alpha gets two distinct types and two of its four rows carry a line

@@ -15,7 +15,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 
 | Command | Status |
 |---|---|
-| `templedb-rs project list` | same 30 projects and counts; **output format differs** — see below |
+| `templedb-rs project list [--nix-only] [--category]` | same 30 projects and counts; both filters select the same projects Python does; **output format differs** — see below |
 | `templedb-rs project show <slug>` | byte-identical |
 | `templedb-rs file cat <proj> <path>` | byte-identical output |
 | `templedb-rs file ls <proj> [prefix] [-l] [--edit-mode]` | byte-identical |
@@ -66,7 +66,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-266 unit tests, run by `cargo test`: 234 in `templedb-db` and 32 in
+272 unit tests, run by `cargo test`: 240 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -966,8 +966,10 @@ Differences that are not deliberate and are not yet closed.
   set the port reads, out of 163 tables and 45 views. Columns are
   likewise limited to the ones the queries name — four of
   `ingestion_runs`'s fourteen, three of `fleet_machines`'s
-  twenty-seven. Anything not yet ported has nothing to mirror and no
-  way to verify a mirror, so the boundary follows the readers.
+  twenty-seven, eight of `projects`'s. Anything not yet ported has
+  nothing to mirror and no way to verify a mirror, so the boundary
+  follows the readers, and it moves when one does: `project list`'s two
+  filters added `is_nix_project` and `project_category` on 2026-10-21.
 
 ## Building
 
@@ -1149,16 +1151,39 @@ nix flake check        # the hermetic half only
 `just check` is what to run before publishing. It is three things in
 order: `cargo test --workspace`, the two CPython oracles (`difflib` and
 the clock), and `scripts/parity-sweep.sh python` — all 50 invocations
-diffed against the Python `templedb`, plus `summary` compared one pane
-at a time. The sweep exits with the number of *unexpected* differences,
-so the six deliberate divergences do not fail it and a new one does.
+diffed against the Python `templedb`, then three stages for what a
+whole-stdout diff cannot reach: `summary` one pane at a time, the flag
+surfaces of 19 commands, and `project list`'s filters by which projects
+they select. The sweep exits with the number of *unexpected*
+differences, so the deliberate divergences do not fail it and a new one
+does.
+
+A current clean run reads:
+
+```
+summary   6 of 7 claimed panes identical, 2 not ported
+flags     19 of 19 commands agree (deliberate divergences allowed)
+filters   8 of 8 project-list filters select the same projects
+
+templedb-rs vs python, 50 invocations: 45 stdout-identical
+(15 differing on stderr only), 16 deliberate, 0 unexpected
+```
+
+Each of the three stages has been sabotage-tested — a deliberate
+regression introduced, then the stage confirmed to report it and the
+script to exit non-zero. That is not ceremony. The filter stage was
+wrong when first written and its failure mode was the bad one: it
+reported six failures against a port that was correct, because it
+looked for rows under a dashed rule that only Python prints. A check
+that cannot fail on demand is not evidence of anything, and one that
+fails for its own reasons is worse than none.
 
 The split between the two commands is not organisational, it is about
 what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (266) | yes | yes |
+| unit tests (272) | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
 | 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
@@ -1228,9 +1253,12 @@ crates/templedb-cli/   clap binary `templedb-rs`, formatting only
                        instant to lines. Ages, colour, column widths
 scripts/
   parity-sweep.sh      all 50 invocations, against Python / the other
-                       backend / a previous build, plus `summary`
-                       compared one pane at a time. Not run by
-                       `cargo test` — it needs the live database.
+                       backend / a previous build. Plus three stages for
+                       the commands whose whole stdout cannot be
+                       diffed: `summary` one pane at a time, the flag
+                       surfaces of 19 commands, and `project list`'s
+                       filters by which projects they select. Not run
+                       by `cargo test` — it needs the live database.
 ```
 
 Nothing from `rusqlite` or `postgres` is re-exported. The previous
@@ -2040,12 +2068,59 @@ of them on commands reported as byte-identical:
 | `vcs log` | `--published` | **ported** — see below |
 | `vcs log` | `--session` | not ported, deliberately |
 | `vcs branch` | `-d` / `--delete` | a write; cannot be ported |
-| `project list` | `--nix-only`, `--category` | not done — read-only filters, simply absent |
+| `project list` | `--nix-only`, `--category` | **ported** — see below |
 
-`vcs branch -d` is a write and a read-only port cannot have it.
-`project list`'s two filters are the honest kind of gap: nothing argues
-against them, they are just not implemented, and the command already
-diverges in output format so no sweep row was ever going to notice.
+`vcs branch -d` is a write and a read-only port cannot have it. Both of
+the others are closed, which is the useful thing about a check that
+names a gap rather than describing one: the list was four items long
+for about an hour.
+
+**`project list`'s two filters** needed two more mirrored columns,
+`is_nix_project` and `project_category`, bringing the `projects`
+projection to eight — and because `statediff` derives its digest from
+the same `TableSpec`, they are covered by the cross-backend digest
+without a second edit.
+
+They select rows and change nothing else, which is **not** what Python
+does. Python runs a separate query under either flag:
+`COUNT(DISTINCT pf.id)` over *all* `project_files` rather than the
+active ones, `SUM(pf.lines_of_code)` instead of the current snapshot's
+`line_count`, and `ORDER BY p.slug` instead of by size. So
+`templedb project list` and `templedb project list --nix-only` can
+report different file counts for the same project, from the same
+database, in the same second. Here the counts are the same whether you
+filtered or not, which is the property that makes a filtered list worth
+believing.
+
+Python also prints **two tables** under either flag — a six-column
+"Nix Projects" one and then the ordinary "Projects" one over the same
+rows — because the filtered branch prints without returning and falls
+through to the shared tail. Not reproduced; doubling the output is not
+a format.
+
+`--nix-only` is `is_nix_project = 1`, as Python has it, not
+`IS NOT NULL` and not a truthiness test: the live column is NULL for
+most rows and 0 for some, and both mean "not a Nix project". A fixture
+row pins each.
+
+`--category` takes Python's five choices as a `ValueEnum`, so a bad
+value exits 2 on both with the valid list printed — but the query layer
+takes a plain `String`, because the live column has no CHECK constraint
+and a sixth category added after this binary was built must still
+filter rather than be unrepresentable.
+
+Verified: **all eight filter combinations select exactly the projects
+Python selects**, including two that select nothing. That comparison is
+a sweep stage rather than a sweep row, for the same reason the summary
+panes are — `project list`'s output format is a deliberate divergence,
+so the bytes will never match and the slug set is the part that carries
+the meaning. Writing that stage is also where this file nearly gained a
+false claim: the first version keyed on the dashed rule under Python's
+header, which this port does not print, so the port's slugs came back
+empty and six of the eight comparisons "failed" against a port that was
+correct. The stage now drops table furniture by name, and a sabotage
+run — making `--nix-only` a no-op — confirms it reports two failures
+and exits non-zero.
 
 **`--published` is now accepted, and `--session` is not.** The two look
 symmetrical and are not. `--published` selects behaviour this port

@@ -257,11 +257,72 @@ FLAGS_EXPECTED=(
     "search content q|--limit"
     # Python always colours and has no flag; this one does.
     "summary|--no-color"
-    # Filters on columns the port mirrors but does not offer. Not
-    # argued as a decision — just not done. See *Known gaps*.
-    "project list|--nix-only"
-    "project list|--category"
 )
+
+# `project list`'s filters, compared by which projects they select.
+#
+# The command's output format is a deliberate divergence — Python has a
+# name column and a heading, and under either filter it prints two
+# tables — so the bytes will never match and the row above sits in
+# EXPECTED. The *slug set* is the portable part and is exactly what the
+# flags change, so that is what this compares. Same move as the summary
+# panes: when the whole output cannot be diffed, diff the sub-unit that
+# carries the meaning.
+PROJECT_FILTERS=(
+    "--nix-only"
+    "--category package"
+    "--category home-module"
+    "--category nixos-module"
+    # Two that select nothing, so an empty result is compared rather
+    # than skipped. A filter that silently matched everything would
+    # pass every row above and fail these.
+    "--category service"
+    "--category desktop-app"
+    "--nix-only --category package"
+    "--nix-only --category nixos-module"
+)
+
+# The slugs in a `project list` table, from either implementation.
+#
+# The first column is the slug in all three tables involved — Python's
+# "Nix Projects" and "Projects", and this port's single one — so the
+# duplicated rows in Python's output fold away under `sort -u`.
+#
+# Structure cannot be used to find the rows, because the two formats do
+# not share any: Python underlines its header with a dashed rule and
+# this port prints none. Keying on the rule made the port's slugs come
+# back empty and six of these comparisons "fail" while the port was in
+# fact correct. So the furniture is dropped by name instead, which both
+# formats make unambiguous — titles and header cells are the only
+# first-column tokens that are not slugs.
+project_slugs() {
+    awk '/^-+$/ || !NF { next }
+         # Pythons empty-result sentence, which is prose on stdout and
+         # would otherwise read as a project called "No". This port
+         # prints a bare header and puts its count on stderr.
+         /^No projects found/ { next }
+         $1 == "slug" || $1 == "SLUG" || $1 == "Projects" || $1 == "Nix" { next }
+         { print $1 }' | sort -u
+}
+
+project_filter_parity() {
+    local args a b agree=0
+    for args in "${PROJECT_FILTERS[@]}"; do
+        # shellcheck disable=SC2086
+        a=$("$RS" project list $args 2>/dev/null | project_slugs)
+        # shellcheck disable=SC2086
+        b=$(run_b project list $args 2>/dev/null | project_slugs)
+        if [[ $a == "$b" ]]; then
+            agree=$((agree + 1))
+        else
+            unexpected=$((unexpected + 1))
+            printf 'DIFFERS   project list %s\n' "$args"
+            diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -6
+        fi
+    done
+    printf 'filters   %d of %d project-list filters select the same projects\n' \
+        "$agree" "${#PROJECT_FILTERS[@]}"
+}
 
 # The long and short options named on stdin, one per line.
 #
@@ -485,6 +546,7 @@ done
 
 summary_parity
 flag_parity
+project_filter_parity
 
 printf '\ntempledb-rs vs %s, %d invocations: %d stdout-identical (%d differing on stderr only), %d deliberate, %d unexpected\n' \
     "$label" "${#INVOCATIONS[@]}" "$pass" "$stderr_only" "$expected" "$unexpected"

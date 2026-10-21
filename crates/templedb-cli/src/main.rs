@@ -169,9 +169,22 @@ enum SearchCmd {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
-    /// List all projects
+    /// List all projects.
+    ///
+    /// The two filters are Python's and select rows only — the counts a
+    /// project shows are the same whether you filtered or not. Python
+    /// runs a separate query under either flag, with a different file
+    /// count, a different line source and a different order, and then
+    /// prints two tables. See `projects.rs`.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Only projects with `is_nix_project = 1`
+        #[arg(long)]
+        nix_only: bool,
+        /// Only projects in one category
+        #[arg(long, value_enum)]
+        category: Option<Category>,
+    },
     /// Show one project's details.
     ///
     /// Takes an exact slug, not a fuzzy name — which is what the Python
@@ -408,6 +421,39 @@ enum SourceCmd {
     Revisions { project: String, file_path: String },
 }
 
+/// The five categories Python's `argparse` offers as `choices`.
+///
+/// An enum here, and a plain `String` in the query layer, on purpose.
+/// Input validation is the edge's job and reproducing Python's fixed
+/// list means a bad value exits 2 with a list of the valid ones on both
+/// implementations. But the live `project_category` column has no CHECK
+/// constraint, so a sixth category added after this binary was built
+/// must still filter correctly rather than be unrepresentable — which
+/// it would be if the query took this type.
+///
+/// `clap` derives the kebab-case spellings, which are the ones Python
+/// accepts: `desktop-app`, `nixos-module`, `home-module`.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Category {
+    Package,
+    Service,
+    DesktopApp,
+    NixosModule,
+    HomeModule,
+}
+
+impl Category {
+    fn as_str(self) -> &'static str {
+        match self {
+            Category::Package => "package",
+            Category::Service => "service",
+            Category::DesktopApp => "desktop-app",
+            Category::NixosModule => "nixos-module",
+            Category::HomeModule => "home-module",
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Dir {
     Out,
@@ -583,12 +629,22 @@ fn run() -> Result<i32> {
 
     match cli.command {
         Command::Project { command } => match command {
-            ProjectCmd::List => {
-                let projects = templedb_db::list_projects(&store)?;
+            ProjectCmd::List { nix_only, category } => {
+                let filter = templedb_db::ProjectFilter {
+                    nix_only,
+                    category: category.map(|c| c.as_str().to_string()),
+                };
+                let projects = templedb_db::list_projects_filtered(&store, &filter)?;
                 println!("{:<28} {:>7} {:>10}", "SLUG", "FILES", "LINES");
                 for p in &projects {
                     println!("{:<28} {:>7} {:>10}", p.slug, p.files, p.lines);
                 }
+                // The count goes to stderr so stdout stays a table, and
+                // it is the one place a filter is visible in the output:
+                // an empty filtered list is otherwise a bare header.
+                // Python prints `No projects found matching filters` on
+                // stdout instead, which this cannot match anyway — see
+                // the README's format divergence.
                 eprintln!("\n{} project(s)", projects.len());
             }
             ProjectCmd::Show { slug } => {

@@ -77,7 +77,19 @@ CREATE TABLE projects (
     -- would make the load order circular. `vcs branch` falls back to
     -- the default branch when this does not resolve, exactly as
     -- Python does.
-    active_branch_id bigint
+    active_branch_id bigint,
+    -- `project list`'s two filters. `is_nix_project` is 0/1 in SQLite
+    -- and stays an integer here rather than becoming `boolean`: the
+    -- cross-backend digest hashes the value as it is read, so a type
+    -- that renders `1` on one side and `t` on the other would report
+    -- every row as different. Same reasoning as `is_current` and
+    -- `is_default`.
+    is_nix_project   integer,
+    -- No CHECK constraint, though Python's argparse offers a fixed list
+    -- of five. The constraint belongs to the writer, and a value
+    -- outside the list should mirror and render as itself rather than
+    -- fail the copy — the mirror's job is to carry what is there.
+    project_category text COLLATE "C"
 );
 
 CREATE TABLE project_files (

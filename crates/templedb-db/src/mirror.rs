@@ -87,6 +87,9 @@ pub(crate) const TABLES: &[TableSpec] = &[
             "repo_url",
             "git_branch",
             "active_branch_id",
+            // `project list --nix-only` and `--category`.
+            "is_nix_project",
+            "project_category",
         ],
         types: &[
             Type::INT8,
@@ -95,6 +98,8 @@ pub(crate) const TABLES: &[TableSpec] = &[
             Type::TEXT,
             Type::TEXT,
             Type::INT8,
+            Type::INT4,
+            Type::TEXT,
         ],
         key: &["id"],
         page: 2000,

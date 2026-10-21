@@ -44,22 +44,94 @@ pub struct Project {
 /// SQLite compares TEXT with BINARY collation, Postgres with the
 /// database's. The Postgres schema declares these columns `COLLATE "C"`
 /// for that reason — see `schema/postgres/001_read_subset.sql`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectFilter {
+    /// `--nix-only`: `is_nix_project = 1`.
+    pub nix_only: bool,
+    /// `--category`: an exact match on `project_category`.
+    ///
+    /// A `String` rather than an enum even though Python's argparse
+    /// offers a fixed list of five. The list is input validation and
+    /// belongs at the CLI edge, which has it; down here a category the
+    /// live database grew after this port was built should filter
+    /// correctly rather than be unrepresentable.
+    pub category: Option<String>,
+}
+
+impl ProjectFilter {
+    pub fn is_empty(&self) -> bool {
+        !self.nix_only && self.category.is_none()
+    }
+}
+
+/// [`list_projects_filtered`] with no filter.
 pub fn list_projects(store: &dyn Store) -> Result<Vec<Project>> {
+    list_projects_filtered(store, &ProjectFilter::default())
+}
+
+/// Projects matching `filter`, in the same order and with the same
+/// counts as the unfiltered list.
+///
+/// # Why the filter does not change the numbers
+///
+/// Python runs an entirely separate query when either flag is passed:
+/// `COUNT(DISTINCT pf.id)` over **all** `project_files` rather than the
+/// active ones, `SUM(pf.lines_of_code)` instead of the current
+/// snapshot's `line_count`, and `ORDER BY p.slug` instead of by size.
+/// So `templedb project list` and `templedb project list --nix-only`
+/// can report different file counts for the same project, from the same
+/// database, in the same second.
+///
+/// This adds a `WHERE` and changes nothing else, so the flags select
+/// rows and never reinterpret them. The counts a project shows are the
+/// same whether you filtered or not, which is the property that makes
+/// the filtered output worth believing.
+///
+/// Python also prints *two* tables when a filter is passed — a
+/// six-column "Nix Projects" one and then the ordinary "Projects" one
+/// over the same rows — because the filtered branch prints without
+/// returning and falls through to the shared tail. Not reproduced:
+/// `project list` is already a deliberate format divergence, and
+/// doubling the output is not a format.
+pub fn list_projects_filtered(store: &dyn Store, filter: &ProjectFilter) -> Result<Vec<Project>> {
+    // Built rather than interpolated from user input: `category` is a
+    // bound parameter, and `nix_only` contributes a constant.
+    let mut params: Vec<Value> = Vec::new();
+    let mut wheres: Vec<String> = Vec::new();
+    if filter.nix_only {
+        // `= 1`, as Python has it, not `IS NOT NULL` and not a
+        // truthiness test. The column is NULL for most rows and 0 for
+        // some, and both mean "not a Nix project".
+        wheres.push("p.is_nix_project = 1".to_string());
+    }
+    if let Some(category) = &filter.category {
+        params.push(Value::from(category.as_str()));
+        wheres.push(format!("p.project_category = ?{}", params.len()));
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", wheres.join(" AND "))
+    };
+
     let rows = store
         .query(
-            "SELECT p.id,
-                    p.slug,
-                    p.name,
-                    COUNT(DISTINCT pf.id)                              AS files,
-                    CAST(COALESCE(SUM(fc.line_count), 0) AS BIGINT)    AS lines
-               FROM projects p
-          LEFT JOIN project_files pf
-                 ON pf.project_id = p.id AND pf.status = 'active'
-          LEFT JOIN file_contents fc
-                 ON fc.file_id = pf.id AND fc.is_current = 1
-              GROUP BY p.id, p.slug, p.name
-              ORDER BY lines DESC, p.slug",
-            &[],
+            &format!(
+                "SELECT p.id,
+                        p.slug,
+                        p.name,
+                        COUNT(DISTINCT pf.id)                              AS files,
+                        CAST(COALESCE(SUM(fc.line_count), 0) AS BIGINT)    AS lines
+                   FROM projects p
+              LEFT JOIN project_files pf
+                     ON pf.project_id = p.id AND pf.status = 'active'
+              LEFT JOIN file_contents fc
+                     ON fc.file_id = pf.id AND fc.is_current = 1
+                  {where_clause}
+                  GROUP BY p.id, p.slug, p.name
+                  ORDER BY lines DESC, p.slug"
+            ),
+            &params,
         )
         .context("listing projects")?;
 
@@ -235,6 +307,115 @@ mod tests {
         // NULL SUM becomes 0, not a missing row and not "None".
         let empty = projects.iter().find(|p| p.slug == "empty").unwrap();
         assert_eq!((empty.files, empty.lines), (0, 0));
+    }
+
+    /// `--nix-only` is `is_nix_project = 1`, so a 0 and a NULL are both
+    /// excluded. Writing it as `IS NOT NULL` would pass a fixture where
+    /// every non-Nix row is NULL and fail on the live data, which has
+    /// both.
+    #[test]
+    fn nix_only_excludes_both_zero_and_null() {
+        let c = testdb::fixture();
+        let filter = super::ProjectFilter {
+            nix_only: true,
+            category: None,
+        };
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["alpha"]);
+    }
+
+    /// `--category` matches on its own, and does not imply
+    /// `--nix-only`: `beta` shares alpha's category and is not a Nix
+    /// project.
+    #[test]
+    fn category_matches_independently_of_the_nix_flag() {
+        let c = testdb::fixture();
+        let filter = super::ProjectFilter {
+            nix_only: false,
+            category: Some("package".to_string()),
+        };
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["alpha", "beta"]);
+    }
+
+    /// Both together are an AND, not an OR.
+    #[test]
+    fn the_two_filters_intersect() {
+        let c = testdb::fixture();
+        let both = super::ProjectFilter {
+            nix_only: true,
+            category: Some("package".to_string()),
+        };
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &both)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["alpha"]);
+
+        // And a combination nothing satisfies is empty rather than an
+        // error: `alpha` is the only Nix project and its category is
+        // `package`.
+        let none = super::ProjectFilter {
+            nix_only: true,
+            category: Some("service".to_string()),
+        };
+        assert!(super::list_projects_filtered(&c, &none).unwrap().is_empty());
+    }
+
+    /// An unknown category is empty, not an error. The CLI rejects a
+    /// value outside Python's five, but this layer must not — the live
+    /// database can grow a sixth without a rebuild.
+    #[test]
+    fn an_unknown_category_returns_nothing() {
+        let c = testdb::fixture();
+        let filter = super::ProjectFilter {
+            nix_only: false,
+            category: Some("no-such-category".to_string()),
+        };
+        assert!(super::list_projects_filtered(&c, &filter)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The filter must not reinterpret the counts, which is the one
+    /// thing Python's separate query does: the rows a filtered list
+    /// shows carry the same numbers as the unfiltered list.
+    #[test]
+    fn filtering_changes_which_rows_not_what_they_say() {
+        let c = testdb::fixture();
+        let all = super::list_projects(&c).unwrap();
+        let filter = super::ProjectFilter {
+            nix_only: true,
+            category: None,
+        };
+        let filtered = super::list_projects_filtered(&c, &filter).unwrap();
+        let alpha_all = all.iter().find(|p| p.slug == "alpha").unwrap();
+        let alpha_filtered = filtered.iter().find(|p| p.slug == "alpha").unwrap();
+        assert_eq!(
+            (alpha_all.files, alpha_all.lines),
+            (alpha_filtered.files, alpha_filtered.lines)
+        );
+    }
+
+    /// An empty filter is the unfiltered list, so `list_projects` can
+    /// delegate without a branch at the call site.
+    #[test]
+    fn the_default_filter_is_no_filter() {
+        let c = testdb::fixture();
+        assert!(super::ProjectFilter::default().is_empty());
+        let all = super::list_projects(&c).unwrap();
+        let via_filter =
+            super::list_projects_filtered(&c, &super::ProjectFilter::default()).unwrap();
+        assert_eq!(all.len(), via_filter.len());
     }
 
     #[test]

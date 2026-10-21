@@ -216,6 +216,7 @@ FLAG_COMMANDS=(
     "project show x"
     "file cat p f"
     "file ls p"
+    "file set p f"
     "entity stats"
     "entity explore K/r"
     "entity trace K/r"
@@ -257,6 +258,23 @@ FLAGS_EXPECTED=(
     "search content q|--limit"
     # Python always colours and has no flag; this one does.
     "summary|--no-color"
+    # `file set` is the first write and is deliberately partial. Every
+    # one of these is a guard or a feature named in the README's
+    # *The first write*, and the command is behind
+    # TEMPLEDB_RS_ALLOW_WRITES because that list is not visible from a
+    # command line. Listed one flag at a time rather than waved at,
+    # so porting any of them shows up here as a surprise.
+    "file set p f|--allow-mojibake"
+    "file set p f|--verify"
+    "file set p f|--skip-intent"
+    # Staging and committing both need sessions, which the port has no
+    # part of yet.
+    "file set p f|-s"
+    "file set p f|--stage"
+    "file set p f|--session"
+    "file set p f|--commit"
+    "file set p f|--commit-msg"
+    "file set p f|-m"
 )
 
 # `project list`'s filters, compared by which projects they select.

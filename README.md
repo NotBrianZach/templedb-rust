@@ -3,7 +3,7 @@
 A Rust port of TempleDB, the project configuration and version control
 system. Binary name is `templedb-rs`. Reads SQLite or PostgreSQL.
 
-## Status: read-only subset, verified against the Python implementation
+## Status: the read-only subset, plus one opt-in write
 
 Restarted 2026-10-04. The previous contents of this repo described a port
 that did not exist — it claimed "Basic CLI structure with clap" and
@@ -34,6 +34,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
+| `templedb-rs file set <proj> <path> [-c] [--if-match]` | **the first write.** Postgres only, opt-in, and two of Python's seven guards — see *The first write* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -66,7 +67,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-280 unit tests, run by `cargo test`: 248 in `templedb-db` and 32 in
+288 unit tests, run by `cargo test`: 256 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -122,10 +123,14 @@ tree.
 operations, no sessions, no checkouts, no ingest, no doctor, no publish,
 no Nix integration, no GUI. See *Porting order* below.
 
-No writes to the live database, either. The one write path in the binary
-is `mirror`, and it writes only into a Postgres mirror it owns — never
-back to the SQLite file the Python implementation has authority over.
-See *Two backends*.
+No writes to the live database, either — and that is still true now
+that the binary has a write command. There are two write paths in it,
+`mirror` and `file set`, and both write only a Postgres database this
+port owns; neither can reach the SQLite file the Python implementation
+has authority over. `file set` additionally requires
+`TEMPLEDB_RS_ALLOW_WRITES=1` and a `TEMPLEDB_WRITE_URL` that is
+deliberately *not* the variable the readers use. See *Two backends* and
+*The first write*.
 
 ### Measured, 3-run average on a 776 MB database
 
@@ -1135,7 +1140,7 @@ order: `cargo test --workspace`, the two CPython oracles (`difflib` and
 the clock), and `scripts/parity-sweep.sh python` — all 50 invocations
 diffed against the Python `templedb`, then three stages for what a
 whole-stdout diff cannot reach: `summary` one pane at a time, the flag
-surfaces of 19 commands, and `project list`'s filters by which projects
+surfaces of 20 commands, and `project list`'s filters by which projects
 they select. The sweep exits with the number of *unexpected*
 differences, so the deliberate divergences do not fail it and a new one
 does.
@@ -1144,12 +1149,21 @@ A current clean run reads:
 
 ```
 summary   6 of 7 claimed panes identical, 2 not ported
-flags     19 of 19 commands agree (deliberate divergences allowed)
+flags     20 of 20 commands agree (deliberate divergences allowed)
 filters   8 of 8 project-list filters select the same projects
 
 templedb-rs vs python, 50 invocations: 45 stdout-identical
-(15 differing on stderr only), 16 deliberate, 0 unexpected
+(15 differing on stderr only), 25 deliberate, 0 unexpected
 ```
+
+The deliberate count jumped from 16 to 25 when `file set` landed: nine
+of its flags are absent on purpose and each is listed individually, so
+porting any one of them shows up here as a change rather than
+disappearing into a waved-at exception.
+
+`just write-test` is **not** part of `just check`, because it needs a
+Postgres server and `check` is meant to run anywhere the build does.
+Run it alongside when touching the write path.
 
 Each of the three stages has been sabotage-tested — a deliberate
 regression introduced, then the stage confirmed to report it and the
@@ -1180,7 +1194,7 @@ what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (280) | yes | yes |
+| unit tests (288) | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
 | 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
@@ -1241,6 +1255,9 @@ crates/templedb-db/    data layer, one module per command family
                        that carries a non-default one
   clock.rs             one injectable instant; julianday and _age_hint,
                        reproduced to the bit. No SQL, no backend
+  writer.rs            PgWriter — the one writable handle, outside the
+                       Store trait on purpose. Opt-in, scratch-only
+  fileset.rs           `file set`: the first write, and its two guards
   pgtext.rs            the NUL escape: SQLite TEXT holds U+0000 and
                        Postgres text cannot. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
@@ -1255,9 +1272,14 @@ scripts/
                        backend / a previous build. Plus three stages for
                        the commands whose whole stdout cannot be
                        diffed: `summary` one pane at a time, the flag
-                       surfaces of 19 commands, and `project list`'s
+                       surfaces of 20 commands, and `project list`'s
                        filters by which projects they select. Not run
                        by `cargo test` — it needs the live database.
+crates/templedb-db/tests/
+  difflib_parity.rs    CPython difflib as an oracle (needs python3)
+  clock_parity.rs      SQLite julianday as an oracle (needs python3)
+  write_parity.rs      `file set` against a real Postgres, read back
+                       through the ported reader (needs a server)
 ```
 
 Nothing from `rusqlite` or `postgres` is re-exported. The previous
@@ -2086,6 +2108,129 @@ So `project list` is the one implemented command that is **not** a
 candidate for byte-level diffing against Python, and the status table
 now says so. Nothing depends on it matching; it is listed here because
 a reader comparing the two outputs deserves to know before they try.
+
+### The first write
+
+Landed 2026-10-21. `templedb-rs file set <proj> <path>`, step 15.
+
+Chosen by the design document over `vcs commit`, which it calls "the
+widest door in the system — workspace scan, three guards, conflict
+detection with resolution strategies, session head bookkeeping, commit
+metadata, and per-file writes across four tables". This is one logical
+change across three tables, and its whole effect is visible through
+read commands the sweep already verifies byte for byte.
+
+**It writes Postgres, never the live SQLite.** Python keeps sole
+authority over `~/.local/share/templedb/templedb.sqlite`; the port
+writes the scratch database it owns, so a wrong write costs a
+`just mirror-refresh`. Two environment variables and not one:
+`TEMPLEDB_WRITE_URL` names the scratch and `TEMPLEDB_URL` names the
+parity target, which only `mirror` may write because it opens with
+`TRUNCATE`. Isolation by connection string rather than by
+`search_path`, because a wrong database name is loud and a wrong
+`search_path` is silent, and the operation on the other side of that
+mistake truncates eleven tables.
+
+**It is opt-in.** `TEMPLEDB_RS_ALLOW_WRITES=1`, as the design document
+asks. Not caution for its own sake — the command is partial in ways a
+command line cannot show, and the opt-in is what stops a script
+reaching it by habit.
+
+#### What it does not do, in full
+
+The design document's sharpest finding is that **the guards are the
+deliverable**: "a port that reproduces the SQL and not these is a
+regression even if every byte of output matches." This reproduces the
+SQL and **two of the seven guards**. The rest are absent and named,
+because an unnamed omission in a write path is how the incidents in
+that document happened:
+
+| absent | what it was for |
+|---|---|
+| the mojibake guard | UTF-8 read as Latin-1 and written back is still valid UTF-8, so hashes match and `--verify` passes. `bza`'s `page.tsx` shipped that way for two weeks |
+| `edit_intents` | provenance: who set this, when, from which session. Table is outside the mirrored subset |
+| `--stage` / `--session` | needs sessions, which the port has no part of |
+| `--commit` / `-m` | needs `vcs commit`, the step after this |
+| `--verify` | reads `is_current` back after the write. Cheap, and not yet done |
+| `--skip-intent` | nothing to skip without `edit_intents` |
+| binary content | Python falls back to `content_blob` for undecodable stdin — which is why `.authinfo.gpg` can be stored at all. This takes text only, and refuses rather than mangling |
+
+All nine of those flags are listed individually in the sweep's
+flag-surface allow-list rather than waved at, so porting any one of
+them shows up as a surprise.
+
+The two guards that *are* here:
+
+- **`--if-match`.** `file set` replaces the whole file, so content read
+  earlier is a lock on all of it: anything written in between is
+  reverted silently, with no conflict and a clean `--verify` — which
+  only checks that what you wrote is what landed, not that you meant to
+  drop the rest. That happened twice on 2026-10-04 to a 5,239-line file
+  four fixes were landing in, and the first instance went unnoticed for
+  three commits. A prefix of 8 hex characters is enough, because every
+  surface that displays a hash truncates it.
+- **The un-delete.** `file set` on a soft-deleted row revives it.
+  Without it the blob lands and everything filtering on
+  `status = 'active'` skips the file, which is how `set bza flake.nix`
+  once looked like a success and shipped nothing.
+
+#### Two things the read subset could not do
+
+**`id` had no default.** The schema was built for `mirror`, which
+copies rows that already have ids, so every `id` is a plain
+`bigint PRIMARY KEY`. A writer has nothing to generate one from. So
+`project_files.id` and `file_contents.id` are now
+`GENERATED BY DEFAULT AS IDENTITY` — `BY DEFAULT` and not `ALWAYS`,
+because `mirror` must keep supplying explicit ids and `ALWAYS` would
+reject its `COPY`. The consequence is that `COPY` does not advance the
+sequence, so a freshly mirrored database would hand out id 1 and
+collide; `mirror` now calls `setval` on both sequences inside the copy's
+transaction. Inside, unlike `ANALYZE`: a mirror whose sequences are
+behind is not merely unoptimised, it is one the first write breaks.
+
+**Resolution is exact, not fuzzy.** Every read command takes a fuzzy
+project name and Python's `file set` does too. This takes an exact
+slug, which is the one place the port is deliberately *stricter*: a
+reader that guesses wrong wastes a second, a writer that guesses wrong
+overwrites a file — and the scoring function has two known bugs wrapped
+around it. The slug is also resolved *inside the write transaction*,
+against the write target, because the reader and the writer point at
+different databases and resolving against one while writing to the
+other would be a genuinely nasty bug.
+
+#### How it is verified
+
+Not by a byte diff, and it never will be: Python writes SQLite and this
+writes Postgres, so there is no shared input. The technique is the one
+the design document calls **cross-read** — the port writes, and the
+already-trusted read layer reads it back.
+
+`crates/templedb-db/tests/write_parity.rs`, seven tests, `#[ignore]`d
+and run by `just write-test`. The read-back goes through
+`templedb_db::read_file` — the actual ported `file cat` query, not SQL
+written for the test — so a write `file cat` cannot see is a failure.
+That mattered immediately: the first version used a hand-written query
+without `status = 'active'`, and the un-delete test passed against a
+soft-deleted row while asserting nothing.
+
+They stay out of `cargo test` for the same reason the two CPython
+oracles do, which preserves the property this file advertises: **no
+Postgres server is needed to build or to `cargo test`**. The design
+document listed replacing the in-memory SQLite fixture as the one
+question blocking this work; it is a *cutover* question, and step 15b
+says why.
+
+What the seven cover: creating a file, replacing one in place through
+the `ON CONFLICT (file_id, is_current)` arm, a no-op rewrite, the
+un-delete, empty content, `--if-match` letting a match through *and
+refusing a stale base without writing*, and content containing a NUL.
+
+That last one ties the write path to `pgtext`: the escape had only ever
+been exercised by `mirror`, and a writer inserting raw text would be
+rejected for exactly the reason the mirror was. The hash is taken over
+the **original** bytes, not the escaped form, so `file cat | sha256sum`
+still equals the blob's own key — verified at the command line, where
+`file set` prints a hash matching `sha256sum` of the same content.
 
 ### The one place the two text types are not the same type
 

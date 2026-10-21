@@ -70,6 +70,7 @@ mod difflib;
 mod entities;
 mod exit;
 mod files;
+mod fileset;
 mod fuzzy;
 mod like;
 mod mirror;
@@ -83,6 +84,7 @@ mod summary;
 mod textsearch;
 mod value;
 mod vcs;
+mod writer;
 
 pub use backend::pg::PgStore;
 pub use backend::sqlite::SqliteStore;
@@ -97,6 +99,7 @@ pub use entities::{
 };
 pub use exit::{code_of, Coded, NOT_FOUND, NO_PATH, USAGE};
 pub use files::{list_files, read_file, EditModeFilter, FileEntry};
+pub use fileset::{content_hash, line_count, resolve_project_exact, set_file, SetOutcome};
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
 pub use mirror::{
     check_freshness, mirror, Drift, FreshnessReport, TableReport, MIRRORED_TABLES, READ_SUBSET_DDL,
@@ -120,6 +123,7 @@ pub use vcs::{
     parent_hash, version_text, BlobKind, BranchEntry, CommitContent, CommitDetail, CommitEntry,
     ContentVersion, FileChange, Visibility,
 };
+pub use writer::{PgWriter, OPT_IN_ENV, WRITE_URL_ENV};
 
 // Nothing from `rusqlite` or `postgres` is re-exported. The previous
 // revision of this file re-exported `rusqlite::Connection` "so the CLI

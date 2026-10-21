@@ -255,7 +255,11 @@ impl ToSql for Value {
 /// failed connection does not put a password in a log or an error
 /// message. Leaves non-URL libpq strings alone apart from a `password=`
 /// field.
-fn redact(conn_string: &str) -> String {
+///
+/// `pub(crate)` so `writer.rs` can use it rather than growing a second
+/// copy: the writer opens its own connection and has exactly the same
+/// reason not to print the password.
+pub(crate) fn redact(conn_string: &str) -> String {
     if let Some((scheme, rest)) = conn_string.split_once("://") {
         if let Some((userinfo, host)) = rest.split_once('@') {
             let user = userinfo.split(':').next().unwrap_or("");

@@ -587,6 +587,18 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
         .with_context(|| format!("recording provenance for {}", report.table))?;
     }
 
+    // Advance the identity sequences to match the ids just copied.
+    //
+    // `COPY` with explicit ids does not touch the sequence behind an
+    // identity column, so a freshly mirrored database would hand out
+    // id 1 on the first insert and collide on the primary key. The
+    // failure is loud, which is the only good thing about it.
+    //
+    // Inside the transaction, unlike `ANALYZE`: a mirror whose
+    // sequences are behind is not merely unoptimised, it is one that
+    // the first write breaks. That belongs to the copy's atomicity.
+    sync_sequences(&mut tx).context("advancing the identity sequences")?;
+
     tx.commit().context("committing the mirror")?;
 
     // `ANALYZE` after the copy, and deliberately *after* the commit.
@@ -623,6 +635,43 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
     }
 
     Ok(reports)
+}
+
+/// The tables whose `id` is an identity column, and whose sequence
+/// therefore has to be advanced past the ids `COPY` just inserted.
+///
+/// Kept beside [`TABLES`] rather than derived from it because being an
+/// identity column is a property of the DDL, not of the copy, and a
+/// table gains one only when a write path needs it. Two today; the list
+/// grows with the writer.
+const IDENTITY_TABLES: &[&str] = &["project_files", "file_contents"];
+
+/// `setval` each identity sequence to the table's current `MAX(id)`.
+///
+/// `COALESCE(MAX(id), 0) + 1` with `false` as the third argument rather
+/// than `setval(seq, MAX(id))`: an empty table has no maximum, and
+/// `setval(..., 0)` is an error because sequences start at 1. Passing
+/// `is_called = false` means "the next value handed out is exactly
+/// this", so the arithmetic is the same for an empty table and a full
+/// one and there is no branch.
+fn sync_sequences(tx: &mut postgres::Transaction<'_>) -> Result<()> {
+    for table in IDENTITY_TABLES {
+        // `pg_get_serial_sequence` rather than guessing
+        // `<table>_id_seq`: the name is an implementation detail and
+        // asking is both correct and self-documenting.
+        tx.execute(
+            &format!(
+                "SELECT setval(
+                     pg_get_serial_sequence('{table}', 'id'),
+                     (SELECT COALESCE(MAX(id), 0) + 1 FROM {table}),
+                     false
+                 )"
+            ),
+            &[],
+        )
+        .with_context(|| format!("advancing {table}'s id sequence"))?;
+    }
+    Ok(())
 }
 
 /// This row's values with every `Value::Text` escaped for Postgres.

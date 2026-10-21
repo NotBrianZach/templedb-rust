@@ -29,3 +29,17 @@ postgres = "0.19"
 # in the lock file via rusqlite and postgres, so it adds no new
 # dependency, only a declared one.
 libc = "0.2"
+# `file set` addresses content by `sha256(bytes)` because Python does,
+# and the hash is the identity of a row in `content_blobs` — so it has
+# to be the same function, not merely a hash. Already in the lock file
+# via the postgres driver's SCRAM authentication, so this adds a
+# declaration rather than a dependency. `statediff`'s digest is
+# deliberately *not* this: it is a 128-bit FNV variant chosen to be
+# order-independent and cheap over 200k rows, and it answers a
+# different question.
+#
+# Pinned to the line already in `Cargo.lock`. Asking for "0.10" instead
+# resolves a *different* version, which drags in `generic-array` through
+# an older `digest` and fails to build offline — the lock has 0.11 and
+# nothing else.
+sha2 = "0.11"

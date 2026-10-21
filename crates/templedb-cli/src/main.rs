@@ -197,6 +197,39 @@ enum ProjectCmd {
 enum FileCmd {
     /// Print a tracked file's current contents
     Cat { project: String, path: String },
+    /// Write a file's contents. **The port's only command that writes.**
+    ///
+    /// Writes the port's own Postgres — the one named by
+    /// `TEMPLEDB_WRITE_URL` — and never the live SQLite database, which
+    /// the Python implementation keeps sole authority over. Requires
+    /// `TEMPLEDB_RS_ALLOW_WRITES=1`.
+    ///
+    /// **Partial.** Python's `file set` carries seven guards; this
+    /// carries two — `--if-match` and the un-delete. Absent: the
+    /// mojibake check, `edit_intents` provenance, staging, `--commit`,
+    /// `--verify`, and binary content. The opt-in exists because none
+    /// of that is visible from a command line. See the README's
+    /// *The first write*.
+    ///
+    /// Takes an exact slug, not a fuzzy name — the one place this port
+    /// is deliberately stricter than Python, because a mis-resolved
+    /// write overwrites a file.
+    Set {
+        project: String,
+        path: String,
+        /// Content to write. Reads stdin when absent.
+        #[arg(short, long)]
+        content: Option<String>,
+        /// Refuse unless the file currently hashes to HASH.
+        ///
+        /// A full sha256 or a prefix of at least 8 hex characters.
+        /// `file set` replaces the whole file, so content read earlier
+        /// is a lock on all of it: anything written in between is
+        /// reverted silently, with no conflict. Use this whenever the
+        /// content being written was derived from a copy read earlier.
+        #[arg(long = "if-match", value_name = "HASH")]
+        if_match: Option<String>,
+    },
     /// List tracked files, optionally under a path prefix
     Ls {
         project: String,
@@ -689,6 +722,97 @@ fn run() -> Result<i32> {
                 // trailing newline, and adding one makes `| sha256sum`
                 // disagree with the Python `file cat` it is replacing.
                 print!("{}", templedb_db::read_file(&store, &slug, &path)?);
+            }
+            FileCmd::Set {
+                project,
+                path,
+                content,
+                if_match,
+            } => {
+                // Read the content before opening anything, so a
+                // refusal on stdin does not leave a connection or a
+                // transaction waiting on it.
+                let content = match content {
+                    Some(c) => c,
+                    None => {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        // Text only. Python falls back to
+                        // `content_blob` for undecodable stdin,
+                        // deliberately — it is why `.authinfo.gpg`
+                        // could be stored at all — and this port does
+                        // not have that branch yet, so it refuses
+                        // rather than writing mojibake.
+                        std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                            anyhow::anyhow!(
+                                "stdin is not UTF-8 text ({e}). This port's \
+                                     `file set` writes text only; Python's falls \
+                                     back to a binary blob."
+                            )
+                        })?;
+                        buf
+                    }
+                };
+                if content.is_empty() && if_match.is_none() {
+                    // Python refuses empty input outright, on the
+                    // grounds that it is almost always a pipe that
+                    // produced nothing. `--if-match` makes truncation
+                    // explicit, so it is allowed through.
+                    anyhow::bail!(
+                        "no content provided (use --content, or pipe to stdin).\n\
+                         To truncate a file deliberately, pass --if-match with \
+                         its current hash."
+                    );
+                }
+
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                let mut tx = writer.transaction()?;
+                let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
+                let outcome = templedb_db::set_file(
+                    &mut tx,
+                    &clock,
+                    project_id,
+                    &path,
+                    &content,
+                    if_match.as_deref(),
+                );
+                // `?` before the commit, deliberately: on the error path
+                // `tx` is dropped without `commit`, and `postgres`
+                // rolls an un-committed transaction back on drop. A
+                // refusal has to leave nothing behind — `--if-match`
+                // exists to *prevent* a write, not to report one — and
+                // the ordering here is what makes that true.
+                let outcome = outcome?;
+                tx.commit()?;
+
+                // stdout is the hash, so a script can chain on it.
+                // Everything else is commentary and goes to stderr,
+                // which is the same division `file ls` already uses for
+                // its count.
+                println!("{}", outcome.hash);
+                let mut notes = Vec::new();
+                if outcome.created {
+                    notes.push("created".to_string());
+                }
+                if outcome.undeleted {
+                    notes.push("revived from deleted".to_string());
+                }
+                if outcome.unchanged {
+                    notes.push("unchanged".to_string());
+                } else if let Some(prev) = &outcome.previous {
+                    notes.push(format!("was {}", &prev[..12.min(prev.len())]));
+                }
+                eprintln!(
+                    "{project}/{path}: {} bytes, {} lines{}",
+                    outcome.size_bytes,
+                    outcome.line_count,
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", notes.join(", "))
+                    }
+                );
             }
             FileCmd::Ls {
                 project,

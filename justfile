@@ -252,3 +252,31 @@ pg-verify-ro:
     else
         echo "refused (correct)"
     fi
+
+# The write path, against the scratch Postgres (needs a server).
+#
+# #[ignore]d in `cargo test` for the same reason the CPython oracles
+# are: it needs something the build does not. Keeping it out means
+# `cargo test` still runs with no server, which is a property the README
+# advertises and which the write path must not quietly cost.
+#
+# PG_SCRATCH, never PG_PARITY_*: `mirror` opens the parity database
+# with TRUNCATE, and a write test that landed there would be destroyed
+# by the next re-mirror while reporting its own writes as parity
+# failures in between.
+#
+# --test-threads=1 because every test creates and drops a project, and
+# two of them racing on `MAX(id) + 1000` would collide on the slug's
+# UNIQUE constraint.
+write-test:
+    TEMPLEDB_WRITE_URL="{{PG_SCRATCH}}" \
+        cargo test --test write_parity -- --ignored --test-threads=1
+
+# Create the write-scratch schema from the subset DDL (first run).
+#
+# Separate from `mirror`: the scratch database does not need the data,
+# only the shape — and pointing `mirror` at it would make the write
+# target a TRUNCATE target, which is the arrangement the two databases
+# exist to prevent.
+pg-scratch-schema:
+    psql "{{PG_SCRATCH}}" -q -f schema/postgres/001_read_subset.sql

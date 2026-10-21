@@ -263,9 +263,12 @@ FLAGS_EXPECTED=(
     # *The first write*, and the command is behind
     # TEMPLEDB_RS_ALLOW_WRITES because that list is not visible from a
     # command line. Listed one flag at a time rather than waved at,
-    # so porting any of them shows up here as a surprise.
-    "file set p f|--allow-mojibake"
-    "file set p f|--verify"
+    # so porting any of them shows up here as a surprise — which is
+    # exactly what happened to `--verify` and `--allow-mojibake`, both
+    # of which were here for one commit and are now implemented.
+    #
+    # Nothing to skip without `edit_intents`, whose table is outside
+    # the mirrored subset.
     "file set p f|--skip-intent"
     # Staging and committing both need sessions, which the port has no
     # part of yet.

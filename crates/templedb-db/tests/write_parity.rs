@@ -88,7 +88,11 @@ impl Fixture {
     ) -> anyhow::Result<templedb_db::SetOutcome> {
         let clock = Clock::at("2026-10-21 12:00:00").unwrap();
         let mut tx = self.writer.transaction()?;
-        let outcome = set_file(&mut tx, &clock, self.project_id, path, content, if_match);
+        let opts = templedb_db::SetOptions {
+            if_match,
+            allow_mojibake: false,
+        };
+        let outcome = set_file(&mut tx, &clock, self.project_id, path, content, &opts);
         match outcome {
             Ok(o) => {
                 tx.commit()?;
@@ -303,6 +307,93 @@ fn content_with_a_nul_round_trips_through_the_write_path() {
     assert!(text.contains('\0'));
     // Size is the original byte count, not the escaped one.
     assert_eq!(f.stats("e.ts").unwrap().0, content.len() as i64);
+}
+
+/// `--verify` passes after a real write and fails when the row moved
+/// underneath it. The second half needs the row changed *by something
+/// else*, which is the only situation the flag exists for.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn verify_passes_after_a_write_and_catches_a_revert() {
+    let mut f = fixture!("wp-verify");
+    let out = f.set("v.txt", "written\n", None).unwrap();
+
+    // A fresh transaction, as the CLI uses — reading inside the
+    // writing one could only ever agree with itself.
+    {
+        let mut tx = f.writer.transaction().unwrap();
+        templedb_db::verify_current(&mut tx, f.project_id, "v.txt", &out.hash)
+            .expect("should agree with what was just written");
+    }
+
+    // Now revert the row behind the writer's back, which is what a
+    // concurrent writer or a trigger would do.
+    {
+        let mut tx = f.writer.transaction().unwrap();
+        tx.execute(
+            "UPDATE file_contents SET content_hash = $1
+              WHERE file_id = (SELECT id FROM project_files
+                                WHERE project_id = $2 AND file_path = $3)
+                AND is_current = 1",
+            &[
+                &templedb_db::content_hash("something else\n"),
+                &f.project_id,
+                &"v.txt",
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let mut tx = f.writer.transaction().unwrap();
+    let err = templedb_db::verify_current(&mut tx, f.project_id, "v.txt", &out.hash)
+        .expect_err("should notice the row moved");
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NOT_FOUND);
+    assert!(format!("{err:#}").contains("--verify failed"));
+}
+
+/// The mojibake guard refuses a write that introduces double-encoded
+/// UTF-8, leaves the database untouched, and exits 3 — and
+/// `allow_mojibake` lets the same content through.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn the_mojibake_guard_refuses_through_the_write_path() {
+    let mut f = fixture!("wp-mojibake");
+    f.set("m.tsx", "<button>done</button>\n", None).unwrap();
+
+    // What `perl -0pi -e` did to page.tsx: encode to UTF-8, read the
+    // bytes back as Latin-1.
+    let corrupted: String = "<button>✓ done</button>\n"
+        .as_bytes()
+        .iter()
+        .map(|&b| b as char)
+        .collect();
+
+    let err = f.set("m.tsx", &corrupted, None).unwrap_err();
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NO_PATH);
+    assert!(format!("{err:#}").contains("double-encoded"));
+    // Refused means nothing written, not written-then-complained.
+    assert_eq!(
+        f.read_back("m.tsx").as_deref(),
+        Some("<button>done</button>\n")
+    );
+
+    // The escape hatch works, and the content that lands is exactly
+    // what was asked for.
+    let opts = templedb_db::SetOptions {
+        if_match: None,
+        allow_mojibake: true,
+    };
+    let clock = Clock::at("2026-10-21 12:00:00").unwrap();
+    let mut tx = f.writer.transaction().unwrap();
+    set_file(&mut tx, &clock, f.project_id, "m.tsx", &corrupted, &opts).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(f.read_back("m.tsx").as_deref(), Some(corrupted.as_str()));
+
+    // And once it is in, an edit that does not *add* any more is
+    // allowed — the file has to stay editable.
+    let more = format!("{corrupted}// trailing\n");
+    f.set("m.tsx", &more, None)
+        .expect("an edit that adds no new sequences must pass");
 }
 
 /// Empty content is a legal file, with Python's line count of 0.

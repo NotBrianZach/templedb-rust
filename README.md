@@ -34,7 +34,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
-| `templedb-rs file set <proj> <path> [-c] [--if-match]` | **the first write.** Postgres only, opt-in, and two of Python's seven guards — see *The first write* |
+| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake]` | **the first write.** Postgres only, opt-in, four of Python’s seven guards — see *The first write* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -67,7 +67,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-288 unit tests, run by `cargo test`: 256 in `templedb-db` and 32 in
+296 unit tests, run by `cargo test`: 264 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -1153,10 +1153,10 @@ flags     20 of 20 commands agree (deliberate divergences allowed)
 filters   8 of 8 project-list filters select the same projects
 
 templedb-rs vs python, 50 invocations: 45 stdout-identical
-(15 differing on stderr only), 25 deliberate, 0 unexpected
+(15 differing on stderr only), 23 deliberate, 0 unexpected
 ```
 
-The deliberate count jumped from 16 to 25 when `file set` landed: nine
+The deliberate count went from 16 to 23 when `file set` landed: seven
 of its flags are absent on purpose and each is listed individually, so
 porting any one of them shows up here as a change rather than
 disappearing into a waved-at exception.
@@ -1194,7 +1194,7 @@ what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (288) | yes | yes |
+| unit tests (296) | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
 | 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
@@ -2147,19 +2147,19 @@ that document happened:
 
 | absent | what it was for |
 |---|---|
-| the mojibake guard | UTF-8 read as Latin-1 and written back is still valid UTF-8, so hashes match and `--verify` passes. `bza`'s `page.tsx` shipped that way for two weeks |
 | `edit_intents` | provenance: who set this, when, from which session. Table is outside the mirrored subset |
 | `--stage` / `--session` | needs sessions, which the port has no part of |
 | `--commit` / `-m` | needs `vcs commit`, the step after this |
-| `--verify` | reads `is_current` back after the write. Cheap, and not yet done |
 | `--skip-intent` | nothing to skip without `edit_intents` |
 | binary content | Python falls back to `content_blob` for undecodable stdin — which is why `.authinfo.gpg` can be stored at all. This takes text only, and refuses rather than mangling |
 
-All nine of those flags are listed individually in the sweep's
-flag-surface allow-list rather than waved at, so porting any one of
-them shows up as a surprise.
+Every one of those flags is listed individually in the sweep's
+flag-surface allow-list rather than waved at, so porting one shows up
+as a change. That is not hypothetical: **`--verify` and
+`--allow-mojibake` were on this list for exactly one commit**, and the
+list is how they got picked up.
 
-The two guards that *are* here:
+The four guards that *are* here:
 
 - **`--if-match`.** `file set` replaces the whole file, so content read
   earlier is a lock on all of it: anything written in between is
@@ -2173,6 +2173,48 @@ The two guards that *are* here:
   Without it the blob lands and everything filtering on
   `status = 'active'` skips the file, which is how `set bza flake.nix`
   once looked like a success and shipped nothing.
+- **The mojibake guard.** UTF-8 read as Latin-1 and written back
+  doubles every non-ASCII character — an em dash's `E2 80 94` becomes
+  `C3 A2 C2 80 C2 94` — and the result is *still valid UTF-8*, so every
+  decode accepts it, the hash matches and `--verify` passes. `bza`'s
+  `frontend/app/page.tsx` shipped that way for two weeks before anyone
+  noticed a button reading `â   done` instead of `✓ done`. The cause
+  was a `perl -0pi -e` one-liner, not TempleDB, which is why the only
+  place to catch it is where content enters the database. Refuses with
+  exit 3 and names what the sequences decode *back* to, because
+  "this looks like it should be ✓" is the only actionable form of the
+  message.
+- **`--verify`.** Reads `is_current` back after the write and refuses
+  if it is not what was written. On **a fresh transaction after the
+  commit**, deliberately: inside the writing transaction it would read
+  its own uncommitted effect and could only ever agree, which is a
+  check that cannot fail and therefore is not one.
+
+#### The refusal codes, which are the contract
+
+Caught the day after the command landed, and it was a real divergence
+rather than a nicety. Python returns **2** for an `--if-match`
+mismatch and **3** for a mojibake refusal; the first version of this
+returned 1 for both, because every refusal was a plain `bail!`.
+
+That matters more for a write than for a read. The design document's
+section on verification lists *refusal parity* as one of three
+techniques replacing the byte diff — "every guard refuses with a
+specific exit code and message; for a write, the refusals are the
+contract" — and closing the error-exit gap was made a precondition for
+exactly this reason. Shipping a writer whose refusals are
+indistinguishable from a missing database would have undone step 12.
+
+So `exit.rs` gained two constructors beside `Coded::not_found`:
+`conflict` (2, for `--if-match` and `--verify` — the database moved
+under you) and `refused` (3, for a content guard). Both reuse numbers
+the read commands already use for other meanings, and that reuse is
+Python's rather than this port's invention. A malformed `--if-match`
+argument still exits 1, which is also Python's split: a bad flag is bad
+input, a mismatched one is a conflict.
+
+Verified at the command line against Python's documented codes: 3 for
+mojibake, 2 for `--if-match`, 0 for a `--verify` that passes.
 
 #### Two things the read subset could not do
 
@@ -2205,7 +2247,7 @@ writes Postgres, so there is no shared input. The technique is the one
 the design document calls **cross-read** — the port writes, and the
 already-trusted read layer reads it back.
 
-`crates/templedb-db/tests/write_parity.rs`, seven tests, `#[ignore]`d
+`crates/templedb-db/tests/write_parity.rs`, nine tests, `#[ignore]`d
 and run by `just write-test`. The read-back goes through
 `templedb_db::read_file` — the actual ported `file cat` query, not SQL
 written for the test — so a write `file cat` cannot see is a failure.
@@ -2220,10 +2262,19 @@ document listed replacing the in-memory SQLite fixture as the one
 question blocking this work; it is a *cutover* question, and step 15b
 says why.
 
-What the seven cover: creating a file, replacing one in place through
+What the nine cover: creating a file, replacing one in place through
 the `ON CONFLICT (file_id, is_current)` arm, a no-op rewrite, the
 un-delete, empty content, `--if-match` letting a match through *and
-refusing a stale base without writing*, and content containing a NUL.
+refusing a stale base without writing*, content containing a NUL,
+`--verify` agreeing after a write *and catching a row reverted behind
+the writer's back*, and the mojibake guard refusing through the write
+path with `--allow-mojibake` letting the same content past.
+
+Two of those are written to be able to fail, which is the only kind
+worth having: the `--verify` test reverts the row with its own `UPDATE`
+before checking, and the mojibake test corrupts a string the way the
+incident did — encode to UTF-8, read the bytes back as Latin-1 — rather
+than hand-writing a sequence that happens to match the pattern.
 
 That last one ties the write path to `pgtext`: the escape had only ever
 been exercised by `mirror`, and a writer inserting raw text would be

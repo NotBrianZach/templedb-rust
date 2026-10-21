@@ -96,6 +96,143 @@ pub fn line_count(content: &str) -> i64 {
     }
 }
 
+/// Sequences in `text` that are valid UTF-8 when encoded back to
+/// Latin-1 — the signature of double-encoded UTF-8.
+///
+/// # The failure this detects
+///
+/// UTF-8 read as Latin-1 and written back as UTF-8 doubles every
+/// non-ASCII character: an em dash's `E2 80 94` becomes
+/// `C3 A2 C2 80 C2 94`. The result is **still valid UTF-8**, so every
+/// decode on the way into the database accepts it, the hash matches,
+/// and `--verify` passes. It renders as a stray `â` plus two C1
+/// control characters that browsers draw as nothing.
+///
+/// `bza`'s `frontend/app/page.tsx` was corrupted this way on 2026-09-29
+/// and shipped for two weeks before anyone noticed a button reading
+/// `â   done` instead of `✓ done`. The cause was not TempleDB: a
+/// `perl -0pi -e` one-liner reads the file as bytes, so inserting one
+/// literal above U+00FF upgrades the whole buffer and re-encodes all of
+/// it. Perl says "Wide character in print" and that warning went to a
+/// discarded stderr. The hazard lives in throwaway shell, so the only
+/// place to catch it is where content enters the database.
+///
+/// # Reproducing Python's regex without a regex
+///
+/// Python compiles three ordered alternatives over *characters* in the
+/// Latin-1 range:
+///
+/// ```text
+/// [U+00C2-U+00DF][U+0080-U+00BF]
+/// [U+00E0-U+00EF][U+0080-U+00BF]{2}
+/// [U+00F0-U+00F4][U+0080-U+00BF]{3}
+/// ```
+///
+/// `finditer` scans left to right, tries the alternatives in order at
+/// each position, and resumes after a match rather than inside it. That
+/// ordering is reproduced here: the two-character form is tried first,
+/// and a match advances the cursor past the whole run. Scanning by
+/// character and not by byte is the other half — these are `char`
+/// comparisons against a `str`, so a genuinely multi-byte character
+/// never half-matches.
+///
+/// Each hit is returned as the character it would decode *back* to, so
+/// a caller can say "this looks like it should be —" rather than
+/// dumping bytes. A run that matches the shape but is not re-decodable
+/// is ordinary text and is dropped, which is Python's `except` arm.
+pub fn mojibake_runs(text: &str) -> Vec<String> {
+    const CONT: std::ops::RangeInclusive<char> = '\u{80}'..='\u{bf}';
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // Ordered exactly as Python's alternation: lead range, then how
+        // many continuations it requires.
+        let run = [
+            ('\u{c2}'..='\u{df}', 1usize),
+            ('\u{e0}'..='\u{ef}', 2),
+            ('\u{f0}'..='\u{f4}', 3),
+        ]
+        .into_iter()
+        .find_map(|(lead, conts)| {
+            if !lead.contains(&chars[i]) {
+                return None;
+            }
+            // The run needs `chars[i + 1 ..= i + conts]`, so the last
+            // index touched is `i + conts`.
+            if i + conts >= chars.len() {
+                return None;
+            }
+            if (1..=conts).all(|k| CONT.contains(&chars[i + k])) {
+                Some(conts + 1)
+            } else {
+                None
+            }
+        });
+        match run {
+            Some(len) => {
+                // Latin-1 encode: every matched char is <= U+00FF by
+                // construction, so this cannot fail — which is why the
+                // only fallible step is the UTF-8 decode.
+                let bytes: Vec<u8> = chars[i..i + len].iter().map(|&c| c as u8).collect();
+                if let Ok(decoded) = String::from_utf8(bytes) {
+                    out.push(decoded);
+                }
+                i += len;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// Refuse content that *newly* looks double-encoded.
+///
+/// The test is whether this write **increases** the count, not whether
+/// any is present. A file that already contains such sequences —
+/// genuinely, or because it is already corrupt — has to stay editable,
+/// and a repair that removes them has to pass. Only going up is
+/// suspicious.
+///
+/// `previous` is `None` for a new file, which has no baseline; Python
+/// treats a failed pre-read the same way, so an unreadable base cannot
+/// block a write.
+pub fn check_mojibake(content: &str, previous: Option<&str>) -> Result<()> {
+    let new_runs = mojibake_runs(content);
+    if new_runs.is_empty() {
+        return Ok(());
+    }
+    let prev_runs = previous.map_or_else(Vec::new, mojibake_runs);
+    if new_runs.len() <= prev_runs.len() {
+        return Ok(());
+    }
+    let added = new_runs.len() - prev_runs.len();
+    // Python shows up to eight distinct decoded characters, sorted.
+    let mut sample: Vec<&String> = new_runs.iter().collect();
+    sample.sort();
+    sample.dedup();
+    let sample: Vec<String> = sample
+        .into_iter()
+        .take(8)
+        .map(|s| format!("{s:?}"))
+        .collect();
+    Err(anyhow::Error::new(crate::Coded::refused(format!(
+        "content looks like double-encoded UTF-8 ({added} new sequence{}; \
+         the file had {}).\n\
+         \x20 These decode back to: {}\n\
+         \x20 That is UTF-8 read as Latin-1 and written back as UTF-8. It is \
+         valid UTF-8, so nothing downstream will catch it.\n\
+         \x20 Usual cause: `perl -0pi -e` inserting a literal above U+00FF, \
+         which upgrades the whole buffer and re-encodes every pre-existing \
+         character. Check for 'Wide character in print'.\n\
+         \x20 If the sequences are genuinely what you meant, pass \
+         --allow-mojibake.",
+        if added == 1 { "" } else { "s" },
+        prev_runs.len(),
+        sample.join(" ")
+    ))))
+}
+
 /// Validate an `--if-match` argument.
 ///
 /// Python accepts a prefix of at least 8 hex characters, lowercased,
@@ -123,23 +260,62 @@ pub fn normalise_if_match(expected: &str) -> Result<String> {
 /// That happened twice on 2026-10-04 to `src/cli/commands/entity.py`, a
 /// 5,239-line file four separate fixes were landing in, and the first
 /// instance went unnoticed for three commits.
+/// Both refusals exit 2, as Python's do — `Coded::conflict`. The
+/// *invalid argument* case is a plain `bail!` and exits 1, which is
+/// also Python's split: a malformed flag is bad input, a mismatched one
+/// is a conflict.
 pub fn check_if_match(expected: &str, current: Option<&str>) -> Result<()> {
     let exp = normalise_if_match(expected)?;
+    let short = &exp[..exp.len().min(12)];
     match current {
-        None => bail!(
-            "--if-match {} given but the file has no current content — it is \
-             a new file, so there is no base to match. Drop --if-match if \
-             creating it is what you meant.",
-            &exp[..exp.len().min(12)]
-        ),
-        Some(cur) if !cur.starts_with(&exp) => bail!(
-            "--if-match mismatch: expected {}, the database currently holds \
-             {}. Something changed the file since you read it, and writing \
-             now would revert it.",
-            &exp[..exp.len().min(12)],
-            &cur[..cur.len().min(12)]
-        ),
+        None => Err(anyhow::Error::new(crate::Coded::conflict(format!(
+            "--if-match {short} given but the file has no current content — \
+             it is a new file, so there is no base to match. Drop --if-match \
+             if creating it is what you meant."
+        )))),
+        Some(cur) if !cur.starts_with(&exp) => {
+            Err(anyhow::Error::new(crate::Coded::conflict(format!(
+                "--if-match mismatch: expected {short}, the database \
+                 currently holds {}. Something changed the file since you \
+                 read it, and writing now would revert it.",
+                &cur[..cur.len().min(12)]
+            ))))
+        }
         Some(_) => Ok(()),
+    }
+}
+
+/// Read back `is_current` after the write and confirm it holds `hash`.
+///
+/// Python's `--verify`, and the gap it covers is narrow but real: the
+/// write itself reported success, so the only thing left that could be
+/// wrong is something *else* having changed the row — a trigger, or a
+/// concurrent writer. Exits 2 on mismatch.
+///
+/// Called on a **fresh transaction after the commit**, deliberately.
+/// Verifying inside the writing transaction would read the write's own
+/// uncommitted effect and could only ever agree, which is a check that
+/// cannot fail and therefore is not one.
+pub fn verify_current(
+    tx: &mut postgres::Transaction<'_>,
+    project_id: i64,
+    file_path: &str,
+    hash: &str,
+) -> Result<()> {
+    match current_hash(tx, project_id, file_path)? {
+        Some(found) if found == hash => Ok(()),
+        Some(found) => Err(anyhow::Error::new(crate::Coded::conflict(format!(
+            "--verify failed on {file_path}: wrote {}, but the database now \
+             holds {}. Something changed the row between the write and this \
+             read.",
+            &hash[..12.min(hash.len())],
+            &found[..12.min(found.len())]
+        )))),
+        None => Err(anyhow::Error::new(crate::Coded::conflict(format!(
+            "--verify failed on {file_path}: wrote {} and the file now has no \
+             current content at all.",
+            &hash[..12.min(hash.len())]
+        )))),
     }
 }
 
@@ -167,6 +343,47 @@ pub fn resolve_project_exact(tx: &mut postgres::Transaction<'_>, slug: &str) -> 
              read command — because a mis-resolved write overwrites a file."
         ),
     }
+}
+
+/// What a caller may vary about a write.
+///
+/// A struct rather than more positional parameters: `set_file` already
+/// takes five, and `(.., Some("abc"), true)` at a call site says
+/// nothing about which `true` that is.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetOptions<'a> {
+    /// Refuse unless the current hash starts with this.
+    pub if_match: Option<&'a str>,
+    /// Skip the double-encoding guard.
+    pub allow_mojibake: bool,
+}
+
+/// The `is_current` content *text* for one path, for the mojibake
+/// baseline.
+///
+/// Separate from [`current_hash`] and called only when the new content
+/// has runs in it, which is Python's order too — the pre-read is a
+/// whole blob and most writes never need it.
+fn current_text(
+    tx: &mut postgres::Transaction<'_>,
+    project_id: i64,
+    file_path: &str,
+) -> Result<Option<String>> {
+    let row = tx.query_opt(
+        "SELECT cb.content_text
+           FROM project_files pf
+           JOIN file_contents fc ON fc.file_id = pf.id AND fc.is_current = 1
+           JOIN content_blobs cb ON cb.hash_sha256 = fc.content_hash
+          WHERE pf.project_id = $1 AND pf.file_path = $2",
+        &[&project_id, &file_path],
+    )?;
+    // Unescaped, because the baseline has to be compared in the same
+    // representation as the incoming content. Comparing a run count
+    // against the escaped form would be comparing two different
+    // strings.
+    Ok(row
+        .and_then(|r| r.get::<_, Option<String>>(0))
+        .map(|s| pgtext::unescape(&s).into_owned()))
 }
 
 /// The `is_current` content hash for one path, or `None`.
@@ -197,11 +414,24 @@ pub fn set_file(
     project_id: i64,
     file_path: &str,
     content: &str,
-    if_match: Option<&str>,
+    opts: &SetOptions<'_>,
 ) -> Result<SetOutcome> {
     let previous = current_hash(tx, project_id, file_path)?;
-    if let Some(expected) = if_match {
+    // `--if-match` first, because it is the cheaper refusal and because
+    // a caller who got the base wrong should hear about that rather
+    // than about the content of a write that was never going to land.
+    if let Some(expected) = opts.if_match {
         check_if_match(expected, previous.as_deref())?;
+    }
+    if !opts.allow_mojibake {
+        // The baseline is only read when the incoming content has runs
+        // at all, so an ordinary write does not pay for a blob fetch.
+        if mojibake_runs(content).is_empty() {
+            // Nothing to compare against; skip the pre-read entirely.
+        } else {
+            let prev_text = current_text(tx, project_id, file_path)?;
+            check_mojibake(content, prev_text.as_deref())?;
+        }
     }
 
     let hash = content_hash(content);
@@ -335,6 +565,127 @@ mod tests {
         assert_eq!(line_count("a\nb"), 2);
         assert_eq!(line_count("a\nb\n"), 3);
         assert_eq!(line_count("\n"), 2);
+    }
+
+    /// The incident case, built the way the incident built it: take a
+    /// real string, encode it UTF-8, then read those bytes back as
+    /// Latin-1. That is exactly what `perl -0pi -e` did to
+    /// `page.tsx`.
+    fn double_encode(s: &str) -> String {
+        s.as_bytes().iter().map(|&b| b as char).collect()
+    }
+
+    /// Python's own self-check, which it runs as an `assert` at import:
+    /// an em dash put through the corruption must be detected. It
+    /// exists because the character classes once degraded to a
+    /// two-member set that matched nothing and reported every file
+    /// clean — "the worst possible behaviour for a corruption guard".
+    #[test]
+    fn the_em_dash_from_the_incident_is_detected() {
+        let corrupted = double_encode("—");
+        let runs = mojibake_runs(&corrupted);
+        assert_eq!(runs, vec!["—"], "{corrupted:?}");
+    }
+
+    /// Each hit decodes back to the character it should have been, so
+    /// the error message can say what was meant.
+    #[test]
+    fn runs_decode_back_to_the_intended_characters() {
+        assert_eq!(mojibake_runs(&double_encode("✓ done")), vec!["✓"]);
+        assert_eq!(mojibake_runs(&double_encode("héllo")), vec!["é"]);
+        assert_eq!(mojibake_runs(&double_encode("é—✓")), vec!["é", "—", "✓"]);
+        // A 4-byte character exercises the third alternative.
+        assert_eq!(mojibake_runs(&double_encode("🎉")), vec!["🎉"]);
+    }
+
+    /// Clean text has no runs — including text that is merely
+    /// non-ASCII, which is the false positive that would make the
+    /// guard unusable.
+    #[test]
+    fn ordinary_text_has_no_runs() {
+        for s in [
+            "",
+            "plain ascii\n",
+            // Properly encoded non-ASCII: the chars are above U+00FF,
+            // so no lead byte class can match them.
+            "héllo → 世界 ✓ 🎉",
+            "fn main() { println!(\"{}\", 1); }\n",
+        ] {
+            assert!(mojibake_runs(s).is_empty(), "false positive on {s:?}");
+        }
+    }
+
+    /// A lead character with too few continuations after it is not a
+    /// run, including at the very end of the string — the bounds case
+    /// that would panic on an off-by-one.
+    #[test]
+    fn a_truncated_run_is_not_a_run_and_does_not_panic() {
+        // Lead needing one continuation, with nothing after it.
+        assert!(mojibake_runs("\u{c3}").is_empty());
+        // Lead needing two, with one.
+        assert!(mojibake_runs("\u{e2}\u{80}").is_empty());
+        // Lead needing three, with two.
+        assert!(mojibake_runs("\u{f0}\u{9f}\u{8e}").is_empty());
+        // And a continuation with no lead.
+        assert!(mojibake_runs("\u{80}\u{80}").is_empty());
+    }
+
+    /// The guard fires only when a write *increases* the count. A file
+    /// that is already corrupt stays editable, and a repair passes.
+    #[test]
+    fn only_an_increase_is_refused() {
+        let one = double_encode("é");
+        let two = double_encode("éé");
+
+        // Introducing corruption into a clean file: refused.
+        assert!(check_mojibake(&one, Some("clean")).is_err());
+        // Into a new file (no baseline): also refused.
+        assert!(check_mojibake(&one, None).is_err());
+        // Adding more to an already-corrupt file: refused.
+        assert!(check_mojibake(&two, Some(&one)).is_err());
+        // The same amount: allowed — an edit elsewhere in a corrupt
+        // file must not be blocked.
+        assert!(check_mojibake(&one, Some(&one)).is_ok());
+        // Fewer: allowed, which is the repair case.
+        assert!(check_mojibake(&one, Some(&two)).is_ok());
+        // A repair to fully clean: allowed, and takes the early return.
+        assert!(check_mojibake("clean", Some(&two)).is_ok());
+    }
+
+    /// The refusal exits 3 and names what the sequences decode back
+    /// to, because "it looks like it should be —" is the only form of
+    /// this message anyone can act on.
+    #[test]
+    fn the_refusal_exits_three_and_shows_the_intended_text() {
+        let err = check_mojibake(&double_encode("✓"), Some("clean")).unwrap_err();
+        assert_eq!(crate::code_of(&err), crate::NO_PATH);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("double-encoded"), "{msg}");
+        assert!(msg.contains('✓'), "{msg}");
+        assert!(msg.contains("1 new sequence;"), "{msg}");
+        assert!(msg.contains("--allow-mojibake"), "{msg}");
+    }
+
+    /// Plural agreement, because the message is the deliverable.
+    #[test]
+    fn the_refusal_counts_in_the_plural_when_it_should() {
+        let err = check_mojibake(&double_encode("éé"), Some("clean")).unwrap_err();
+        assert!(format!("{err:#}").contains("2 new sequences;"));
+    }
+
+    /// `--if-match` refusals exit 2, as Python's do, and a *malformed*
+    /// argument exits 1 — the same split Python makes between bad input
+    /// and a conflict.
+    #[test]
+    fn if_match_refusals_exit_two_and_bad_input_exits_one() {
+        let conflict = check_if_match("deadbeef", Some("ff4938cc03ca2b40")).unwrap_err();
+        assert_eq!(crate::code_of(&conflict), crate::NOT_FOUND);
+
+        let new_file = check_if_match("deadbeef", None).unwrap_err();
+        assert_eq!(crate::code_of(&new_file), crate::NOT_FOUND);
+
+        let malformed = check_if_match("xyz", Some("ff4938cc03ca2b40")).unwrap_err();
+        assert_eq!(crate::code_of(&malformed), crate::USAGE);
     }
 
     #[test]

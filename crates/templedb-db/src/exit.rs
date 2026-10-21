@@ -74,6 +74,38 @@ impl Coded {
         }
     }
 
+    /// A write was refused because the database moved under the caller:
+    /// `--if-match` mismatched, or `--verify` read back something else.
+    /// Exit 2.
+    ///
+    /// The same number as [`NOT_FOUND`], and that is Python's doing
+    /// rather than a collision this port invented — `file set` returns
+    /// 2 for both of those and the read commands return 2 for a missing
+    /// entity. A separate constructor rather than reusing `not_found`
+    /// because the *message* is the contract and the two cases read
+    /// nothing alike; a caller branching on 2 from `file set` is asking
+    /// "did my write land", not "does this exist".
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Coded {
+            code: NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    /// A write was refused because the *content* failed a guard — today
+    /// only the mojibake check. Exit 3.
+    ///
+    /// Again Python's number: `file set` returns 3 here, where a read
+    /// command's 3 means `entity paths` found no path. Both are "a
+    /// well-formed request, deliberately answered no", which is the
+    /// family resemblance that makes the reuse defensible.
+    pub fn refused(message: impl Into<String>) -> Self {
+        Coded {
+            code: NO_PATH,
+            message: message.into(),
+        }
+    }
+
     pub fn code(&self) -> i32 {
         self.code
     }

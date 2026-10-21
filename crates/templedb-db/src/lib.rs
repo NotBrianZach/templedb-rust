@@ -99,7 +99,10 @@ pub use entities::{
 };
 pub use exit::{code_of, Coded, NOT_FOUND, NO_PATH, USAGE};
 pub use files::{list_files, read_file, EditModeFilter, FileEntry};
-pub use fileset::{content_hash, line_count, resolve_project_exact, set_file, SetOutcome};
+pub use fileset::{
+    check_mojibake, content_hash, line_count, mojibake_runs, resolve_project_exact, set_file,
+    verify_current, SetOptions, SetOutcome,
+};
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
 pub use mirror::{
     check_freshness, mirror, Drift, FreshnessReport, TableReport, MIRRORED_TABLES, READ_SUBSET_DDL,

@@ -229,6 +229,22 @@ enum FileCmd {
         /// content being written was derived from a copy read earlier.
         #[arg(long = "if-match", value_name = "HASH")]
         if_match: Option<String>,
+        /// After the write, confirm `is_current` holds what was
+        /// written. Exits 2 on mismatch.
+        ///
+        /// Checked on a fresh transaction after the commit, so it can
+        /// actually fail: reading inside the writing transaction would
+        /// see the write's own uncommitted effect and could only agree.
+        #[arg(long)]
+        verify: bool,
+        /// Permit content that newly looks double-encoded.
+        ///
+        /// The guard refuses when a write *increases* the number of
+        /// such sequences, not when any are present — a file that is
+        /// already corrupt has to stay editable and a repair has to
+        /// pass. Exits 3.
+        #[arg(long)]
+        allow_mojibake: bool,
     },
     /// List tracked files, optionally under a path prefix
     Ls {
@@ -728,6 +744,8 @@ fn run() -> Result<i32> {
                 path,
                 content,
                 if_match,
+                verify,
+                allow_mojibake,
             } => {
                 // Read the content before opening anything, so a
                 // refusal on stdin does not leave a connection or a
@@ -767,16 +785,14 @@ fn run() -> Result<i32> {
 
                 let mut writer = templedb_db::PgWriter::open()?;
                 let clock = templedb_db::Clock::from_env()?;
+                let opts = templedb_db::SetOptions {
+                    if_match: if_match.as_deref(),
+                    allow_mojibake,
+                };
                 let mut tx = writer.transaction()?;
                 let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
-                let outcome = templedb_db::set_file(
-                    &mut tx,
-                    &clock,
-                    project_id,
-                    &path,
-                    &content,
-                    if_match.as_deref(),
-                );
+                let outcome =
+                    templedb_db::set_file(&mut tx, &clock, project_id, &path, &content, &opts);
                 // `?` before the commit, deliberately: on the error path
                 // `tx` is dropped without `commit`, and `postgres`
                 // rolls an un-committed transaction back on drop. A
@@ -785,6 +801,13 @@ fn run() -> Result<i32> {
                 // the ordering here is what makes that true.
                 let outcome = outcome?;
                 tx.commit()?;
+
+                // After the commit, on its own transaction. Inside the
+                // writing one this could only ever agree with itself.
+                if verify {
+                    let mut tx = writer.transaction()?;
+                    templedb_db::verify_current(&mut tx, project_id, &path, &outcome.hash)?;
+                }
 
                 // stdout is the hash, so a script can chain on it.
                 // Everything else is commentary and goes to stderr,

@@ -1381,14 +1381,30 @@ Writes last, and only once the read layer is trusted.
     byte-diff method cannot verify a mutation, and `Store` — two
     methods, `query` and `dialect`, over a `READ_ONLY` handle — has no
     way to perform one. It recommends a clock seam, closing the
-    error-exit gap and a state-diff harness *before* any command, a
-    separate concrete `SqliteWriter` rather than a widened trait, and
+    error-exit gap and a state-diff harness *before* any command, and
     `file set` rather than `commit` as the first write. **All three
     preconditions are now done** — the exit codes (step 12), the clock
-    seam (step 13) and the state-diff harness (step 15a below). What
-    remains before a write is the writer itself, and the open question
-    the design document flags as blocking: what replaces the in-memory
-    SQLite test fixture once SQLite goes away.
+    seam (step 13) and the state-diff harness (step 15a below).
+
+    **This entry said `SqliteWriter` until 2026-10-21 and that was
+    wrong.** The recommendation is in the document's body, and the
+    document's own 2026-10-16 decision — recorded two paragraphs down
+    in the same report, and summarised in 15a below — reverses it:
+    Postgres is primary and the port does not carry SQLite. The first
+    write therefore goes to the **write scratch** database as a
+    concrete `PgWriter`, following `mirror`'s precedent of owning a
+    `postgres::Client` outside the `Store` trait. The reasoning against
+    widening `Store` survives the reversal intact and is the part worth
+    keeping: a write trait would have one implementation, widening it
+    costs every reader its read-only guarantee, and
+    `rusqlite::Transaction` / `postgres::Transaction` borrow their
+    connection so neither fits behind `&dyn Store` anyway.
+
+    Reading a stale recommendation out of a superseded section is
+    exactly the failure the report warned about when it said it would
+    "record what it changes rather than quietly leaving the body of the
+    document wrong". The body is still wrong; this entry no longer
+    repeats it.
 
 15a. **Done** — the state-diff harness, `crates/templedb-db/src/statediff.rs`
     and `templedb-rs state`. One digest per mirrored table, built so
@@ -1412,6 +1428,42 @@ Writes last, and only once the read layer is trusted.
     the FTS5 triggers. Postgres becoming the
     primary store is the same project as porting the writes; the mirror
     is a read replica and does not change that.
+
+15b. **The two questions the design document left open have both
+    moved**, and neither blocks the first write any more. Recorded here
+    because the document itself says they are "decisions, not research
+    tasks" and because one of them was the stated blocker.
+
+    **"What replaces the in-memory test fixture?" is a cutover
+    question, not a blocker.** The document calls it "the only open
+    question that blocks work", reasoning that Postgres-as-primary means
+    no SQLite, so `testdb.rs` has nothing to run on. But the
+    *2026-10-16* decision in the same report defers cutover
+    indefinitely: the port stays a separate project, data arrives by
+    copy, and SQLite remains both Python's authoritative store and one
+    of this port's two backends. So the fixture is not going anywhere
+    yet, the 248 `templedb-db` tests that stand on it keep working, and
+    the property the README advertises — **no Postgres server needed to
+    build or to `cargo test`** — survives. The question becomes live at
+    cutover, when `backend/sqlite.rs` is deleted; it is not live now.
+
+    What follows for the writer: its own tests do need a server, so
+    they go behind `#[ignore]` with a `just` target, exactly as the two
+    CPython oracles already do. That keeps the no-server property for
+    `cargo test` while still testing the write.
+
+    **"Does `mirror` need a known-instant snapshot mode?" is answered,
+    by work that landed after the document.** It asks because the
+    state-diff method depends on knowing which SQLite state a Postgres
+    was copied from, and "today nothing records it". Something does
+    now: `mirror_provenance` (2026-10-16) records `copied_at` plus the
+    per-table row count, `mirror --check` compares those against the
+    live source and exits 4 on drift, and `parity-sweep.sh` refuses to
+    run a cross-backend comparison against a mirror that cannot vouch
+    for itself. The `ANALYZE` half of that same question closed
+    2026-10-21. What is *not* covered is an update in place — counts
+    catch inserts and deletes — which is precisely the gap
+    `templedb-rs state` fills.
 
 ### The state digest, and why it must not sort
 
@@ -2106,6 +2158,25 @@ in Rust on the unescaped text, so the final answer would still have
 been right; what would have gone missing is a hit. `escape` is a no-op
 for every realistic term, which is exactly why this needed finding by
 reading rather than by testing.
+
+**And a consequence to re-open later, deliberately recorded rather
+than inherited.** This was chosen as a *mirror* decision, where the
+cost is that a `psql` session sees the escape in three rows and nothing
+reading through this crate does. But the design document's 2026-10-16
+decision is that **Postgres becomes primary and the port drops
+SQLite** — and at that point the escape is no longer a mirror detail,
+it is how the canonical bytes are stored, and every non-Rust consumer
+of that database sees it rather than one curious session.
+
+That is a materially bigger commitment than the one actually made here,
+and the right time to revisit it is at cutover, when `BYTEA` for
+`content_text` stops costing a cross-backend digest — because there
+would no longer be two backends to compare. Noting it now because the
+alternative is inheriting a mirror-scale decision at primary-store
+scale without anyone deciding to. While the port carries both backends
+the choice stands; reversing it is cheap, which is the other reason to
+write the expiry date down: delete `pgtext.rs`, drop its three call
+sites, re-mirror.
 
 **Verified end to end**, not just round-tripped in a unit test:
 

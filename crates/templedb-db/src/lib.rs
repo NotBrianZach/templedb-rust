@@ -63,10 +63,12 @@
 //! `templedb_db::projects::list_projects`.
 
 mod backend;
+mod clock;
 mod conn;
 mod dialect;
 mod difflib;
 mod entities;
+mod exit;
 mod files;
 mod fuzzy;
 mod like;
@@ -74,13 +76,16 @@ mod mirror;
 mod projects;
 mod search;
 mod source;
+mod statediff;
 mod store;
+mod summary;
 mod textsearch;
 mod value;
 mod vcs;
 
 pub use backend::pg::PgStore;
 pub use backend::sqlite::SqliteStore;
+pub use clock::{julian_day, julian_day_ms, timestamp_of_ms, Age, Clock, Freshness, NOW_ENV};
 pub use conn::{db_path, open_ro, target, Target, URL_ENV};
 pub use dialect::Dialect;
 pub use difflib::{context_diff, splitlines, unified_diff, Match, Opcode, SequenceMatcher, Tag};
@@ -89,16 +94,23 @@ pub use entities::{
     DeadImport, Direction, Edge, EntityMatch, Explored, GraphStats, Observation, PathResult,
     TraceHit, Traced,
 };
+pub use exit::{code_of, Coded, NOT_FOUND, NO_PATH, USAGE};
 pub use files::{list_files, read_file, EditModeFilter, FileEntry};
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
 pub use mirror::{
-    check_freshness, mirror, Drift, FreshnessReport, TableReport, MIRRORED_TABLES,
-    READ_SUBSET_DDL,
+    check_freshness, mirror, Drift, FreshnessReport, TableReport, MIRRORED_TABLES, READ_SUBSET_DDL,
 };
 pub use projects::{list_projects, project_detail, Project, ProjectDetail};
 pub use search::{search_content, SearchHit};
 pub use source::{revisions, snapshot, snapshot_body, Revision, Snapshot, SnapshotBody};
+pub use statediff::{capture, compare, diff, DbState, TableDelta, TableState};
 pub use store::Store;
+pub use summary::{
+    fleet_reconciles, graph_facts, handoff_inbox, hygiene, ingest_adapters, invariant_results,
+    live_reconciliations, observe, reconciliation_counts, AdapterRuns, GraphFacts, HandoffInbox,
+    HygieneRow, InvariantResult, MachineReconcile, Reconciliation, ReconciliationCounts,
+    SummaryFacts,
+};
 pub use value::{Row, Value};
 pub use vcs::{
     branches, commit_detail, commit_log, content_at_commit, content_versions, current_content,

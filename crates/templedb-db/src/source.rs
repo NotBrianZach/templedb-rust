@@ -92,13 +92,17 @@ pub fn snapshot(store: &dyn Store, slug: &str, path: &str, rev: Option<&str>) ->
         )?,
     };
 
+    // Both arms exit 2: the project resolved and the address parsed,
+    // so this is a question about data rather than about input. A
+    // project that does not resolve exits 1 and is handled by the
+    // caller, which is the same split Python makes.
     let Some(row) = row else {
         match rev {
-            Some(r) => anyhow::bail!(
+            Some(r) => crate::bail_not_found!(
                 "no snapshot for {slug}/{path} at revision {r:?} \
                  (try `templedb-rs source revisions {slug} {path}`)"
             ),
-            None => anyhow::bail!(
+            None => crate::bail_not_found!(
                 "no current snapshot for {slug}/{path} \
                  (deleted, or not yet ingested)"
             ),
@@ -218,7 +222,7 @@ pub fn revisions(store: &dyn Store, slug: &str, path: &str) -> Result<Vec<Revisi
         .collect::<Result<_>>()?;
 
     if out.is_empty() {
-        anyhow::bail!("no snapshots for {slug}/{path}");
+        crate::bail_not_found!("no snapshots for {slug}/{path}");
     }
     Ok(out)
 }
@@ -269,6 +273,28 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no snapshot"), "{err}");
+    }
+
+    /// Exit 2, both arms, and 1 for the blob that is gone.
+    ///
+    /// The split is not cosmetic: "no snapshot at that revision" is a
+    /// question about data, while a hash with no blob behind it is the
+    /// database being inconsistent with itself. Python gives the first
+    /// a 2 and the second a 1, and nothing but this test stands between
+    /// the two sites — they are eight lines apart in the same function.
+    #[test]
+    fn missing_snapshots_exit_two_and_a_missing_blob_exits_one() {
+        let c = testdb::fixture();
+        for err in [
+            snapshot(&c, "alpha", "src/main.rs", Some("deadbeef")).unwrap_err(),
+            snapshot(&c, "alpha", "nope.txt", None).unwrap_err(),
+            revisions(&c, "alpha", "nope.txt").unwrap_err(),
+        ] {
+            assert_eq!(crate::code_of(&err), crate::NOT_FOUND, "{err:#}");
+        }
+        let s = snapshot(&c, "beta", "orphan.txt", Some("cafe")).unwrap();
+        let err = snapshot_body(&c, &s).unwrap_err();
+        assert_eq!(crate::code_of(&err), crate::USAGE, "{err:#}");
     }
 
     #[test]

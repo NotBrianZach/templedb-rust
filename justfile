@@ -33,33 +33,41 @@ default: check
 test:
     cargo test --workspace
 
-# The CPython difflib oracle: ~700 generated cases, repeated-block
-# tie-breaks and this repository's own source, through both the unified
-# and context renderers.
+# The CPython oracles. Two of them now:
 #
-# `#[ignore]`d in `cargo test` because it shells out to python3, so it
-# needs its own invocation. Run from the crate directory because
-# `real_source_files_diff_identically` reads `src/difflib.rs` by
-# relative path.
+#   difflib_parity  ~700 generated cases, repeated-block tie-breaks and
+#                   this repository's own source, through both the
+#                   unified and context renderers.
+#   clock_parity    2,000 timestamp pairs through SQLite's julianday and
+#                   Python's _age_hint, half of them landing on an exact
+#                   truncation boundary.
+#
+# Both are `#[ignore]`d in `cargo test` because they shell out to
+# python3, so they need their own invocation. Run from the crate
+# directory because `real_source_files_diff_identically` reads
+# `src/difflib.rs` by relative path.
 
-# The CPython difflib oracle (needs python3).
+# The CPython oracles: difflib and the clock (needs python3).
 oracle:
     cd crates/templedb-db && cargo test --test difflib_parity -- --ignored
+    cd crates/templedb-db && cargo test --test clock_parity -- --ignored
 
-# All 40 implemented invocations, diffed against the Python templedb.
+# All 49 implemented invocations, diffed against the Python templedb,
+# plus `summary` compared one pane at a time — its whole stdout can
+# never match, because two of Python's nine panes are not ported.
 #
 # Impure by construction: needs the live database and `templedb` on
 # PATH. Exits with the number of *unexpected* differences, so a
 # deliberate divergence does not fail it — the list lives in the script.
 
-# All 40 invocations, diffed against the Python templedb.
+# All 49 invocations plus summary's panes, diffed against the Python templedb.
 sweep: build
     bash scripts/parity-sweep.sh python
 
 # The same sweep across backends. PGURL is a mirrored Postgres; see
 # `templedb-rs mirror`.
 
-# SQLite vs a mirrored Postgres, same 40 invocations.
+# SQLite vs a mirrored Postgres, same 49 invocations.
 sweep-backends PGURL: build
     bash scripts/parity-sweep.sh backends {{PGURL}}
 

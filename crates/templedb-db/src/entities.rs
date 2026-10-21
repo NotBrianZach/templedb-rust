@@ -635,7 +635,11 @@ fn lookup_entity(
         )
         .context("looking up entity")?;
     let Some(row) = row else {
-        anyhow::bail!("no entity {kind}/{external_ref}");
+        // Exit 2, not 1. All three commands that resolve an address
+        // this way — `explore`, `trace`, `paths` — separate "that is
+        // not an address" from "that address names nothing" in Python,
+        // and the second is a well-formed question answered no.
+        crate::bail_not_found!("no entity {kind}/{external_ref}");
     };
     Ok((
         row.get_i64(0)?,
@@ -1385,9 +1389,28 @@ mod tests {
             Direction::Both,
             &[],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("no entity Machine/nope"), "{err}");
+        .unwrap_err();
+        assert!(err.to_string().contains("no entity Machine/nope"), "{err}");
+        // Exit 2, and from all three commands that resolve an address:
+        // `paths` reaches `lookup_entity` twice and `explore` and
+        // `trace` once each, so one untagged `bail!` would show up as a
+        // 1 from whichever of them the test did not cover.
+        for err in [
+            err,
+            shortest_path(
+                &c,
+                ("Machine", "nope"),
+                ("Machine", "box1"),
+                6,
+                Direction::Both,
+                &[],
+            )
+            .unwrap_err(),
+            explore(&c, "Machine", "nope").unwrap_err(),
+            trace(&c, "Machine", "nope", 2, Direction::Out, &[], 10).unwrap_err(),
+        ] {
+            assert_eq!(crate::code_of(&err), crate::NOT_FOUND, "{err:#}");
+        }
     }
 
     /// The bug this port fixes: Python caps each node's fan-out at an

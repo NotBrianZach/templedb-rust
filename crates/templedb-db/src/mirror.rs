@@ -46,10 +46,10 @@ pub const READ_SUBSET_DDL: &str = include_str!("../../../schema/postgres/001_rea
 /// `columns` and `types` are positional and parallel: the SELECT
 /// projects the columns in this order and `BinaryCopyInWriter` is
 /// handed the types in the same order.
-struct TableSpec {
-    name: &'static str,
-    columns: &'static [&'static str],
-    types: &'static [Type],
+pub(crate) struct TableSpec {
+    pub(crate) name: &'static str,
+    pub(crate) columns: &'static [&'static str],
+    pub(crate) types: &'static [Type],
     /// The columns to paginate on, which **must** be collectively
     /// unique. Pagination is keyset rather than `LIMIT`/`OFFSET`
     /// because `OFFSET n` re-scans n rows on every page, which turns a
@@ -64,20 +64,20 @@ struct TableSpec {
     /// skip the rest, and the mirror would be quietly missing a parent
     /// edge. Row-value comparison (`(a, b) > (?, ?)`) is the fix, and
     /// both engines have supported it for years.
-    key: &'static [&'static str],
+    pub(crate) key: &'static [&'static str],
     /// Rows per read from SQLite. Tuned down for `content_blobs`
     /// because its rows are not uniform: the table averages 28 KB per
     /// row but its largest single `content_text` is 4.9 MB, so a page
     /// count that is comfortable on average is not bounded in the worst
     /// case.
-    page: i64,
+    pub(crate) page: i64,
 }
 
 /// FK order. `projects` before `project_files` before `file_contents`,
 /// `entities` before `relations`, and `content_blobs` before anything
 /// referencing a hash. The subset schema declares the FKs it can, so
 /// this order is enforced rather than merely intended.
-const TABLES: &[TableSpec] = &[
+pub(crate) const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "projects",
         columns: &[
@@ -305,6 +305,72 @@ const TABLES: &[TableSpec] = &[
         key: &["id"],
         page: 5000,
     },
+    // The six `summary` reads. None of them references another table in
+    // the subset — `fleet_machines.network_id` points at
+    // `fleet_networks`, which has no reader and is not mirrored — so
+    // they can sit at the end in any order.
+    TableSpec {
+        name: "ingestion_runs",
+        columns: &["id", "adapter", "started_at", "status"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 5000,
+    },
+    TableSpec {
+        name: "invariant_checks",
+        columns: &["id", "check_name", "ran_at", "status", "issue_count"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8],
+        key: &["id"],
+        page: 5000,
+    },
+    TableSpec {
+        name: "reconcile_runs",
+        columns: &["id", "machine_name", "ran_at", "status"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 5000,
+    },
+    TableSpec {
+        name: "fleet_machines",
+        columns: &["id", "machine_name", "last_deployed_at"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 2000,
+    },
+    TableSpec {
+        name: "handoff_notes",
+        columns: &["id", "to_session", "to_topic", "acked_at"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 2000,
+    },
+    TableSpec {
+        name: "reconciliations",
+        columns: &[
+            "id",
+            "kind",
+            "subject_ref",
+            "status",
+            "item_count",
+            "owner",
+            "first_detected_at",
+            "last_observed_at",
+            "review_after",
+        ],
+        types: &[
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+        ],
+        key: &["id"],
+        page: 2000,
+    },
 ];
 
 /// How many rows one table contributed.
@@ -402,8 +468,7 @@ fn compare_counts(recorded: &[(String, i64)], live: &[(&'static str, i64)]) -> V
 /// either side — so it is safe to run against a mirror the port is
 /// connected to read-only, and cheap enough to run before every sweep.
 pub fn check_freshness(src: &SqliteStore, dest_url: &str) -> Result<FreshnessReport> {
-    let mut client =
-        Client::connect(dest_url, NoTls).context("connecting to the mirror target")?;
+    let mut client = Client::connect(dest_url, NoTls).context("connecting to the mirror target")?;
 
     let exists: bool = client
         .query_one(
@@ -656,7 +721,10 @@ mod tests {
     /// "absent", which no real count can collide with.
     #[test]
     fn a_table_missing_from_provenance_is_drift() {
-        let drift = compare_counts(&rec(&[("projects", 25)]), &[("projects", 25), ("entities", 7)]);
+        let drift = compare_counts(
+            &rec(&[("projects", 25)]),
+            &[("projects", 25), ("entities", 7)],
+        );
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].table, "entities");
         assert_eq!(drift[0].mirrored, -1);

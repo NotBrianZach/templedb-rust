@@ -47,20 +47,22 @@
           # this is a `nativeCheckInput` and not a build input.
           nativeCheckInputs = [ pkgs.python3 ];
 
-          # Two invocations, because the oracle tests are `#[ignore]`d —
-          # `cargo test` must pass on a machine with no interpreter, so
-          # they do not run by default and a check that only ran the
-          # default set would skip the three tests that pin the
-          # SequenceMatcher port against the real thing.
+          # Three invocations, because the oracle tests are
+          # `#[ignore]`d — `cargo test` must pass on a machine with no
+          # interpreter, so they do not run by default and a check that
+          # only ran the default set would skip the five tests that pin
+          # the SequenceMatcher port and the clock against the real
+          # thing.
           #
-          # The second runs from the crate directory because
+          # They run from the crate directory because
           # `real_source_files_diff_identically` reads `src/difflib.rs`
           # and friends by relative path, and asserts it found some.
           checkPhase = ''
             runHook preCheck
             cargo test --workspace
             ( cd crates/templedb-db \
-                && cargo test --test difflib_parity -- --ignored )
+                && cargo test --test difflib_parity -- --ignored \
+                && cargo test --test clock_parity -- --ignored )
             runHook postCheck
           '';
 

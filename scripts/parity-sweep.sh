@@ -97,11 +97,34 @@ INVOCATIONS=(
     "entity paths Machine/zMothership2 Machine/web1 --max-depth 6"
     # Across a node with more than Python's old hardcoded 100 edges.
     "entity paths AgentSession/c3129fbf-4fc3-45b7-ad9e-908c32d0408c ToolCall/17815"
-    # An entity that does not exist: Python exits 2, this exits 1. The
-    # one exit-code divergence left, and a constructed ref rather than a
-    # real-but-deleted one so the row cannot start passing when the data
-    # changes.
+    # The error statuses. Python separates bad input (1) from an
+    # address that names nothing (2), and until 2026-10-17 everything
+    # here left through one `anyhow` path and exited 1.
+    #
+    # Every one of these prints nothing on stdout, so the exit code is
+    # the entire content of the row — which is the reason they are rows
+    # at all rather than a note. Constructed refs rather than
+    # real-but-deleted ones, so none of them can start passing when the
+    # data moves.
+    #
+    # `paths` is here twice because it resolves two addresses and tags
+    # them separately; the second is the one that was failing before
+    # the fix, since the first endpoint exists.
+    "entity explore Machine/no-such-machine-ever"
+    "entity trace Machine/no-such-machine-ever"
     "entity paths Machine/no-such-machine-ever Machine/zMothership2"
+    "entity paths Machine/zMothership2 Machine/no-such-machine-ever"
+    "source revisions templedb no/such/file.txt"
+    "source snapshot templedb no/such/file.txt"
+    # Exit 1, not 2: a malformed address is bad input on both sides.
+    # Here to pin the *other* half of the split — a change that tagged
+    # every error as not-found would pass all the rows above.
+    "entity explore Machine"
+    "entity paths Machine Machine/zMothership2"
+    # Also 1: a project that does not resolve, and a commit that does
+    # not exist. Python gives neither of them a 2.
+    "source revisions no-such-project-ever CHANGELOG.md"
+    "vcs show templedb no-such-commit-ever --no-diff"
 )
 
 # Divergences that are deliberate and documented in the README. Matched
@@ -115,11 +138,105 @@ EXPECTED=(
     "entity explore"
     # Python's default view includes your staging session's commits.
     "vcs log templedb -n"
-    # Python exits 2 for a missing entity, 1 for a malformed address.
-    "entity paths Machine/no-such-machine-ever"
     # Substring not stemmed, and a different layout.
     "search content"
 )
+
+# `summary` is compared one pane at a time, not as one blob.
+#
+# It is the first command whose whole stdout can never match: two of
+# Python's nine panes are not ported — one reads systemd and one reads
+# tables outside the mirrored subset — so a row in INVOCATIONS above
+# would land in EXPECTED permanently and take the *other seven* panes
+# with it. Six of those seven are byte-identical with Python on live
+# data, and a check that cannot say so is not worth running.
+#
+# Panes the port implements and claims parity for.
+SUMMARY_PANES=(
+    # No header of its own: the lines between the title and the first
+    # pane rule.
+    "═════ TempleDB Summary ═════"
+    "── Ingestion (per adapter) ──"
+    "── Doctor invariants (latest results) ──"
+    "── Reconciliations (discrepancies being worked on) ──"
+    "── Reconcile (per fleet machine) ──"
+    "── Python hygiene ──"
+    "── Handoff inbox ──"
+)
+
+# Panes deliberately absent, reported rather than skipped. Listed so
+# that porting one shows up here as a surprise.
+SUMMARY_UNPORTED=(
+    "── Agent fleet (per project) ──"
+    "── Systemd units ──"
+)
+
+# Pane-level divergences that are deliberate.
+SUMMARY_EXPECTED=(
+    # Python's listing orders by `datetime(first_detected_at)` with no
+    # tie-break, and three of the eight open rows share a timestamp to
+    # the second — one `doctor entities` run detected them together. The
+    # pane prints four rows, so *which* of the tied three appear is the
+    # planner's choice. This port adds `, kind, subject_ref`. Same
+    # reasoning as `entity trace`.
+    "── Reconciliations (discrepancies being worked on) ──"
+)
+
+# One pane's body: everything after its header, up to the next rule.
+#
+# The `──` run is U+2500 twice and the muted prose uses an em dash, so
+# matching the rule cannot catch a `(not ported — ...)` line by mistake.
+summary_pane() {
+    awk -v p="$2" 'index($0, p) { f = 1; next } f && /──/ { exit } f { print }' "$1"
+}
+
+# Compare every claimed pane, retrying the whole capture on a difference.
+#
+# The retry is for the clock, not for flakiness in the usual sense: the
+# ingestion pane renders ages, so a minute boundary falling between the
+# two invocations turns `0min ago` into `1min ago` and reports a
+# difference that is only elapsed time. `TEMPLEDB_RS_NOW` cannot help —
+# it pins this port's clock and not Python's, which would make the
+# comparison worthless rather than merely noisy. A real divergence
+# survives all three attempts; a boundary crossing does not survive one.
+summary_parity() {
+    local -a diffs=()
+    local attempt pane a b e
+    for attempt in 1 2 3; do
+        diffs=()
+        "$RS" summary >"$sumfile_a" 2>/dev/null
+        run_b summary >"$sumfile_b" 2>/dev/null
+        for pane in "${SUMMARY_PANES[@]}"; do
+            a=$(summary_pane "$sumfile_a" "$pane")
+            b=$(summary_pane "$sumfile_b" "$pane")
+            [[ $a == "$b" ]] || diffs+=("$pane")
+        done
+        (( ${#diffs[@]} == 0 )) && break
+    done
+
+    for pane in "${SUMMARY_UNPORTED[@]}"; do
+        printf 'unported  summary %s\n' "$pane"
+    done
+
+    local identical=$(( ${#SUMMARY_PANES[@]} - ${#diffs[@]} ))
+    for pane in "${diffs[@]}"; do
+        local is_exp=no
+        for e in "${SUMMARY_EXPECTED[@]}"; do
+            [[ $pane == "$e" ]] && is_exp=yes
+        done
+        if [[ $is_exp == yes ]]; then
+            expected=$((expected + 1))
+            printf 'expected  summary %s\n' "$pane"
+        else
+            unexpected=$((unexpected + 1))
+            printf 'DIFFERS   summary %s\n' "$pane"
+            diff <(summary_pane "$sumfile_a" "$pane") \
+                 <(summary_pane "$sumfile_b" "$pane") | head -8
+        fi
+    done
+    printf 'summary   %d of %d claimed panes identical, %d not ported\n' \
+        "$identical" "${#SUMMARY_PANES[@]}" "${#SUMMARY_UNPORTED[@]}"
+}
 
 is_expected() {
     local inv=$1 e
@@ -160,6 +277,9 @@ backends)
     # that looks exactly like a translation bug. Re-mirror before
     # believing a failure.
     EXPECTED=()
+    # Both sides are this port, so every pane must agree — the
+    # reconciliation tie-break is in the SQL for both dialects.
+    SUMMARY_EXPECTED=()
     ;;
 regress)
     [[ -x $ARG ]] || { echo "regress mode needs an executable old binary" >&2; exit 2; }
@@ -168,6 +288,7 @@ regress)
     # Every difference is interesting when comparing two builds of this
     # port: the point is to notice unintended ones.
     EXPECTED=()
+    SUMMARY_EXPECTED=()
     ;;
 *)
     echo "unknown mode: $MODE (python | backends | regress)" >&2
@@ -187,7 +308,8 @@ esac
 # a *new* stderr difference is still visible without being an error.
 pass=0 unexpected=0 expected=0 stderr_only=0
 errfile_a=$(mktemp) errfile_b=$(mktemp)
-trap 'rm -f "$errfile_a" "$errfile_b"' EXIT
+sumfile_a=$(mktemp) sumfile_b=$(mktemp)
+trap 'rm -f "$errfile_a" "$errfile_b" "$sumfile_a" "$sumfile_b"' EXIT
 
 for inv in "${INVOCATIONS[@]}"; do
     # Unquoted on purpose: the rows above are argument lists.
@@ -213,6 +335,8 @@ for inv in "${INVOCATIONS[@]}"; do
         diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | head -8
     fi
 done
+
+summary_parity
 
 printf '\ntempledb-rs vs %s, %d invocations: %d stdout-identical (%d differing on stderr only), %d deliberate, %d unexpected\n' \
     "$label" "${#INVOCATIONS[@]}" "$pass" "$stderr_only" "$expected" "$unexpected"

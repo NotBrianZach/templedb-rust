@@ -33,6 +33,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
+| `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -46,7 +47,9 @@ all), for `entity trace Machine/zMothership2 --depth 2`, and for
 `Symbol/…:DeployCommands.deploy`) — both directions, at and below the
 depth cutoff, each `--direction`, a matching `--via` and a bogus one.
 All eight agree byte for byte, and so do the exit codes: 0 for a path,
-3 for "no path within depth N".
+3 for "no path within depth N", 2 for an endpoint that does not exist
+and 1 for one that is not an address. The last two were 1 and 1 until
+2026-10-17; see *The error statuses*.
 
 `entity search` used to agree on *which* entities match and
 deliberately disagree on their order, because Python's `ORDER BY` had no
@@ -63,11 +66,12 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-206 unit tests, run by `cargo test`: 193 in `templedb-db` and 13 in
-`templedb-cli` for the formatting the SQL layer cannot see. Three more
-are `#[ignore]`d because they need `python3`: they drive CPython's
-`difflib` as a reference oracle for *both* renderers, and are described
-under *Porting order* below. The 95 added
+262 unit tests, run by `cargo test`: 230 in `templedb-db` and 32 in
+`templedb-cli` for the formatting the SQL layer cannot see. Five more
+are `#[ignore]`d because they need `python3`: three drive CPython's
+`difflib` as a reference oracle for *both* renderers, and two drive
+CPython's `sqlite3` to pin the clock's arithmetic against
+`julianday`. Both are described under *Porting order* below. The 95 added
 since the backend split cover the parts that have no database behind
 them and would otherwise only be exercised by running against a server —
 placeholder rewriting (including a `?` inside a string literal, a
@@ -75,6 +79,18 @@ doubled `''`, and the `ESCAPE '\'` whose backslash must not swallow the
 closing quote), the `Value` getters refusing NULL in a required column,
 backend selection from the environment, connection-string redaction, and
 the mirror's table ordering and keyset pagination.
+
+Nineteen of the `templedb-cli` tests are `summary`'s, and they carry
+more weight than the count suggests: `summary` is the one command the
+sweep cannot diff whole, so hand-built facts rendered at a fixed instant
+are most of what verifies it. They are the only place several of its
+properties are checked at all — that a check which *errored* never
+prints its stale issue count, that the stale-reconciliation set
+*replaces* the listing rather than preceding it, that `subject_ref[:40]`
+slices characters and not bytes, and that padding a string Python
+painted first leaves the escape codes inside the column width. That
+last one is a misalignment being reproduced on purpose, which the
+obvious implementation silently fixes.
 
 Six of them pin the batched graph walk, and they are the reason three
 rewrites of it stayed byte-identical: that the fan-out cap is per node
@@ -190,7 +206,7 @@ not a chain of pairwise comparisons that could have drifted together.
 `search content` is deliberately excluded from the regression axis,
 because changing its answer was the point.
 
-Both axes are now run over **one sweep of 40 invocations covering every
+Both axes are now run over **one sweep of 49 invocations covering every
 implemented command**, and it is committed as
 `scripts/parity-sweep.sh` rather than retyped each time:
 
@@ -213,23 +229,28 @@ stdout and the exit code are the contract; stderr is counted but not
 failed on. Python routes diagnostics through `logging`, so they arrive
 prefixed `ERROR` / `INFO` where this port writes them plain, and
 `file ls` prints a `N file(s)` count to stderr precisely so stdout stays
-diffable. Five rows differ on stderr alone today and the summary says
-so.
+diffable. Fifteen rows differ on stderr alone today and the summary
+says so. Ten of the fifteen are the error-status rows added on
+2026-10-17, which print nothing on stdout at all: for those the exit
+code *is* the comparison, and the differing stderr is the message
+wording, which is not the contract. See *The error statuses*.
 
 Committing the sweep is the audit's main deliverable. Three commands had
 drifted *because* each harness was written during one command's port and
 retired when that command was declared done.
 
-- **Python axis**: 34 of 40 stdout-identical, 6 deliberate, 0
-  unexpected.
+- **Python axis**: 44 of 49 stdout-identical, 5 deliberate, 0
+  unexpected. It was 34 of 40 with 6 deliberate when the audit ran; the
+  sixth deliberate row was the exit-code divergence, which is now a
+  passing row rather than an excused one.
 - **Regression axis**, pre-audit binary against new: 25 identical, 15
   changed, every one on purpose — `entity stats`'s layout and new
   `relations:` section, `file ls -l`'s `edit_mode` column and width,
   `entity trace`'s truncation advisory, `source revisions` and
   `--meta`'s NULL rendering, three `vcs show` commits from the blob fix,
   and the two `-s` renderings.
-- **Backend axis**, SQLite against a freshly mirrored Postgres: **all
-  identical**, exit codes included.
+- **Backend axis**, SQLite against a freshly mirrored Postgres: **49 of
+  49 identical**, exit codes and stderr included.
 
 The blob classification fix is the one that needed the second axis: it
 asks the database `content_blob IS NOT NULL` through a `CASE`, which
@@ -581,13 +602,14 @@ The blob bug surfaced from a `--side-by-side` sweep that happened to
 also run the unified renderer; the other three surfaced only once every
 implemented command was diffed in one pass.
 
-So that is now the method: a single sweep over all 40 invocations
+So that is now the method: a single sweep over all 49 invocations
 (`scripts/parity-sweep.sh`), run against Python and across both
 backends, rather than a per-command harness retired when the command is
-declared done. Six differences remain and every one is deliberate and
+declared done. Five differences remain and every one is deliberate and
 documented — `project list`'s layout, `entity explore`'s ordering,
-`vcs log`'s session default, `entity paths`'s exit code, and two
-`search content` invocations.
+`vcs log`'s session default, and two `search content` invocations. The
+sixth was `entity paths`'s exit code, closed on 2026-10-17; see *The
+error statuses*.
 
 ## Bugs found while porting
 
@@ -744,6 +766,76 @@ Two more, found in this repository rather than in Python:
   explicit `ESCAPE`. The same applies to `--rev`, where an unescaped `%`
   would match every revision and silently return the newest.
 
+### The error statuses
+
+Closed 2026-10-17. This was the longest-standing entry under *Known
+gaps* and the last one that was a divergence rather than a decision.
+
+Python's read commands use three statuses:
+
+| code | meaning | where |
+|---|---|---|
+| 1 | bad input, or a project that does not resolve | everywhere |
+| 2 | the thing you named does not exist | `entity explore` / `trace` / `paths`, `source snapshot` / `revisions` |
+| 3 | a valid negative answer | `entity paths`: no path within depth N |
+
+Three was matched from the start, because it is the one a script is
+likely to branch on and it is not an error at all — `entity paths`
+prints its answer on stdout and returns through the normal `Ok` path.
+Every actual error, though, left through one `anyhow` arm in `main` and
+exited 1, so a caller could not tell `entity explore Machin/zMothership2`
+— a typo in the *kind*, which is bad input — from
+`entity explore Machine/zMothership3`, which is a well-formed question
+answered no.
+
+The fix is `crates/templedb-db/src/exit.rs`: a `Coded` error carrying a
+status, a `bail_not_found!` macro, and `code_of` called once in `main`.
+**Five sites** needed it, and they turn out to be three — `lookup_entity`,
+which all three entity commands resolve addresses through, and two
+`bail!`s in `source.rs`.
+
+Two things about the shape are deliberate:
+
+- **The status rides on the error rather than through the signatures.**
+  Every one of those sites is two or three frames below a CLI arm that
+  already returns `anyhow::Result`. Threading a code out would mean a
+  bespoke error enum per module and a `match` per call site to collapse
+  it again — the sites that do not care, which is nearly all of them,
+  would pay for the two that do. The cost is that the status is found
+  by downcast rather than visible in the type, and a unit test pins the
+  property that makes that safe: **a `Coded` survives any number of
+  `.context(...)` layers**. If it did not, the code would be lost
+  silently on the way up and every error would exit 1 again — this
+  exact bug, reintroduced invisibly.
+- **Only `NOT_FOUND` is constructible.** `USAGE` is what an untagged
+  error already produces, so a second way to spell it would only invite
+  two call sites to disagree.
+
+Ten rows were added to the sweep, which is where the real verification
+is: six that must exit 2, four that must exit 1. They print nothing on
+stdout, so the exit code is the entire content of the row — including
+`entity explore Machine` and `entity paths Machine Machine/zMothership2`,
+which exist to pin the *other* half of the split. A change that tagged
+every error as not-found would pass the six and fail those two. All ten
+agree with Python, and the refs are constructed (`no-such-machine-ever`)
+rather than real-but-deleted, so no row can start passing when the data
+moves.
+
+The unit tests were checked by mutation rather than trusted: reverting
+the `bail_not_found!` in `lookup_entity` to a plain `bail!` fails
+`paths_rejects_unknown_endpoints`.
+
+All three axes were run on the finished change, and the regression one
+is the useful result: against a release build of the previous tree,
+**43 of 49 rows identical and exactly the six intended ones changed**,
+each `exit 2 vs 1`. Nothing else moved — stderr included, on all 49, so
+the messages did not drift while the statuses were being sorted out.
+The Python axis is 44 of 49 with 0 unexpected and the backend axis is
+49 of 49.
+
+What is still not matched is the *message*, and that is in *Known gaps*
+below rather than here.
+
 ## Known gaps
 
 Differences that are not deliberate and are not yet closed.
@@ -765,12 +857,13 @@ Differences that are not deliberate and are not yet closed.
   `--limit`, which Python does not. Both directions, and nothing checks
   that flag surfaces agree — the audit found this by passing `--limit`
   to Python and getting exit 2.
-- **Error exits are all `1`.** Python distinguishes a malformed
-  `<kind>/<ref>` (1) from an entity that does not exist (2); every error
-  here leaves through one `anyhow` path and exits 1. The messages differ
-  too, and go to stderr in both. Successful-but-negative exits *are*
-  matched: `entity paths` exits 3 for "no path within depth N", which is
-  the one a script is likely to branch on.
+- **Error *messages* differ**, though the statuses no longer do (see
+  *The error statuses*). Python routes them through `logging` and
+  prefixes `ERROR`; this writes them plain, and the wording is the
+  port's own. Both go to stderr, which the sweep counts and does not
+  fail on — so ten of the fifteen stderr-only rows are exactly these.
+  Closing it would mean reproducing another implementation's log
+  formatting, which is a worse contract than the exit code.
 - **`entity search` would print a NULL `external_ref` as `(none)`**
   where Python raises `TypeError` from `{:<50}`. No row in the live
   database has a NULL one, so neither behaviour has ever been observed;
@@ -817,11 +910,22 @@ Differences that are not deliberate and are not yet closed.
   query that prompted the investigation — the plan was the same before
   and after — but it is a real gap, and `ANALYZE` after a mirror run is
   worth doing.
-- **The Postgres schema covers 11 tables and 1 view.** That is the whole
+- **`summary` is two panes short of Python's nine.** The agent-fleet
+  pane needs `agent.store.fleet_rollup()`'s tables, which are outside
+  the mirrored subset, so there is nothing to observe yet; the systemd
+  pane reads `systemctl`. Both print a `(not ported)` line in the
+  position Python prints the pane, and the sweep names them. Omitting
+  them silently was the alternative and is worse than a wrong number: a
+  missing systemd pane reads as "no failed units" and a missing fleet
+  pane as "nothing waiting on you". Python's fleet pane *does* vanish
+  when the agent tables are absent, so silence there would have been
+  faithful — which is exactly why it is not safe.
+- **The Postgres schema covers 17 tables and 1 view.** That is the whole
   set the port reads, out of 163 tables and 45 views. Columns are
-  likewise limited to the ones the queries name. Anything not yet
-  ported has nothing to mirror and no way to verify a mirror, so the
-  boundary follows the readers.
+  likewise limited to the ones the queries name — four of
+  `ingestion_runs`'s fourteen, three of `fleet_machines`'s
+  twenty-seven. Anything not yet ported has nothing to mirror and no
+  way to verify a mirror, so the boundary follows the readers.
 
 ## Building
 
@@ -862,7 +966,7 @@ No Postgres server is needed to build or to run `cargo test`.
 ```bash
 just pg-up          # initdb if absent, start, create both databases + the ro role
 just mirror         # copy the read subset from live SQLite into templedb_parity
-just sweep-pg       # the 40 invocations, SQLite vs Postgres
+just sweep-pg       # the 49 invocations, SQLite vs Postgres
 just pg-verify-ro   # prove the read-only role is enforced, not assumed
 just pg-down        # stop; pg-nuke throws the cluster away
 ```
@@ -906,9 +1010,22 @@ on entry to the directory. Keeping them there rather than in
 `flake.nix` means they are discoverable from the project they belong to
 and can differ per machine without editing tracked files.
 
-Measured 2026-10-16, with the mirror above: **40 of 40 invocations are
+Measured 2026-10-17, with the mirror above: **49 of 49 invocations are
 stdout-identical between the SQLite and Postgres backends**, through the
-read-only role. The Postgres read path is not a plan.
+read-only role — and on this axis stderr agrees too, which is why the
+summary reports zero stderr-only rows where the Python axis reports
+fifteen. The Postgres read path is not a plan.
+
+Re-measured 2026-10-21 with `summary` added: **49 of 49 invocations and
+7 of 7 `summary` panes identical**, which exercises the three
+dialect-split queries in `summary.rs` — the bare-column `GROUP BY`
+against `DISTINCT ON`, the fleet subquery, and `instr` against `strpos`
+— through a renderer for the first time. The result also settles the
+seventh pane: the reconciliation listing agrees across both backends
+and disagrees with Python, which is what a tie-break this port added
+should look like and not what a translation bug looks like. Had the two
+backends disagreed with each other as well, the diagnosis would have
+been the other one.
 
 **The sweep refuses to run on a stale mirror**, and that guard was
 written the same afternoon it was needed. `sweep-pg` diffs SQLite
@@ -926,7 +1043,7 @@ interrupted run must not leave counts vouching for a copy that rolled
 back.
 
 ```bash
-just pg-check         # fresh: all 11 tables match the source
+just pg-check         # fresh: all 17 tables match the source
 just mirror-refresh   # when it isn't
 just sweep-pg-fresh   # refresh, then sweep -- the form to actually use
 ```
@@ -973,34 +1090,34 @@ materialise could write over a running server's state.
 ### Checks
 
 ```bash
-just check             # the full gate: tests, difflib oracle, parity sweep
+just check             # the full gate: tests, CPython oracles, parity sweep
 nix flake check        # the hermetic half only
 ```
 
 `just check` is what to run before publishing. It is three things in
-order: `cargo test --workspace`, the CPython `difflib` oracle, and
-`scripts/parity-sweep.sh python` — all 40 implemented invocations diffed
-against the Python `templedb`. The sweep exits with the number of
-*unexpected* differences, so the six deliberate divergences do not fail
-it and a new one does.
+order: `cargo test --workspace`, the two CPython oracles (`difflib` and
+the clock), and `scripts/parity-sweep.sh python` — all 49 invocations
+diffed against the Python `templedb`, plus `summary` compared one pane
+at a time. The sweep exits with the number of *unexpected* differences,
+so the six deliberate divergences do not fail it and a new one does.
 
 The split between the two commands is not organisational, it is about
 what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (206) | yes | yes |
-| difflib oracle vs CPython | yes | yes |
-| 40-invocation parity sweep | **no** | yes |
+| unit tests (262) | yes | yes |
+| CPython oracles (difflib, clock) | yes | yes |
+| 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
 `nix flake check` builds in a sandbox with no live SQLite file and no
 Python `templedb` installed, so the sweep cannot run there and is not
 wired in pretending otherwise. What it *can* do it now does: the
-`checkPhase` runs the unit tests and then re-runs the three
+`checkPhase` runs the unit tests and then re-runs the five
 `#[ignore]`d oracle tests with `--ignored`, from the crate directory,
 because `cargo test` alone skips them and the one that reads this
 repository's own source needs that working directory. Verified running
-rather than merely compiling: 193 + 13 unit tests and 3 oracle tests
+rather than merely compiling: 218 + 13 unit tests and 5 oracle tests
 pass inside the sandbox.
 
 Both `checks` and `packages` build with the same `rust-bin` toolchain
@@ -1034,21 +1151,33 @@ crates/templedb-db/    data layer, one module per command family
   backend/pg.rs        postgres (sync), OID->Value, statement cache
   conn.rs              path/URL resolution, backend selection
   mirror.rs            SQLite -> Postgres copy (the one write path)
+  statediff.rs         order-independent per-table digests, so a write's
+                       effect can be compared across two engines
   projects.rs          project list
   files.rs             file cat / ls
   search.rs            search content — candidate SQL + orchestration
   textsearch.rs        matching, BM25, snippets; no SQL, no backend
+  summary.rs           summary's observation layer: facts only, no clock
   entities.rs          entity stats / explore / trace / search / paths
   source.rs            source snapshot / revisions
   fuzzy.rs             project name resolution
   like.rs              LIKE-pattern escaping, shared by the three
                        modules that take a user string
+  exit.rs              the three exit statuses, and the one error type
+                       that carries a non-default one
+  clock.rs             one injectable instant; julianday and _age_hint,
+                       reproduced to the bit. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
 schema/postgres/       the DDL the mirror targets
 crates/templedb-cli/   clap binary `templedb-rs`, formatting only
+  main.rs              the command tree, and the two impure inputs
+                       `summary` needs: the clock and the session id
+  summary_view.rs      summary's interpretation layer: facts plus an
+                       instant to lines. Ages, colour, column widths
 scripts/
-  parity-sweep.sh      all 40 invocations, against Python / the other
-                       backend / a previous build. Not run by
+  parity-sweep.sh      all 49 invocations, against Python / the other
+                       backend / a previous build, plus `summary`
+                       compared one pane at a time. Not run by
                        `cargo test` — it needs the live database.
 ```
 
@@ -1128,7 +1257,44 @@ Writes last, and only once the read layer is trusted.
     `scripts/` waiting to be remembered — `just check` runs it, and
     `nix flake check` runs the half that needs no live database. See
     *Checks* above.
-12. **Last, and not without a design document** — any write path, and
+12. **Done** — the error statuses. Not a command: the write-path
+    design document names it as one of three things to do *before* any
+    write lands, on the grounds that a harness which cannot distinguish
+    a rejected mutation from a crashed one is not a harness. It is also
+    the last read-layer divergence that was a gap rather than a
+    decision. See *The error statuses* above.
+13. **Done** — the clock seam. The design document's *first*
+    precondition, and like the exit codes it is not a command:
+    `crates/templedb-db/src/clock.rs` is one injectable instant plus
+    the age arithmetic Python does in SQL, pinned against CPython
+    driving SQLite over 2,000 timestamp pairs. It unblocks `summary`,
+    whose output is relative ages, and it is what a state-diff harness
+    needs to stop excluding the columns most likely to be wrong. See
+    *The clock seam* below for what reproducing it turned up.
+14. **Done, at seven panes of nine** — `summary`, and with it a
+    question about what a command *is*. Its observation layer landed
+    2026-10-18: six more mirrored tables (`ingestion_runs`,
+    `invariant_checks`, `reconcile_runs`, `fleet_machines`,
+    `handoff_notes`, `reconciliations`) and eight pure functions in
+    `summary.rs` that return facts with absolute timestamps and read no
+    clock. The rendering layer landed 2026-10-21 as
+    `templedb-cli/src/summary_view.rs` — one function from facts plus an
+    instant to lines — along with the session identity, which is
+    `TEMPLEDB_SESSION_ID` or `(gethostname, getppid)` resolved at the
+    entry point and threaded in.
+
+    **Six of the seven ported panes are byte-identical with Python on
+    live data**, measured over three consecutive runs: the entity graph,
+    ingestion, doctor invariants, per-machine reconcile, Python hygiene
+    and the handoff inbox. The seventh diverges by one line order and on
+    purpose; see below.
+
+    Two panes are **not** ported and print `(not ported)` where Python
+    prints them: the agent fleet, whose tables are outside the mirrored
+    subset, and systemd, which reads the machine. See
+    *`summary` is not a function of the database* below, and the
+    TempleDB report of the same name.
+15. **Last, and not without a design document** — any write path, and
     with it the rest of the Postgres schema. The design document now
     exists, as the TempleDB report
     *The write path: what porting it actually requires*
@@ -1138,7 +1304,28 @@ Writes last, and only once the read layer is trusted.
     way to perform one. It recommends a clock seam, closing the
     error-exit gap and a state-diff harness *before* any command, a
     separate concrete `SqliteWriter` rather than a widened trait, and
-    `file set` rather than `commit` as the first write. It also records
+    `file set` rather than `commit` as the first write. **All three
+    preconditions are now done** — the exit codes (step 12), the clock
+    seam (step 13) and the state-diff harness (step 15a below). What
+    remains before a write is the writer itself, and the open question
+    the design document flags as blocking: what replaces the in-memory
+    SQLite test fixture once SQLite goes away.
+
+15a. **Done** — the state-diff harness, `crates/templedb-db/src/statediff.rs`
+    and `templedb-rs state`. One digest per mirrored table, built so
+    that the *same* function run against SQLite and against Postgres
+    produces comparable values — which is what the 2026-10-16 decision
+    requires, since the two copies being compared are no longer two
+    SQLite files. Measured 2026-10-20: **all 17 tables digest
+    identically across both backends over 207,857 rows**, in under a
+    second on SQLite. See *The state digest, and why it must not sort*
+    below.
+
+    The document also carries a later decision, 2026-10-16: **the port
+    stays a separate project and owns a Postgres populated by copy**,
+    rather than cutting over. That is why `just pg-up` provisions two
+    databases, and it is why the schema boundary still follows the
+    readers instead of jumping to 164 tables. It also records
     two boundaries not to cross by accident: 58 of the live database's
     61 triggers are cr-sqlite's, calling functions from an extension
     this port never loads, and the bundled SQLite (3.50.2) is not the
@@ -1146,6 +1333,251 @@ Writes last, and only once the read layer is trusted.
     the FTS5 triggers. Postgres becoming the
     primary store is the same project as porting the writes; the mirror
     is a read replica and does not change that.
+
+### The state digest, and why it must not sort
+
+The byte-diff method verified every read command because both
+implementations print their answer. A write does not: `file set` prints
+almost nothing and changes four tables, so the interesting output is not
+on stdout at all. `statediff.rs` is the replacement, and the design
+document insisted it exist before the thing it verifies.
+
+What makes it more than a checksum loop is a constraint that only shows
+up once the two sides are different engines. The obvious digest hashes
+rows in `ORDER BY` sequence. That would be wrong here: `content_blobs`
+keys on `hash_sha256`, a TEXT column, and SQLite compares TEXT by bytes
+while Postgres uses the database collation. A sorted digest would
+report an identical table as divergent — not reliably, which is worse,
+because it would depend on which hashes happened to be present.
+
+So rows are hashed independently and combined with `wrapping_add`,
+which is commutative: the table digest does not depend on arrival
+order. Addition rather than XOR, because XOR cancels — two identical
+rows would vanish from the digest instead of doubling, and duplicate
+rows are exactly what a write-path harness should catch. Keyset
+pagination still needs an order, but it only needs one that is
+consistent *within* one engine, so the collation difference is confined
+to a place where it cannot do harm.
+
+Values carry a type tag and a length. Without the length,
+`("ab", "c")` and `("a", "bc")` hash identically and a write that
+shifted a boundary between two TEXT columns would be invisible. Without
+the tag, a column reading back as `Int` from one engine and `Text` from
+the other would be silently coerced, when it is a real condition
+between a dynamically typed source and a strict destination and worth
+failing on.
+
+**What it catches that `mirror --check` cannot.** `compare_counts` says
+so itself: row counts miss an update in place. Demonstrated on
+`templedb_scratch` on 2026-10-20 — flip one `file_contents.is_current`
+and `mirror --check` still reports *fresh: all 17 tables match the
+source*, while `templedb-rs state` reports the same 2,213 rows and a
+different digest. The two are complements, not alternatives: counts are
+the cheap check to run before every sweep, the digest is the thorough
+one to run either side of a mutation.
+
+The harness is a library plus `templedb-rs state`, which prints one
+fixed-width line per table so a shell can capture before and after and
+`diff` them. There is no comparison subcommand because there does not
+need to be one.
+
+**Not yet exercised against a real write**, because there is no write
+to exercise it against — which is the order the design document asked
+for, and means the first `file set` is also this harness's first real
+test rather than its validation.
+
+### `summary` is not a function of the database
+
+The half-ported command, and the one that changed how the rest of this
+file reads. Written up in full as the TempleDB report of the same name
+(2026-10-18); the part that belongs here is what it means for the
+method.
+
+**The byte-diff harness is a purity test, and nobody designed it as
+one.** It works because both binaries read the same input and read
+nothing else. Every command ported so far satisfies that — `file cat`,
+`entity trace`, `vcs show` are all pure functions from database state
+to bytes, which is also the only reason asking "do SQLite and Postgres
+agree?" is a meaningful question. `summary` is the first command that
+fails it, and it fails on five inputs that are not rows: the wall
+clock, `os.getppid()`, the hostname, systemd, and
+`TEMPLEDB_SESSION_ID`.
+
+This file used to list three commands as not byte-diffable —
+`project list`, `search content` and `summary` — as though they were
+the same kind of exception. The first two are deliberate output
+choices. The third is a different thing entirely, and grouping them
+hid it.
+
+So the port splits the command three ways rather than reproducing it:
+
+| layer | depends on | where |
+|---|---|---|
+| observation | the database alone | `templedb-db/src/summary.rs` |
+| interpretation — ages, freshness, colour | the facts **plus an instant passed in** | the CLI |
+| environment — systemd, session identity | the machine | the CLI |
+
+The observation half is a function, so it is mirrored, diffed across
+backends and tested without a clock. The two queries that genuinely
+need the date take it as a parameter — `reconciliation_counts(store,
+today)` — rather than reading one. That rule is not for this command:
+every write stamps `datetime('now')` and mints `commit_hash` from
+`time.time()`, so a write path built the ambient way produces a state
+no harness can diff. **The clock and the identity have to be arguments
+threaded from the entry point.**
+
+**One query in the port cannot be written once, and it is not the one
+you would guess.** Python's doctor pane asks:
+
+```sql
+SELECT check_name, status, MAX(ran_at) AS ran_at, issue_count
+  FROM invariant_checks GROUP BY check_name
+```
+
+`status` and `issue_count` are neither grouped nor aggregated — an
+error in Postgres (`42803`) and in standard SQL. It works because
+SQLite documents that with exactly one `min()`/`max()` aggregate, the
+bare columns come **from the row that produced the extreme**. So it
+means "the latest run's status", which is what the pane needs, and the
+repair that compiles everywhere — wrapping them in `MAX()` — returns
+the alphabetically largest status instead. On live data that reports a
+check as `violated` with nine issues when its latest run is `ok` with
+none. A fixture row pins exactly that substitution.
+
+`summary.rs` therefore carries two SQL texts for it, `DISTINCT ON` on
+the Postgres side, in the open rather than behind the placeholder
+rewriter. Verified: 42 invariant rows and 6 machine rows, byte-identical
+between SQLite and the mirror. The fleet pane has the same shape and
+the same split.
+
+**And a tie-break Python does not have.** `ORDER BY ran_at DESC` alone
+ties constantly here, because one `doctor entities` run stamps all 42
+checks within the same second — so *which three problems the pane
+shows* is the planner's choice. `(ran_at DESC, check_name)` makes it a
+sequence. Same reasoning as `entity trace`, and the same kind of
+divergence.
+
+#### What the rendering layer turned out to be worth
+
+Built 2026-10-21, in `templedb-cli/src/summary_view.rs`. The split had
+been argued for on method grounds; rendering it is what paid for the
+argument, because six of the seven ported panes came out byte-identical
+with Python the first time they ran against the live database. A command
+whose output was supposed to be unverifiable turns out to be verifiable
+almost everywhere, once the parts that are not functions are named and
+moved to the edge.
+
+**The impure inputs are four lines, not a pane.** `Clock::from_env` and
+a `session_id()` of `TEMPLEDB_SESSION_ID` or `(gethostname, getppid)`
+is the whole of it. Everything else that looked like it needed the
+machine needed an argument.
+
+**The sweep compares panes, not the command.** A `summary` row in
+`INVOCATIONS` could only ever land in `EXPECTED` — two panes are
+missing, so the whole stdout can never match — and that would have
+taken the other seven with it, reporting a command as a known
+divergence when six of its panes agree to the byte. So the sweep gained
+a pane-scoped stage instead: it splits both outputs on the accent rules
+and compares the panes the port *claims*, naming the unported ones
+rather than skipping them. It retries the whole capture up to three
+times, because the ingestion pane renders ages and a minute boundary
+falling between the two invocations reports `0min ago` against
+`1min ago` — elapsed time, not a divergence. `TEMPLEDB_RS_NOW` is no
+help: it pins this port's clock and not Python's, which would make the
+comparison worthless rather than merely noisy.
+
+**The seventh pane is the reconciliation listing, and it is the
+tie-break again.** Python orders by `datetime(first_detected_at)` with
+nothing after it. Three of the eight open rows share
+`2026-10-16 14:32:25` to the second — one `doctor entities` run
+detected them together — and the pane prints four rows, so *which* of
+the tied three appear, and in what order, is the planner's choice.
+`live_reconciliations` adds `, kind, subject_ref`. That is the fourth
+place in this port where the same decision has come up, and the first
+where it was already in the SQL before anything printed it.
+
+**Two misalignments are reproduced rather than fixed.** Python pads
+several strings *after* colouring them — `f"{_c(ts, colour):<40}"` —
+so nine characters of ANSI escape count toward the forty and the
+columns do not line up. And the doctor pane writes `_c(age, 'muted')`
+with `age` set to `''` for a fresh check, putting an empty
+`\x1b[90m\x1b[0m` pair at the end of the line. Both are on stdout, so
+both are reproduced; the second is nine bytes of nothing that a
+byte-diff would otherwise have caught.
+
+The first of those has a consequence worth stating, because this port
+has a `--no-color` flag and Python does not: **`--no-color` output is
+not the coloured output with the escapes stripped.** Padding an
+unpainted 19-character timestamp to 40 leaves 21 spaces; painting it
+first leaves 12. The flag produces columns that actually align, which
+is a different output rather than a cleaner encoding of the same one,
+and a test pins the inequality so that nobody implements the flag as a
+post-processing pass.
+
+### The clock seam, and the float error that is part of the answer
+
+Built 2026-10-17. `clock.rs` is small — one instant, a `julianday`
+parser, and `_age_hint` — and the interesting part is that the obvious
+implementation is wrong in a way no amount of care would have caught.
+
+Python asks the database for every age:
+
+```sql
+SELECT (julianday('now') - julianday(?)) * 24 AS hours
+```
+
+A Julian Day is about 2.46 million, so an `f64` resolves it to roughly
+47 microseconds, and `_age_hint` **truncates** the result. Those two
+facts meet at every boundary:
+
+| gap | what SQLite computes | what `summary` prints |
+|---|---|---|
+| exactly 1 minute | `0.016666665673…` × 60 = 0.99999994 | `0min ago` |
+| exactly 1 hour, at 12:00 | `0.9999999962747097` | `59min ago`, **fresh** |
+| exactly 1 hour, at 06:30 | `1.0000000074505806` | `1h ago`, **stale** |
+
+The same gap, an hour apart in the day, lands on opposite sides of the
+`hours < 1` test. So an implementation that computes the age
+*correctly* — integer milliseconds, divided once — prints a different
+string from Python's for some inputs, and is wrong for this port's
+purpose. `clock.rs` therefore holds the instant as integer
+milliseconds and divides by 86,400,000 to get a Julian Day, which is
+what SQLite does internally (`sqlite3_int64 iJD`), so that the
+rounding is the same rounding.
+
+That is not a conclusion anyone would reach by reading the Python. It
+came out of the oracle, and the oracle is the deliverable as much as
+the module is: `tests/clock_parity.rs` puts 2,000 timestamp pairs
+through CPython's `sqlite3` — half of them landing on an exact minute,
+hour or day boundary on purpose — and compares the `f64` bit-for-bit
+as well as the rendered string. Checked for vacuity the same way the
+difflib oracle was: replacing the subtraction with exact integer
+arithmetic, which is the *more* accurate implementation, fails it
+immediately.
+
+Three smaller things the exercise settled:
+
+- **The `sqlite3` CLI cannot be used as the oracle.** Its
+  `printf('%.17g')` reports `1.000000007450581` for a double whose
+  exact value is `1.0000000074505806`. The harness goes through
+  Python, whose `repr` round-trips — and Python is the implementation
+  being matched anyway.
+- **A zone suffix is a different instant, not decoration.** SQLite
+  reads `06:30:00+02:00` as 04:30 UTC. No column this port reads
+  carries one, so the parser could have refused them; it applies them
+  instead, because a parser that silently differs from the one it
+  reproduces is the kind of gap that surfaces years later through a
+  column nobody checked.
+- **The `ancient` cutoff is `threshold × 24`.** With the reconcile
+  pane's 168-hour threshold that is 168 *days*, so a machine
+  unreconciled for three months renders as `2184h ago` rather than in
+  days. It reads like a bug, it is on stdout, and it is reproduced.
+
+The seam itself is the small part: `TEMPLEDB_RS_NOW` pins the instant,
+`Clock::system()` is the default, and nothing else in the crate reads
+a clock. The prefix is `TEMPLEDB_RS_` rather than `TEMPLEDB_` on
+purpose — a variable that pinned one binary's clock and not the
+other's would make a parity run look like agreement.
 
 ### `entity explore` orders its edges and Python does not
 
@@ -1607,7 +2039,7 @@ Omitted rather than reproduced, because mirroring `commit_files` to
 compute a discarded value is work for nobody. If a caller ever wants the
 count, it wants a real fallback, tested against those 354 commits.
 
-### Why `summary` and `doctor` are not next
+### Why `summary` and `doctor` were not next, and what that got wrong
 
 An earlier revision of this list had them as step 4, justified by "`doctor`
 hashes roughly 400 files per run, which is work Rust does far better."
@@ -1636,6 +2068,24 @@ None of that makes `summary` unportable — it makes it the first command
 needing a different verification approach, probably injected time and a
 fixed session id, which is its own piece of work rather than a
 precondition smuggled into a command port.
+
+**All of that is now built, and the conclusion above was too
+pessimistic.** The clock seam landed 2026-10-17 as step 13, the
+observation layer 2026-10-18, and the rendering layer and session
+identity 2026-10-21. The claim that "a byte diff against Python is
+meaningless" turned out to be true of the command and false of its
+panes: six of the seven ported panes are byte-identical, including the
+one whose ages come from the clock. Ages agree because both
+implementations compute them from the same stored timestamps and the
+same `julianday` arithmetic, so two runs a second apart agree — it is
+only a *minute boundary* landing between them that does not, which a
+retry settles. The decision that was open is closed: the sweep compares
+panes, and the pane that genuinely cannot be diffed is the one reading
+systemd, which is not ported.
+
+What is left of `summary` is the two unported panes, listed under
+*Known gaps*. `doctor` is unchanged: `doctor entities` is still a write
+path and still sits behind the write-path design document.
 
 Nothing here renames the binary to `templedb`. The Python one is on PATH
 under that name and every script, systemd unit and agent wrapper invokes

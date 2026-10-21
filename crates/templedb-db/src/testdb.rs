@@ -161,6 +161,56 @@ CREATE TABLE observations_archive (
     prior_source_authority TEXT
 );
 
+-- The six tables `summary` reads. Only the mirrored columns, so the
+-- fixture and the Postgres subset describe the same shape and a query
+-- that works here cannot quietly depend on a column the mirror drops.
+CREATE TABLE ingestion_runs (
+    id         INTEGER PRIMARY KEY,
+    adapter    TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    status     TEXT NOT NULL
+);
+
+CREATE TABLE invariant_checks (
+    id          INTEGER PRIMARY KEY,
+    check_name  TEXT NOT NULL,
+    ran_at      TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    issue_count INTEGER NOT NULL
+);
+
+CREATE TABLE reconcile_runs (
+    id           INTEGER PRIMARY KEY,
+    machine_name TEXT NOT NULL,
+    ran_at       TEXT NOT NULL,
+    status       TEXT NOT NULL
+);
+
+CREATE TABLE fleet_machines (
+    id               INTEGER PRIMARY KEY,
+    machine_name     TEXT NOT NULL,
+    last_deployed_at TEXT
+);
+
+CREATE TABLE handoff_notes (
+    id         INTEGER PRIMARY KEY,
+    to_session TEXT,
+    to_topic   TEXT,
+    acked_at   TEXT
+);
+
+CREATE TABLE reconciliations (
+    id                INTEGER PRIMARY KEY,
+    kind              TEXT NOT NULL,
+    subject_ref       TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    item_count        INTEGER NOT NULL,
+    owner             TEXT,
+    first_detected_at TEXT,
+    last_observed_at  TEXT,
+    review_after      TEXT
+);
+
 CREATE VIRTUAL TABLE file_contents_fts USING fts5(
     file_path UNINDEXED,
     content_text,
@@ -450,6 +500,85 @@ VALUES
     (3, 'Machine', 'box1', 'box one',  'nix', '2026-10-03 00:00:00', 1, 'box one', 'nix'),
     (4, 'Machine', 'box1', 'box one',  'nix', '2026-10-03 00:00:00', 1, 'box 1',   'nix'),
     (5, 'Machine', 'box1', NULL,       'nix', '2026-10-03 00:00:00', 1, 'box one', 'nix');
+
+-- `summary`'s six tables. Every row here exists for a branch that is
+-- otherwise unreachable on a fixture small enough to read.
+
+-- Two adapters, three runs each counted: `git` has an error among its
+-- successes and a later run than `nix`, so the ordering and the two
+-- tallies are both exercised. One row per *run*, so a query that
+-- forgets to group returns five rows instead of two.
+INSERT INTO ingestion_runs (id, adapter, started_at, status) VALUES
+    (1, 'git', '2026-10-17 10:00:00', 'ok'),
+    (2, 'git', '2026-10-17 11:00:00', 'error'),
+    (3, 'git', '2026-10-17 12:00:00', 'ok'),
+    (4, 'nix', '2026-10-16 09:00:00', 'ok'),
+    (5, 'nix', '2026-10-17 09:00:00', 'running');
+
+-- `no_orphans` is the row that matters: an older `violated` run with 9
+-- issues and a newer `ok` run with 0. SQLite's bare-column GROUP BY
+-- must report it as `ok`; the portable-looking repair of wrapping the
+-- columns in MAX() reports `violated` with 9 issues, because
+-- 'violated' > 'ok' and 9 > 0. Nothing else in the fixture can catch
+-- that substitution.
+--
+-- All three checks share `2026-10-17 12:00:00` for their latest run,
+-- which is the normal case — one `doctor entities` stamps every check
+-- in the same second — and is what makes the tie-break necessary.
+INSERT INTO invariant_checks
+    (id, check_name, ran_at, status, issue_count)
+VALUES
+    (1, 'no_orphans',   '2026-10-16 12:00:00', 'violated', 9),
+    (2, 'no_orphans',   '2026-10-17 12:00:00', 'ok',       0),
+    (3, 'no_cycles',    '2026-10-17 12:00:00', 'violated', 3),
+    -- A check that could not run. Its issue_count is whatever the last
+    -- good run left and must not be counted as a violation.
+    (4, 'needs_python', '2026-10-15 12:00:00', 'ok',       0),
+    (5, 'needs_python', '2026-10-17 12:00:00', 'error',    7);
+
+-- `box1` is deployed and reconciled, with a later `ok` after an
+-- earlier `drift`: the correlated subquery must report the newer one.
+-- `unreconciled` is deployed with no runs at all, which is the
+-- LEFT JOIN case. `neverdeployed` has a NULL last_deployed_at and is
+-- listed separately by the pane.
+INSERT INTO fleet_machines (id, machine_name, last_deployed_at) VALUES
+    (1, 'box1',          '2026-10-01 00:00:00'),
+    (2, 'unreconciled',  '2026-10-02 00:00:00'),
+    (3, 'neverdeployed', NULL);
+
+INSERT INTO reconcile_runs (id, machine_name, ran_at, status) VALUES
+    (1, 'box1', '2026-10-17 10:00:00', 'drift'),
+    (2, 'box1', '2026-10-17 11:00:00', 'ok');
+
+-- One note for this session, one broadcast, one for a topic and one
+-- already acked. Only the first two are counted, and the inbox differs
+-- per session id -- which is the point of passing it in.
+INSERT INTO handoff_notes (id, to_session, to_topic, acked_at) VALUES
+    (1, 'box1-123', NULL,       NULL),
+    (2, NULL,       NULL,       NULL),
+    (3, NULL,       'templedb', NULL),
+    (4, 'box1-123', NULL,       '2026-10-17 09:00:00'),
+    (5, NULL,       NULL,       '2026-10-17 09:00:00');
+
+-- Four live rows across the three live statuses plus one `settled`,
+-- which is counted by the histogram and shown nowhere. The accepted
+-- row's `review_after` is in the future relative to the fixture's
+-- usual instant, so `review_due` is 0 until a test passes a later
+-- date -- the whole argument for the date being an argument.
+INSERT INTO reconciliations
+    (id, kind, subject_ref, status, item_count, owner,
+     first_detected_at, last_observed_at, review_after)
+VALUES
+    (1, 'invariant',     'no_cycles',  'open',        3, 'zach',
+        '2026-10-01 09:00:00', '2026-10-10 09:00:00', NULL),
+    (2, 'machine_drift', 'box1',       'open',        1, NULL,
+        '2026-10-05 09:00:00', '2026-10-16 09:00:00', NULL),
+    (3, 'invariant',     'no_orphans', 'in_progress', 9, 'zach',
+        '2026-10-02 09:00:00', '2026-10-15 09:00:00', NULL),
+    (4, 'dormant_table', 'old_table',  'accepted',    0, NULL,
+        '2026-09-01 09:00:00', '2026-09-01 09:00:00', '2026-11-01'),
+    (5, 'invariant',     'fixed_one',  'settled',     0, NULL,
+        '2026-08-01 09:00:00', '2026-08-02 09:00:00', NULL);
 "#;
 
 /// The `File -imports-> File` graph `entity dead-imports` reads, loaded

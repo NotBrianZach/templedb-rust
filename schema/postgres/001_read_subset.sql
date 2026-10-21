@@ -360,6 +360,99 @@ CREATE INDEX observations_archive_entity
     ON observations_archive (entity_kind, entity_ref, observed_at DESC, id ASC);
 
 -- ---------------------------------------------------------------------
+-- The six tables `summary` reads.
+--
+-- Added 2026-10-18 with the `summary` port. The boundary still follows
+-- the readers — only the columns the panes name are here, out of 14 on
+-- `ingestion_runs` and 27 on `fleet_machines` — and the rule holds
+-- that a table with no reader has nothing to verify a mirror against.
+--
+-- One shape note that applies to four of them. These are *event log*
+-- tables: `ingestion_runs`, `invariant_checks` and `reconcile_runs`
+-- each hold one row per run, and every pane that reads them wants the
+-- latest row per group. That read pattern is why the indexes below
+-- carry `(group, timestamp DESC)` rather than the timestamp alone, and
+-- it is the same pattern the SQLite-only `GROUP BY` extension exists to
+-- serve — see `summary.rs` for why that query cannot be written once.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE ingestion_runs (
+    id          bigint PRIMARY KEY,
+    adapter     text COLLATE "C" NOT NULL,
+    started_at  text COLLATE "C" NOT NULL,
+    -- CHECK'd to ('running','ok','partial','error') in SQLite. Not
+    -- reproduced: the mirror has to accept whatever the live database
+    -- holds, and a constraint that rejects a future status would turn
+    -- a copy into a failure.
+    status      text COLLATE "C" NOT NULL
+);
+
+CREATE INDEX ingestion_runs_adapter_started
+    ON ingestion_runs (adapter, started_at DESC);
+
+CREATE TABLE invariant_checks (
+    id          bigint PRIMARY KEY,
+    check_name  text COLLATE "C" NOT NULL,
+    ran_at      text COLLATE "C" NOT NULL,
+    status      text COLLATE "C" NOT NULL,
+    issue_count bigint NOT NULL
+);
+
+CREATE INDEX invariant_checks_name_time
+    ON invariant_checks (check_name, ran_at DESC);
+
+CREATE TABLE reconcile_runs (
+    id           bigint PRIMARY KEY,
+    machine_name text COLLATE "C" NOT NULL,
+    ran_at       text COLLATE "C" NOT NULL,
+    status       text COLLATE "C" NOT NULL
+);
+
+CREATE INDEX reconcile_runs_machine_time
+    ON reconcile_runs (machine_name, ran_at DESC);
+
+-- `last_deployed_at` is declared TIMESTAMP in SQLite, which stores it
+-- as whatever string was written — SQLite has no date type. Mirrored as
+-- text for the same reason every other timestamp here is: the port
+-- compares these as strings and parses them in Rust, so turning one
+-- into a `timestamptz` would introduce a timezone that the SQLite side
+-- does not have.
+CREATE TABLE fleet_machines (
+    id               bigint PRIMARY KEY,
+    machine_name     text COLLATE "C" NOT NULL,
+    last_deployed_at text COLLATE "C"
+);
+
+CREATE TABLE handoff_notes (
+    id         bigint PRIMARY KEY,
+    to_session text COLLATE "C",
+    to_topic   text COLLATE "C",
+    acked_at   text COLLATE "C"
+);
+
+-- The unacked-broadcast query is `to_session IS NULL AND to_topic IS
+-- NULL AND acked_at IS NULL`, which no btree index helps with on a
+-- table this size; the partial index SQLite carries for it is not
+-- reproduced.
+CREATE INDEX handoff_notes_session
+    ON handoff_notes (to_session, acked_at);
+
+CREATE TABLE reconciliations (
+    id                bigint PRIMARY KEY,
+    kind              text COLLATE "C" NOT NULL,
+    subject_ref       text COLLATE "C" NOT NULL,
+    status            text COLLATE "C" NOT NULL,
+    -- The pane prints this and never reads `reconciliation_items`, so
+    -- that table is not mirrored. If a surface ever needs the items
+    -- themselves it gains a reader and then a mirror, in that order.
+    item_count        bigint NOT NULL,
+    owner             text COLLATE "C",
+    first_detected_at text COLLATE "C",
+    last_observed_at  text COLLATE "C",
+    review_after      text COLLATE "C"
+);
+
+-- ---------------------------------------------------------------------
 -- `source_snapshots`, translated from the live view.
 --
 -- Structurally identical to the SQLite original — a `UNION ALL` of the

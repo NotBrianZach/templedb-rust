@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use templedb_db::{Direction, ProjectLookup, SnapshotBody};
 
+mod summary_view;
+
 #[derive(Parser)]
 #[command(
     name = "templedb-rs",
@@ -96,6 +98,52 @@ enum Command {
         /// `compare_counts`.
         #[arg(long, conflicts_with = "create_schema")]
         check: bool,
+    },
+    /// Digest every mirrored table, for comparison across a write.
+    ///
+    /// The state-diff harness the write-path design document asks for,
+    /// in the only form a shell needs: one line per table, `rows` and
+    /// a 128-bit digest, deterministic and ordered by the table list.
+    /// Capture before and after a mutation and `diff` the two files.
+    ///
+    /// Reads whichever backend the environment selects, so the two
+    /// captures can come from different engines — which is the point.
+    /// `mirror` at a known instant, let Python write to SQLite and the
+    /// port write to its Postgres, and compare. The digest is
+    /// order-independent precisely so the two engines' disagreement
+    /// about TEXT collation cannot show up as a false difference.
+    ///
+    /// Unlike `mirror --check`, this catches an update in place: a
+    /// flipped `is_current` leaves every row count alone and changes
+    /// the digest.
+    ///
+    /// Reads every row of the subset, `content_blobs` included. It is
+    /// not cheap and is not meant to be run in a loop.
+    State,
+    /// Health at a glance — ingest, doctor, reconcile, handoff.
+    ///
+    /// The first command in this port that is not a pure function of
+    /// the database, and the only one whose output the byte-diff sweep
+    /// cannot verify: Python's reads the wall clock, the hostname,
+    /// `os.getppid()`, systemd and `TEMPLEDB_SESSION_ID` alongside the
+    /// rows. The facts come from `templedb-db/src/summary.rs`, which
+    /// reads none of those; the clock and the session identity are
+    /// resolved here and passed in.
+    ///
+    /// **Seven of Python's nine panes.** The agent-fleet pane has no
+    /// observation layer — its tables are outside the mirrored subset —
+    /// and the systemd pane reads `systemctl` rather than the database.
+    /// Both print a `(not ported)` line in place, because a pane that
+    /// silently vanishes reads as good news.
+    Summary {
+        /// Print without ANSI colour.
+        ///
+        /// Not equivalent to piping the coloured output through a
+        /// filter: Python pads several strings *after* painting them,
+        /// so the column widths differ between the two forms. See
+        /// `summary_view.rs`.
+        #[arg(long)]
+        no_color: bool,
     },
 }
 
@@ -423,9 +471,16 @@ fn main() {
     // Return an exit code rather than letting a panic print a backtrace:
     // this is a CLI, and "Error: no database at ..." is the useful output.
     match run() {
+        // Which status an error leaves with is the error's own
+        // property, not this arm's: `templedb_db::code_of` reads it
+        // back off the chain and gives 1 for everything that does not
+        // say otherwise. Python separates bad input (1) from an
+        // address that names nothing (2), and collapsing both into 1
+        // here is what the README carried as a known gap. See
+        // `templedb-db/src/exit.rs`.
         Err(e) => {
             eprintln!("Error: {e:#}");
-            std::process::exit(1);
+            std::process::exit(templedb_db::code_of(&e));
         }
         // Not every non-zero exit is an error. `entity paths` answers
         // "no path" on stdout and exits 3, which is a result a script can
@@ -473,14 +528,20 @@ fn run() -> Result<i32> {
                 );
                 return Ok(0);
             }
-            eprintln!("STALE: {} table(s) have moved since the mirror", report.drift.len());
+            eprintln!(
+                "STALE: {} table(s) have moved since the mirror",
+                report.drift.len()
+            );
             for d in &report.drift {
                 let was = if d.mirrored < 0 {
                     "absent".to_string()
                 } else {
                     d.mirrored.to_string()
                 };
-                eprintln!("  {:<20} mirrored {:>9}  source {:>9}", d.table, was, d.source);
+                eprintln!(
+                    "  {:<20} mirrored {:>9}  source {:>9}",
+                    d.table, was, d.source
+                );
             }
             eprintln!("\nRe-run `mirror` before trusting a cross-backend comparison.");
             return Ok(4);
@@ -712,7 +773,7 @@ fn run() -> Result<i32> {
                             "(no path within depth {max_depth} between \
                              {from_kind}/{from_ref} and {to_kind}/{to_ref})"
                         );
-                        return Ok(3);
+                        return Ok(templedb_db::NO_PATH);
                     }
                     templedb_db::PathResult::Found { source_label, hops } => {
                         println!(
@@ -1216,10 +1277,78 @@ fn run() -> Result<i32> {
                 }
             }
         },
+        Command::State => {
+            let state = templedb_db::capture(store.as_ref())?;
+            // Fixed-width columns and a zero-padded hex digest, so the
+            // output diffs line-for-line and a changed table is one
+            // changed line rather than a reflowed block.
+            for t in &state.tables {
+                println!("{:<22} {:>9} {:032x}", t.table, t.rows, t.digest);
+            }
+        }
+        Command::Summary { no_color } => {
+            // Both inputs that are not rows, resolved here and nowhere
+            // deeper. `Clock::from_env` honours `TEMPLEDB_RS_NOW`, which
+            // is what makes a rendered pane reproducible at all.
+            let clock = templedb_db::Clock::from_env()?;
+            let session = session_id();
+            // One call, so no pane can read a database that moved
+            // between it and the pane above — the live file is being
+            // written by the Python implementation while this runs.
+            let facts = templedb_db::observe(store.as_ref(), &clock, &session)?;
+            for line in summary_view::render(&facts, &clock, &session, !no_color) {
+                println!("{line}");
+            }
+        }
         // Handled above, before the read store is opened.
         Command::Mirror { .. } => unreachable!("handled before open_ro"),
     }
     Ok(0)
+}
+
+/// Python's session identity: `TEMPLEDB_SESSION_ID`, or
+/// `{hostname}-{getppid()}`.
+///
+/// This is the third of `summary`'s three layers — environment — and it
+/// is two system calls rather than a query on purpose. The handoff
+/// inbox is scoped to it, which means the pane's answer depends on
+/// *which shell* invoked the command: the same database, read from two
+/// terminals, reports two different inbox counts. Resolving it at the
+/// entry point does not remove that dependency, but it puts it where a
+/// caller can see it and a test can fix it, which is the rule the
+/// write path will need when every insert stamps `datetime('now')`.
+///
+/// An exported-but-empty variable falls back, because Python's `or`
+/// treats `''` as unset — the same reading `conn.rs` gives an empty
+/// `TEMPLEDB_PATH`.
+fn session_id() -> String {
+    match std::env::var("TEMPLEDB_SESSION_ID") {
+        Ok(v) if !v.is_empty() => v,
+        // SAFETY: `getppid` takes no arguments, cannot fail, and
+        // touches no memory this program owns.
+        _ => format!("{}-{}", hostname(), unsafe { libc::getppid() }),
+    }
+}
+
+/// `socket.gethostname()`.
+///
+/// Empty on failure rather than an error: Python raises here, but a
+/// hostname this process cannot read would fail `summary` outright over
+/// one line of one pane, and the inbox query it feeds returns zero rows
+/// for an unmatched session either way.
+fn hostname() -> String {
+    // HOST_NAME_MAX is 64 on Linux. POSIX leaves truncation unspecified
+    // when the buffer is too small — it may come back without a NUL —
+    // so the terminator is searched for rather than assumed.
+    let mut buf = [0u8; 256];
+    // SAFETY: the pointer and length describe `buf` exactly, and
+    // `gethostname` writes at most `len` bytes into it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// Colour one diff line the way Python's `_colorize_diff_line` does.

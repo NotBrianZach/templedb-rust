@@ -79,6 +79,14 @@ INVOCATIONS=(
     # commits and this port does not. A deliberate divergence, kept in
     # the sweep so that it stays *visible* rather than forgotten.
     "vcs log templedb -n 10"
+    # The published view, which needs no session on either side and is
+    # this port's default. Byte-identical exactly when your session has
+    # nothing pending: Python's `if visibility == 'published' and
+    # pending` adds a one-line advisory otherwise, and `just check` runs
+    # *before* a publish, which is when pending is non-zero. So this row
+    # passes when it can and is listed in EXPECTED for when it cannot —
+    # the one arrangement that never reports a false failure.
+    "vcs log templedb --published -n 10"
     "vcs branch templedb"
     # Three blobs typed text/x-prolog: the misclassification case.
     "vcs show templedb 40E93339139FA809 --no-color"
@@ -138,6 +146,8 @@ EXPECTED=(
     "entity explore"
     # Python's default view includes your staging session's commits.
     "vcs log templedb -n"
+    # Only when the session has pending commits; see the row's comment.
+    "vcs log templedb --published"
     # Substring not stemmed, and a different layout.
     "search content"
 )
@@ -181,6 +191,136 @@ SUMMARY_EXPECTED=(
     # reasoning as `entity trace`.
     "── Reconciliations (discrepancies being worked on) ──"
 )
+
+# --- flag surfaces -----------------------------------------------------
+#
+# The sweep above cannot see this class of difference at all, and the
+# README has carried that as a known gap since the audit.
+#
+# A diff of outputs only compares flags that *both* implementations
+# define, because a flag only one side knows is never passed to the
+# other. So a missing flag is invisible until a script hits it: the
+# audit found `search content --limit` by passing it to Python and
+# getting exit 2, by hand. Comparing the surfaces directly is a
+# different question — "can the same command line be typed at both" —
+# and it is the one a caller actually cares about.
+#
+# It found four undocumented divergences the first time it ran, across
+# three commands that were all reported as byte-identical.
+#
+# One command per read-only family, with placeholder arguments: both
+# implementations parse `--help` before validating positionals, so the
+# arguments only have to be present, not real.
+FLAG_COMMANDS=(
+    "project list"
+    "project show x"
+    "file cat p f"
+    "file ls p"
+    "entity stats"
+    "entity explore K/r"
+    "entity trace K/r"
+    "entity search q"
+    "entity paths A/b C/d"
+    "entity dead-imports"
+    "entity observations K/r"
+    "search content q"
+    "source snapshot p f"
+    "source revisions p f"
+    "vcs log p"
+    "vcs show p c"
+    "vcs branch p"
+    "vcs diff p f"
+    "summary"
+)
+
+# Flag divergences that are deliberate, as `<command>|<flag>` pairs.
+# Every one of these is argued in the README; the pair form means a
+# *new* flag on an already-diverging command is still caught.
+FLAGS_EXPECTED=(
+    # Writes. A read-only port cannot have them.
+    "vcs branch p|-d"
+    "vcs branch p|--delete"
+    # Needs the staging session, which is a write and six environment
+    # fallbacks. See `vcs log has no session-scoped default`.
+    "vcs diff p f|--staged"
+    "vcs log p|--session"
+    # Dead unless --no-fts is passed too, and what it selects is this
+    # port's default behaviour.
+    "search content q|-i"
+    "search content q|--ignore-case"
+    # Would have to be accepted and ignored, which is worse than absent:
+    # a flag promising different matching that delivers none.
+    "search content q|--no-fts"
+    # The one place this port is deliberately more capable: Python's FTS
+    # path applies no limit at all.
+    "search content q|-l"
+    "search content q|--limit"
+    # Python always colours and has no flag; this one does.
+    "summary|--no-color"
+    # Filters on columns the port mirrors but does not offer. Not
+    # argued as a decision — just not done. See *Known gaps*.
+    "project list|--nix-only"
+    "project list|--category"
+)
+
+# The long and short options named on stdin, one per line.
+#
+# Reads only the options section, and only the option tokens at the
+# *start* of each line — the two help formats differ everywhere else,
+# and both mention other flags in their descriptions. Python's
+# `-i, --ignore-case  Case insensitive (only with --no-fts)` is exactly
+# the line that a naive grep for `--[a-z]*` gets wrong.
+parse_flags() {
+    awk '
+        tolower($0) ~ /^ *(options|flags):/ { f = 1; next }
+        f && /^[^[:space:]]/ { f = 0 }
+        f && /^[[:space:]]+-/ {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/  +.*$/, "", line)         # cut the description
+            gsub(/<[^>]*>/, "", line)       # clap metavars
+            gsub(/\{[^}]*\}/, "", line)     # argparse choice lists
+            gsub(/[A-Z_][A-Z_]+/, "", line) # argparse metavars
+            n = split(line, parts, /[ ,]+/)
+            for (i = 1; i <= n; i++)
+                if (parts[i] ~ /^--?[a-zA-Z]/) print parts[i]
+        }' | sort -u
+}
+
+flag_parity() {
+    local cmd flag side pair e is_exp matched agree=0 a b
+    for cmd in "${FLAG_COMMANDS[@]}"; do
+        matched=yes
+        # Unquoted on purpose: the rows above are argument lists. The
+        # other side is `run_b`, a function, so it cannot be passed as
+        # a command word.
+        # shellcheck disable=SC2086
+        a=$("$RS" $cmd --help 2>&1 | parse_flags)
+        # shellcheck disable=SC2086
+        b=$(run_b $cmd --help 2>&1 | parse_flags)
+        while read -r side flag; do
+            [[ -n $flag ]] || continue
+            pair="$cmd|$flag"
+            is_exp=no
+            for e in "${FLAGS_EXPECTED[@]}"; do
+                [[ $pair == "$e" ]] && is_exp=yes
+            done
+            if [[ $is_exp == yes ]]; then
+                expected=$((expected + 1))
+            else
+                matched=no
+                unexpected=$((unexpected + 1))
+                printf 'DIFFERS   flags %-24s %s-only: %s\n' "$cmd" "$side" "$flag"
+            fi
+        done < <(
+            comm -13 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | sed 's/^/other /'
+            comm -23 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | sed 's/^/port /'
+        )
+        [[ $matched == yes ]] && agree=$((agree + 1))
+    done
+    printf 'flags     %d of %d commands agree (deliberate divergences allowed)\n' \
+        "$agree" "${#FLAG_COMMANDS[@]}"
+}
 
 # One pane's body: everything after its header, up to the next rule.
 #
@@ -280,6 +420,10 @@ backends)
     # Both sides are this port, so every pane must agree — the
     # reconciliation tie-break is in the SQL for both dialects.
     SUMMARY_EXPECTED=()
+    # Likewise the flag surface: it is the same binary twice, so this
+    # stage can only ever report agreement here. Kept rather than
+    # skipped so the three modes produce the same shape of report.
+    FLAGS_EXPECTED=()
     ;;
 regress)
     [[ -x $ARG ]] || { echo "regress mode needs an executable old binary" >&2; exit 2; }
@@ -289,6 +433,9 @@ regress)
     # port: the point is to notice unintended ones.
     EXPECTED=()
     SUMMARY_EXPECTED=()
+    # A flag this build dropped, or one the old build never had, is
+    # exactly the kind of unintended change this mode is for.
+    FLAGS_EXPECTED=()
     ;;
 *)
     echo "unknown mode: $MODE (python | backends | regress)" >&2
@@ -337,6 +484,7 @@ for inv in "${INVOCATIONS[@]}"; do
 done
 
 summary_parity
+flag_parity
 
 printf '\ntempledb-rs vs %s, %d invocations: %d stdout-identical (%d differing on stderr only), %d deliberate, %d unexpected\n' \
     "$label" "${#INVOCATIONS[@]}" "$pass" "$stderr_only" "$expected" "$unexpected"

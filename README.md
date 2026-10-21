@@ -29,7 +29,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs entity paths FROM TO [--max-depth] [--direction] [--via]` | byte-identical, exit codes included |
 | `templedb-rs entity dead-imports [--slug] [--limit]` | byte-identical across 5 variants |
 | `templedb-rs entity observations <kind>/<ref> [--limit]` | byte-identical across 6 variants |
-| `templedb-rs vcs log <proj> [-n] [--branch] [--all-sessions]` | byte-identical; Python's session-scoped default not ported |
+| `templedb-rs vcs log <proj> [-n] [--branch] [--all-sessions] [--published]` | byte-identical; Python's session-scoped default and `--session` not ported |
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
@@ -66,7 +66,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-262 unit tests, run by `cargo test`: 230 in `templedb-db` and 32 in
+266 unit tests, run by `cargo test`: 234 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -206,7 +206,7 @@ not a chain of pairwise comparisons that could have drifted together.
 `search content` is deliberately excluded from the regression axis,
 because changing its answer was the point.
 
-Both axes are now run over **one sweep of 49 invocations covering every
+Both axes are now run over **one sweep of 50 invocations covering every
 implemented command**, and it is committed as
 `scripts/parity-sweep.sh` rather than retyped each time:
 
@@ -602,7 +602,7 @@ The blob bug surfaced from a `--side-by-side` sweep that happened to
 also run the unified renderer; the other three surfaced only once every
 implemented command was diffed in one pass.
 
-So that is now the method: a single sweep over all 49 invocations
+So that is now the method: a single sweep over all 50 invocations
 (`scripts/parity-sweep.sh`), run against Python and across both
 backends, rather than a per-command harness retired when the command is
 declared done. Five differences remain and every one is deliberate and
@@ -854,9 +854,12 @@ Differences that are not deliberate and are not yet closed.
   command that is not a byte-diff candidate at all.
 - **`search content`'s flags do not match.** Python has `-i` /
   `--ignore-case` and `--no-fts`, which this does not; this has
-  `--limit`, which Python does not. Both directions, and nothing checks
-  that flag surfaces agree — the audit found this by passing `--limit`
-  to Python and getting exit 2.
+  `--limit`, which Python does not. Both directions, and all of it
+  deliberate — see below. The *checking* half of this gap is closed:
+  `parity-sweep.sh` now compares flag surfaces directly, which is the
+  only way this class of difference is visible at all. It found four
+  undocumented divergences the first time it ran. See
+  *Flag surfaces* below.
 - **Error *messages* differ**, though the statuses no longer do (see
   *The error statuses*). Python routes them through `logging` and
   prefixes `ERROR`; this writes them plain, and the wording is the
@@ -904,12 +907,51 @@ Differences that are not deliberate and are not yet closed.
   stating because the sweep cannot catch this class of difference at
   all: a flag that only one implementation defines is never invoked on
   both sides, so flag-surface drift is invisible to a diff of outputs.
-- **A freshly mirrored Postgres has no statistics.** `mirror` uses
-  `COPY` and does not `ANALYZE`, so until autovacuum gets to it the
-  planner works from defaults. It did not turn out to matter for the
-  query that prompted the investigation — the plan was the same before
-  and after — but it is a real gap, and `ANALYZE` after a mirror run is
-  worth doing.
+- ~~**A freshly mirrored Postgres has no statistics.**~~ **Closed
+  2026-10-21.** `mirror` now runs `ANALYZE` after the copy, outside the
+  transaction — statistics are not part of the copy's atomicity, and
+  holding the copy's locks through an `ANALYZE` of 210,000 rows would
+  extend the one window in which the mirror is unreadable. A failure
+  there is reported on stderr and does not fail the command: the data
+  is committed and correct at that point, and returning an error would
+  send the caller back to a `TRUNCATE`. Verified: all six
+  `content_blobs` columns carry statistics after a run, against none
+  for that table before.
+- **The mirror cannot represent a NUL in a TEXT column, and one live
+  row has one.** Found 2026-10-21. Postgres `TEXT` cannot store
+  U+0000; SQLite `TEXT` can. `bza/frontend/lib/suggest/normalize.ts` is
+  an ordinary TypeScript file that joins on a NUL
+  (`.join('\0')`), so the classification is right and the column is
+  genuinely text — there is no bug upstream to fix. It is one row out
+  of 4,637 with text, and it appeared between two mirror runs on the
+  same afternoon, which is how a copy that had worked all week started
+  failing.
+
+  **This blocks `mirror` and therefore `just sweep-pg` outright.** What
+  is done is the diagnosis: the server's own message is
+  `invalid byte sequence for encoding "UTF8": 0x00` with no table, no
+  column and no row, arriving from `finish()` after 104 MB has
+  streamed. `mirror` now names the column and the row's key before
+  writing. What is *not* done is the repair, because every repair is a
+  decision about what the mirror means and three of the four change
+  what a cross-backend digest compares:
+
+  - **Escape and unescape** in the Postgres read path. Readers see the
+    original text and the digest matches, but the stored bytes are no
+    longer a copy — anyone querying the mirror with `psql` sees the
+    escape.
+  - **Store `content_text` as `BYTEA`.** Faithful, and it costs every
+    text query: the `LIKE` prefilter, the lowercased search column,
+    `file cat` and the diffs all gain an encode/decode.
+  - **Move the text to `content_blob` and NULL `content_text`.** No
+    schema change, but the port's readers would then treat a text file
+    as binary, so `file cat` refuses a file Python prints.
+  - **Skip the row, loudly.** The mirror is one blob short and
+    `file cat` of that one file fails on Postgres only.
+
+  No option is free, so none has been taken. The decision belongs with
+  the write-path design document, which is where the rest of the
+  SQLite-versus-Postgres representation questions already live.
 - **`summary` is two panes short of Python's nine.** The agent-fleet
   pane needs `agent.store.fleet_rollup()`'s tables, which are outside
   the mirrored subset, so there is nothing to observe yet; the systemd
@@ -966,7 +1008,7 @@ No Postgres server is needed to build or to run `cargo test`.
 ```bash
 just pg-up          # initdb if absent, start, create both databases + the ro role
 just mirror         # copy the read subset from live SQLite into templedb_parity
-just sweep-pg       # the 49 invocations, SQLite vs Postgres
+just sweep-pg       # the 50 invocations, SQLite vs Postgres
 just pg-verify-ro   # prove the read-only role is enforced, not assumed
 just pg-down        # stop; pg-nuke throws the cluster away
 ```
@@ -1026,6 +1068,16 @@ and disagrees with Python, which is what a tie-break this port added
 should look like and not what a translation bug looks like. Had the two
 backends disagreed with each other as well, the diagnosis would have
 been the other one.
+
+**This axis is blocked as of later the same day.** A blob containing a
+NUL landed in the live database between that measurement and the next
+mirror run, and `mirror` cannot represent it in Postgres `TEXT` — see
+*Known gaps*. The staleness guard behaved correctly when it happened,
+which is worth recording because it is the case it was built for:
+`mirror --check` exited 4 naming every drifted table and `sweep-pg`
+refused to run rather than producing a comparison against a mirror it
+could not vouch for. The cross-backend numbers above stand as measured;
+they cannot be reproduced until the representation decision is made.
 
 **The sweep refuses to run on a stale mirror**, and that guard was
 written the same afternoon it was needed. `sweep-pg` diffs SQLite
@@ -1096,7 +1148,7 @@ nix flake check        # the hermetic half only
 
 `just check` is what to run before publishing. It is three things in
 order: `cargo test --workspace`, the two CPython oracles (`difflib` and
-the clock), and `scripts/parity-sweep.sh python` — all 49 invocations
+the clock), and `scripts/parity-sweep.sh python` — all 50 invocations
 diffed against the Python `templedb`, plus `summary` compared one pane
 at a time. The sweep exits with the number of *unexpected* differences,
 so the six deliberate divergences do not fail it and a new one does.
@@ -1106,7 +1158,7 @@ what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (262) | yes | yes |
+| unit tests (266) | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
 | 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
@@ -1175,7 +1227,7 @@ crates/templedb-cli/   clap binary `templedb-rs`, formatting only
   summary_view.rs      summary's interpretation layer: facts plus an
                        instant to lines. Ages, colour, column widths
 scripts/
-  parity-sweep.sh      all 49 invocations, against Python / the other
+  parity-sweep.sh      all 50 invocations, against Python / the other
                        backend / a previous build, plus `summary`
                        compared one pane at a time. Not run by
                        `cargo test` — it needs the live database.
@@ -1955,6 +2007,72 @@ So `project list` is the one implemented command that is **not** a
 candidate for byte-level diffing against Python, and the status table
 now says so. Nothing depends on it matching; it is listed here because
 a reader comparing the two outputs deserves to know before they try.
+
+### Flag surfaces, and the four divergences nobody had noticed
+
+Added 2026-10-21, closing the checking half of a gap this file has
+carried since the audit.
+
+A diff of outputs can only compare flags that *both* implementations
+define, because a flag one side does not know is never passed to the
+other. So the sweep — 50 invocations, byte-exact, the thing this port
+trusts — is structurally blind to a missing flag. It stays invisible
+until a caller hits it, which is how `search content --limit` was
+found: by hand, passing it to Python and getting exit 2.
+
+Comparing the surfaces directly asks a different question — *can the
+same command line be typed at both?* — and it is the one a script cares
+about. `parity-sweep.sh` now extracts the long and short options from
+each side's `--help` for nineteen commands and diffs the sets. Reading
+help text is less fragile than it sounds, because the only thing both
+formats agree on is the part being read: an options section whose
+entries begin at the start of a line. It deliberately ignores
+everything after the first double space, since both implementations
+mention *other* flags in their descriptions —
+`-i, --ignore-case  Case insensitive (only with --no-fts)` is exactly
+the line a naive grep gets wrong.
+
+It found four divergences on three commands the first time it ran, all
+of them on commands reported as byte-identical:
+
+| command | flag | disposition |
+|---|---|---|
+| `vcs log` | `--published` | **ported** — see below |
+| `vcs log` | `--session` | not ported, deliberately |
+| `vcs branch` | `-d` / `--delete` | a write; cannot be ported |
+| `project list` | `--nix-only`, `--category` | not done — read-only filters, simply absent |
+
+`vcs branch -d` is a write and a read-only port cannot have it.
+`project list`'s two filters are the honest kind of gap: nothing argues
+against them, they are just not implemented, and the command already
+diverges in output format so no sweep row was ever going to notice.
+
+**`--published` is now accepted, and `--session` is not.** The two look
+symmetrical and are not. `--published` selects behaviour this port
+*has* — it is already the default — and it is the most portable of
+Python's three views, the only one needing no session at all. A script
+written `vcs log --published` worked against Python and exited 2 here,
+which is the opposite of what a port is for. `--session` asks for the
+current session's unpublished commits, which this port cannot produce;
+accepting it would promise session inclusion and silently deliver none.
+That is the same test `search content --no-fts` fails, and it is the
+whole rule: **a no-op flag is only harmful when the thing it names is
+absent.**
+
+Measured: `vcs log --published` is byte-identical to Python when your
+session has nothing pending, which is the state just after a publish.
+Python adds a one-line `N pending commit(s) in your session` advisory
+otherwise — `if visibility == 'published' and pending` — and that needs
+the session. So the sweep row passes when it can and is listed in
+`EXPECTED` for when it cannot, which is the one arrangement that never
+reports a false failure. `just check` runs before a publish, when
+pending is usually non-zero.
+
+One precedence difference, chosen rather than inherited: Python lets
+`--published` override `--all-sessions`, and here the two conflict and
+clap refuses the pair with exit 2. Reproducing the override would mean
+`--published` silently discarding the one view this port renders
+identically to Python's.
 
 ### `vcs log` has no session-scoped default, and says so
 

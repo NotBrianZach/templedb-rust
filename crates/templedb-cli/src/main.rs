@@ -306,6 +306,30 @@ enum VcsCmd {
         /// because it consults no session at all.
         #[arg(long)]
         all_sessions: bool,
+        /// Show only published commits — which is already the default
+        /// here.
+        ///
+        /// Accepted because it selects behaviour this port *has*, and
+        /// because it is the most portable of Python's three views: it
+        /// is the only one that needs no session. A script written
+        /// `vcs log --published` works against Python and exited 2
+        /// against this binary until 2026-10-21, which is the opposite
+        /// of the compatibility a port is for.
+        ///
+        /// Deliberately not the same decision as `search content`'s
+        /// `--no-fts`, which is *not* accepted. That one promises
+        /// different matching and would silently deliver none; this one
+        /// promises the published view and delivers exactly it. A no-op
+        /// flag is only harmful when the thing it names is absent.
+        ///
+        /// `--all-sessions` wins if both are passed, which is Python's
+        /// precedence inverted — its `--published` overrides
+        /// `--all-sessions`. Reproducing the inversion would mean
+        /// `--published` silently discarding the one view this port
+        /// renders identically; conflicting flags are better refused,
+        /// so clap refuses them.
+        #[arg(long, conflicts_with = "all_sessions")]
+        published: bool,
     },
     /// List branches, with the active one marked.
     ///
@@ -983,6 +1007,12 @@ fn run() -> Result<i32> {
                 n,
                 branch,
                 all_sessions,
+                // Accepted and intentionally unread: the published view
+                // is this port's default, so the flag names what the
+                // `else` arm below already does. Bound rather than
+                // matched with `..` so that adding a third view cannot
+                // quietly leave this one unhandled.
+                published: _,
             } => {
                 let p = resolve_project_row(&store, &project)?;
                 let visibility = if all_sessions {

@@ -583,7 +583,81 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
     }
 
     tx.commit().context("committing the mirror")?;
+
+    // `ANALYZE` after the copy, and deliberately *after* the commit.
+    //
+    // `COPY` does not update the planner's statistics, so until
+    // autovacuum gets round to it a freshly mirrored database plans from
+    // defaults — which for the 104 MB `content_blobs` means guessing at
+    // the size of the biggest table in the subset. It did not turn out
+    // to matter for the query that prompted the investigation (the plan
+    // was identical before and after), which is why this is a one-line
+    // repair rather than the subject of a measurement; what it buys is
+    // that the *next* query to go wrong is not wrong for this reason.
+    //
+    // Outside the transaction because statistics are not part of the
+    // copy's atomicity: a mirror that committed is correct whether or
+    // not it has been analysed, and holding the copy's locks through an
+    // `ANALYZE` of 210,000 rows would extend the one window in which
+    // the mirror is unreadable. Which is also why a failure here is not
+    // propagated — see below.
+    //
+    // A failed `ANALYZE` must not fail `mirror`. The data is committed
+    // and correct at that point; returning `Err` would report a
+    // successful copy as a failed one and send the caller to re-run a
+    // `TRUNCATE`. It is reported on stderr instead, which is where this
+    // crate's diagnostics go.
+    if let Err(e) = client.batch_execute("ANALYZE") {
+        eprintln!(
+            "mirror copied {} tables but ANALYZE failed: {e}",
+            reports.len()
+        );
+        eprintln!(
+            "the mirror is usable; the planner will work from defaults until autovacuum runs"
+        );
+    }
+
     Ok(reports)
+}
+
+/// The first `TEXT` column in this row holding a NUL, named along with
+/// the row's key so the offending row can be found.
+///
+/// `None` for every row in the live database but one, which is why the
+/// cost that matters is the scan and not the formatting.
+///
+/// Only `Value::Text` is checked. `Value::Blob` goes to a `BYTEA`
+/// column, where a NUL is an ordinary byte — `content_blob` carries
+/// plenty and must not be flagged.
+fn first_nul(row: &crate::value::Row, spec: &TableSpec) -> Option<String> {
+    for (i, name) in spec.columns.iter().enumerate() {
+        let Ok(Value::Text(s)) = row.value(i) else {
+            continue;
+        };
+        if !s.contains('\0') {
+            continue;
+        }
+        // The key, so the row is addressable. Rendered from the spec's
+        // own key columns rather than assuming an `id`, because
+        // `content_blobs` keys on a hash and `vcs_commit_parents` on a
+        // pair.
+        let key = spec
+            .key
+            .iter()
+            .filter_map(|k| {
+                let j = spec.columns.iter().position(|c| c == k)?;
+                let v = row.value(j).ok()?;
+                Some(match v {
+                    Value::Text(t) => format!("{k}={t}"),
+                    Value::Int(n) => format!("{k}={n}"),
+                    other => format!("{k}={other:?}"),
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("column {name} of row ({key})"));
+    }
+    None
 }
 
 fn copy_table(
@@ -645,6 +719,32 @@ fn copy_table(
             break;
         }
         for row in &rows {
+            // Postgres TEXT cannot hold U+0000 and SQLite TEXT can, so
+            // one real file in the live database stops this copy dead.
+            // The server's own diagnosis is
+            // `invalid byte sequence for encoding "UTF8": 0x00` with no
+            // table, no column and no row — and it arrives from
+            // `finish()`, after 104 MB has already streamed, so it does
+            // not even say which table was being written.
+            //
+            // Checking here costs one pass over the text columns and
+            // buys a message that names the row. The condition is not
+            // repaired, deliberately: every repair is a decision about
+            // what the mirror *means* — escape and unescape, move the
+            // text to `content_blob`, store the column as BYTEA, or
+            // skip the row — and three of the four change what a
+            // cross-backend digest compares. See *Known gaps*.
+            if let Some(detail) = first_nul(row, spec) {
+                // No table name here: the caller's `with_context`
+                // already says `mirroring content_blobs`.
+                anyhow::bail!(
+                    "{detail} contains a NUL (U+0000), which Postgres TEXT \
+                     cannot store and SQLite TEXT can.\n\
+                     The mirror cannot represent this row. See the README's \
+                     *Known gaps* — the repair is a representation decision, \
+                     not a bug fix."
+                );
+            }
             let values: Vec<&(dyn ToSql + Sync)> = (0..spec.columns.len())
                 .map(|i| row.value(i).map(|v| v as &(dyn ToSql + Sync)))
                 .collect::<Result<_>>()?;
@@ -677,6 +777,97 @@ mod tests {
 
     fn rec(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
         pairs.iter().map(|(t, n)| (t.to_string(), *n)).collect()
+    }
+
+    /// The `content_blobs` spec, which is the one that hits this in
+    /// practice: a TEXT column, a TEXT key, and a BYTEA column that
+    /// must *not* be flagged.
+    fn blobs_spec() -> &'static TableSpec {
+        TABLES
+            .iter()
+            .find(|t| t.name == "content_blobs")
+            .expect("content_blobs is in the subset")
+    }
+
+    /// A NUL in a TEXT column is named, with the row's key, so the
+    /// offending row is findable. Postgres reports only
+    /// `invalid byte sequence for encoding "UTF8": 0x00` from
+    /// `finish()`, after the whole table has streamed.
+    #[test]
+    fn a_nul_in_a_text_column_names_the_column_and_the_row() {
+        let row = crate::value::Row::new(vec![
+            Value::Text("ff4938cc03ca2b40".into()),
+            Value::Text("join('\0')".into()),
+            Value::Null,
+            Value::Text("text".into()),
+            Value::Int(13410),
+        ]);
+        let detail = first_nul(&row, blobs_spec()).expect("the NUL should be found");
+        assert_eq!(
+            detail,
+            "column content_text of row (hash_sha256=ff4938cc03ca2b40)"
+        );
+    }
+
+    /// A NUL in the BYTEA column is an ordinary byte. `content_blob`
+    /// holds binary files and most of them contain one, so flagging it
+    /// would refuse to mirror the database at all.
+    #[test]
+    fn a_nul_in_a_blob_column_is_not_a_problem() {
+        let row = crate::value::Row::new(vec![
+            Value::Text("abc".into()),
+            Value::Null,
+            Value::Blob(vec![0x7f, 0x45, 0x00, 0x00]),
+            Value::Text("application/octet-stream".into()),
+            Value::Int(4),
+        ]);
+        assert_eq!(first_nul(&row, blobs_spec()), None);
+    }
+
+    /// The common case: nothing to report, which is every row in the
+    /// live database but one.
+    #[test]
+    fn ordinary_text_passes() {
+        let row = crate::value::Row::new(vec![
+            Value::Text("abc".into()),
+            Value::Text("hello\nworld".into()),
+            Value::Null,
+            Value::Text("text".into()),
+            Value::Int(11),
+        ]);
+        assert_eq!(first_nul(&row, blobs_spec()), None);
+    }
+
+    /// A composite key renders both of its columns, because
+    /// `vcs_commit_parents` has no surrogate id to fall back on.
+    #[test]
+    fn a_composite_key_is_rendered_in_full() {
+        let spec = TABLES
+            .iter()
+            .find(|t| t.key.len() > 1)
+            .expect("vcs_commit_parents has a two-column key");
+        let row = crate::value::Row::new(
+            spec.columns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i == 0 {
+                        Value::Int(7)
+                    } else if i == 1 {
+                        Value::Int(9)
+                    } else {
+                        Value::Text("x\0y".into())
+                    }
+                })
+                .collect(),
+        );
+        let detail = first_nul(&row, spec);
+        // Only meaningful if that table has a text column at all; if it
+        // does not, there is nothing to find and that is also correct.
+        if let Some(detail) = detail {
+            assert!(detail.contains("=7"), "{detail}");
+            assert!(detail.contains("=9"), "{detail}");
+        }
     }
 
     #[test]

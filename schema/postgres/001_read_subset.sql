@@ -1,11 +1,11 @@
 -- TempleDB, Postgres: the objects the Rust port reads.
 --
 -- SCOPE. This is not the schema. The live SQLite database has 163
--- tables, 45 views, 61 triggers and 361 indexes; this file has nineteen
+-- tables, 45 views, 61 triggers and 361 indexes; this file has twenty-one
 -- tables and one view, because that is the entire set the Rust port
 -- touches today. The full translation is the next step toward Postgres
 -- as the primary store and belongs with the write-path design document,
--- not here: the remaining 144 tables have no reader in this codebase
+-- not here: the remaining 142 tables have no reader in this codebase
 -- yet, and mirroring data nothing reads would be work with no way to
 -- verify it.
 --
@@ -18,10 +18,13 @@
 -- boundary moves when a reader appears and not before: `vcs_sessions`
 -- arrived with `vcs log`'s default view, at two of its ten columns.
 --
--- `edit_intents` is the one exception to "follow the readers", and it
--- follows the same rule read sideways: nothing *reads* it here, a
--- writer *writes* it, and the columns carried are the ones that writer
--- supplies. Twelve of fourteen.
+-- Three tables are exceptions to "follow the readers", and they follow
+-- the same rule read sideways: nothing *reads* them here, a writer
+-- writes them, and the columns carried are the ones that writer
+-- supplies. `edit_intents` at twelve of fourteen, `vcs_working_state`
+-- at nine of eleven, and `vcs_commit_metadata` at three of forty —
+-- where the trim is not a boundary decision at all but the table's
+-- entire information content. See each table's own note.
 --
 -- Load with:  psql -d templedb -f schema/postgres/001_read_subset.sql
 -- Populate with:  templedb-rs mirror --to <url>
@@ -388,6 +391,79 @@ CREATE TABLE edit_intents (
 -- The provenance question is always "what happened to this file", so
 -- the index carries the pair and the time.
 CREATE INDEX edit_intents_file ON edit_intents (project_id, file_path, created_at DESC);
+
+-- Three columns of forty, and that is the table's whole information
+-- content rather than the usual follow-the-readers trim.
+--
+-- Measured 2026-10-24 over all 436 live rows: `intent`, `change_type`,
+-- `scope`, `tags`, `ai_tool`, `review_status` and `confidence_level` are
+-- non-NULL on ZERO rows, and `is_breaking` / `ai_assisted` are 0 on
+-- every one. They are reachable only through `commit --interactive` or
+-- an explicit flag, and nobody has ever passed one.
+--
+-- The one populated column is derived: `_collect_commit_metadata` sets
+-- `impact_level` from the staged file count — `'high'` above 50,
+-- `'medium'` above 20, else `'low'` (410 low, 18 medium, 8 high). So the
+-- table is a bucketed count, once per commit, read by nothing. Same
+-- shape as `vcs log`'s `files_changed`, except stored.
+CREATE TABLE vcs_commit_metadata (
+    id            bigint PRIMARY KEY,
+    -- UNIQUE in the live schema and reproduced: one metadata row per
+    -- commit. The FK is declared because `vcs_commits` loads first and
+    -- a metadata row for a pruned commit is not a state the live
+    -- database can reach — the live FK is ON DELETE CASCADE.
+    commit_id     bigint NOT NULL UNIQUE REFERENCES vcs_commits(id) ON DELETE CASCADE,
+    impact_level  text COLLATE "C",
+    created_at    text COLLATE "C" NOT NULL
+);
+
+-- Staging. Nothing in the port reads it yet: it arrives with
+-- `file set --stage`, whose only consumer is `vcs commit`. The second
+-- table here carried for a writer rather than a reader, after
+-- `edit_intents` — see the TempleDB report *vcs commit: the widest
+-- door, measured*.
+--
+-- `content_text` and `content_blob` are deliberately absent. What
+-- `vcs commit` reads is the staged *hash*, and those columns hold the
+-- workspace's copy of bytes `content_blobs` already stores under that
+-- hash. Carrying them would store staged content twice, on top of the
+-- `text_lower` copy `content_blobs` already pays for.
+CREATE TABLE vcs_working_state (
+    id                   bigint PRIMARY KEY,
+    project_id           bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    -- No FK on `branch_id` or `file_id`, though the live schema
+    -- declares both ON DELETE CASCADE. `file_id` is the one that
+    -- matters: `sync_engine` and some migrations bulk-delete with FK
+    -- enforcement off, so rows pointing at a reaped `project_files`
+    -- row are a state the live database reaches — it is why
+    -- `vcs commit` carries a defensive orphan reap and why
+    -- `working_state_references_valid_files` is an invariant check. A
+    -- mirror enforcing the constraint would refuse to load real data.
+    branch_id            bigint NOT NULL,
+    file_id              bigint NOT NULL,
+    content_hash         text COLLATE "C",
+    -- 'unmodified' | 'modified' | 'added' | 'deleted' | 'conflict'.
+    -- CHECK'd nowhere in the live schema either; the comment there is
+    -- the only constraint.
+    state                text COLLATE "C" NOT NULL DEFAULT 'unmodified',
+    last_modified        text COLLATE "C" NOT NULL,
+    -- NULL means NOT STAGED, not "staged by nobody". Migration 083
+    -- dropped the `staged` BOOLEAN in favour of this column, and
+    -- `unstage_files` is literally `SET staged_by_session_id = NULL`.
+    -- No FK to `vcs_sessions`: the default reap policy orphans these
+    -- rows by design, and `vcs session prune` does not consult them.
+    staged_by_session_id bigint,
+    -- migration 088, so a provenance query can join a staged row to
+    -- the `edit_intents` row that produced it. No FK, matching the
+    -- live NO ACTION — nothing nulls it when an intent goes.
+    intent_id            bigint,
+    UNIQUE (project_id, branch_id, file_id)
+);
+
+-- The staged-rows lookup `vcs commit` and `publish` both make.
+CREATE INDEX vcs_working_state_staged
+    ON vcs_working_state (staged_by_session_id)
+    WHERE staged_by_session_id IS NOT NULL;
 
 CREATE TABLE entities (
     id               bigint PRIMARY KEY,

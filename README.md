@@ -993,7 +993,7 @@ Differences that are not deliberate and are not yet closed.
   Python calls the link cosmetic — "the commit path doesn't need it, but
   downstream provenance queries do" — so the gap is in those queries,
   not in the write.
-- **The Postgres schema covers 19 tables and 1 view.** That is the whole
+- **The Postgres schema covers 21 tables and 1 view.** That is the whole
   set the port reads, out of 163 tables and 45 views. Columns are
   likewise limited to the ones the queries name — four of
   `ingestion_runs`'s fourteen, three of `fleet_machines`'s
@@ -1003,6 +1003,24 @@ Differences that are not deliberate and are not yet closed.
   does: `project list`'s two filters added `is_nix_project` and
   `project_category` on 2026-10-21, and `vcs log`'s default view added
   `vcs_sessions` on 2026-10-23.
+- **Three of the 21 tables have no reader at all**, which is the one
+  place the rule above reads sideways: `edit_intents` (12 of 14 columns),
+  `vcs_working_state` (9 of 11) and `vcs_commit_metadata` (3 of 40) are
+  carried for a *writer*. The first is written today; the other two
+  arrive with `file set --stage` and `vcs commit`, so for now the only
+  thing verifying them is the cross-backend digest over the copy. That
+  is a weaker claim than every other table here has, and it is stated
+  rather than left to be inferred from a passing sweep.
+- **`vcs_commit_metadata` is 3 of 40 columns because 37 are unanimously
+  empty**, not because the port is being frugal. Measured over all 436
+  live rows: `intent`, `change_type`, `scope`, `tags`, `ai_tool`,
+  `review_status` and `confidence_level` are non-NULL on *zero* rows,
+  and `is_breaking` / `ai_assisted` are 0 on every one — they are
+  reachable only through `commit --interactive` or an explicit flag and
+  nobody has ever passed one. The single populated column is derived:
+  `impact_level` is `'high'` above 50 staged files, `'medium'` above 20,
+  else `'low'` (410 / 18 / 8). It is `vcs log`'s `files_changed` again —
+  a count computed and read by nothing — except this one is stored.
 
 ## Building
 
@@ -1132,7 +1150,15 @@ mirrored table rather than the live file — so a pinned session resolves
 the same through the replica as through SQLite, which is the property
 `file set --session` will stand on.
 
-Re-measured again the same day with `edit_intents`: **54 of 54
+Re-measured 2026-10-24 with `vcs_working_state` and
+`vcs_commit_metadata`: **54 of 54 invocations, 7 of 7 panes, 20 of 20
+flag surfaces, 8 of 8 filters**, and **all 21 tables digest identically
+over 222,890 rows**. Three of those 21 now have no reader at all, so
+the digest over the copy is the only thing verifying them until
+`file set --stage` and `vcs commit` land — a weaker claim than the
+other eighteen carry, and named as such in *Known gaps*.
+
+Re-measured earlier the same week with `edit_intents`: **54 of 54
 invocations, 7 of 7 panes, 20 of 20 flag surfaces, 8 of 8 filters**, and
 **all 19 tables digest identically over 217,919 rows**. Nothing reads
 `edit_intents` here, so what the digest covers is the copy itself — the
@@ -1156,7 +1182,7 @@ interrupted run must not leave counts vouching for a copy that rolled
 back.
 
 ```bash
-just pg-check         # fresh: all 19 tables match the source
+just pg-check         # fresh: all 21 tables match the source
 just mirror-refresh   # when it isn't
 just sweep-pg-fresh   # refresh, then sweep -- the form to actually use
 ```
@@ -1623,6 +1649,42 @@ Writes last, and only once the read layer is trusted.
     The name path creates when absent, and a port that creates session
     rows has no read-only guarantee left to argue from. See *Sessions*
     below for the whole argument and what it cost.
+
+19. **Done** — `vcs_working_state` and `vcs_commit_metadata`, the 20th
+    and 21st mirrored tables, and step 1 of the TempleDB report
+    *vcs commit: the widest door, measured* (2026-10-24). Both are
+    carried for a writer with no reader yet, which the report argues is
+    the right order: `file set --stage` is blocked on the first and
+    `vcs commit` consumes both, so mirroring them is what makes the pair
+    verifiable by cross-read rather than by assertion.
+
+    Measuring commit to write that report is what moved the numbers.
+    The sessions report had guessed "six remaining guards, four tables";
+    it is **seven tables written and nine guards**, and
+    `project_files` is the one to notice — commit is the only path in
+    the system that *hard-deletes* a `project_files` row, which is why
+    `file set` needed an un-delete guard at all.
+
+    Two findings are in the report and worth the pointer. **The branch
+    head is advanced by a trigger**, and the port has none of the live
+    database's 61 — so a faithful port of the *code* leaves the head
+    frozen, and the fix is the application-level compare-and-swap that
+    Python's own comment records as having been buggy *because the
+    trigger beat it to the column*. A port without the trigger is the
+    only implementation that can do that CAS correctly: the first place
+    "reproduce Python" and "reproduce Python's behaviour" come apart,
+    and the first mirrored table whose contents would be produced by
+    different mechanisms on the two backends rather than by a copy.
+
+    And **five of the nine guards reconcile a filesystem**, not a
+    database. The report's recommendation is therefore to split the
+    command: port the staged-rows write and refuse the tree-dependent
+    half explicitly, which is what `publish` already does — its guard
+    is `COUNT(*) … WHERE staged_by_session_id IS NOT NULL` and it
+    commits without scanning anything.
+
+    Measured: **all 21 tables digest identically across both backends
+    over 222,890 rows**, 54 of 54 invocations on both axes.
 
 ### The state digest, and why it must not sort
 

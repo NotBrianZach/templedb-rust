@@ -142,6 +142,32 @@ CREATE TABLE vcs_commit_parents (
     PRIMARY KEY (commit_id, parent_commit_id)
 );
 
+-- Three of forty columns, which is the whole of what the live table
+-- holds: only `impact_level` is ever populated and it is a bucketed
+-- file count. See the Postgres subset.
+CREATE TABLE vcs_commit_metadata (
+    id           INTEGER PRIMARY KEY,
+    commit_id    INTEGER NOT NULL UNIQUE,
+    impact_level TEXT,
+    created_at   TEXT NOT NULL
+);
+
+-- Staging. Carried so the mirror and the digest have the same shape on
+-- both sides; `file set --stage` and `vcs commit` are its readers and
+-- neither is ported yet.
+CREATE TABLE vcs_working_state (
+    id                   INTEGER PRIMARY KEY,
+    project_id           INTEGER NOT NULL,
+    branch_id            INTEGER NOT NULL,
+    file_id              INTEGER NOT NULL,
+    content_hash         TEXT,
+    state                TEXT NOT NULL DEFAULT 'unmodified',
+    last_modified        TEXT NOT NULL,
+    staged_by_session_id INTEGER,
+    intent_id            INTEGER,
+    UNIQUE(project_id, branch_id, file_id)
+);
+
 -- `file set`'s provenance record. Written by the Postgres writer and
 -- never read here, so the fixture carries it only so the mirror's
 -- pagination and the cross-backend digest have the same shape on both
@@ -512,6 +538,27 @@ INSERT INTO vcs_commit_parents (commit_id, parent_commit_id, parent_order) VALUE
     (14, 12, 0),
     (19, 12, 1),
     (19, 11, 0);
+
+-- One metadata row per commit for two of the commits, so the digest has
+-- rows and the UNIQUE(commit_id) is exercised. `low` and `medium` so
+-- both ends of the bucketing are present.
+INSERT INTO vcs_commit_metadata (id, commit_id, impact_level, created_at) VALUES
+    (1, 11, 'low',    '2026-02-01 00:00:00'),
+    (2, 12, 'medium', '2026-02-02 00:00:00');
+
+-- Staged and unstaged rows on one branch, which is the distinction
+-- every reader of this table makes. Row 1 is staged by session 7; row 2
+-- is `modified` with a NULL owner, which means NOT STAGED and is the
+-- state `vcs session reconcile`'s default `orphan_stages` policy
+-- produces; row 3 is `unmodified`, the resting state of 1,764 of the
+-- 1,886 live rows.
+INSERT INTO vcs_working_state
+    (id, project_id, branch_id, file_id, content_hash, state,
+     last_modified, staged_by_session_id, intent_id)
+VALUES
+    (1, 1, 1, 1, 'h-main',     'modified',   '2026-10-05 00:00:00', 7,    2),
+    (2, 1, 1, 4, 'h-readme-a', 'modified',   '2026-10-05 00:00:00', NULL, NULL),
+    (3, 1, 1, 2, NULL,         'unmodified', '2026-10-05 00:00:00', NULL, NULL);
 
 -- Two intents on one file, so the digest has more than one row and the
 -- `(project_id, file_path, created_at DESC)` ordering has something to

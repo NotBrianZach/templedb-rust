@@ -253,6 +253,36 @@ pub(crate) const TABLES: &[TableSpec] = &[
         key: &["commit_id", "parent_commit_id"],
         page: 2000,
     },
+    // After `vcs_commits`, which it references with a UNIQUE FK.
+    //
+    // **Three columns of forty**, and that is not the usual
+    // follow-the-readers trim — it is the whole information content of
+    // the table. Measured 2026-10-24 over all 436 live rows: `intent`,
+    // `change_type`, `scope`, `tags`, `ai_tool`, `review_status` and
+    // `confidence_level` are non-NULL on ZERO rows, and `is_breaking`
+    // and `ai_assisted` are 0 on every one. They are reachable only
+    // through `commit --interactive` or an explicit flag, and nobody
+    // has ever passed one.
+    //
+    // The one column that is populated is **derived**:
+    // `_collect_commit_metadata` sets `impact_level` to `'high'` when
+    // `added + modified + deleted > 50`, `'medium'` above 20, else
+    // `'low'`. So the table is a bucketed file count, once per commit —
+    // 410 low, 18 medium, 8 high.
+    //
+    // Carried anyway rather than skipped, because the cross-backend
+    // digest should cover what the live database holds; what is *not*
+    // carried is 37 columns of unanimous NULL. This is the same shape as
+    // `vcs log`'s `files_changed` — a count computed and discarded —
+    // except here it is computed, bucketed, stored, and still read by
+    // nothing.
+    TableSpec {
+        name: "vcs_commit_metadata",
+        columns: &["id", "commit_id", "impact_level", "created_at"],
+        types: &[Type::INT8, Type::INT8, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 2000,
+    },
     // After `projects`, which it references. The one table here that
     // exists for a writer rather than a reader, so its projection is
     // the columns `record_intent` supplies rather than the columns a
@@ -287,6 +317,54 @@ pub(crate) const TABLES: &[TableSpec] = &[
             Type::TEXT,
             Type::TEXT,
             Type::TEXT,
+        ],
+        key: &["id"],
+        page: 2000,
+    },
+    // Last of the VCS group, and after `edit_intents` on purpose:
+    // `intent_id` points at it (migration 088). The FK is not declared
+    // in the subset — `vcs_working_state.intent_id` is NO ACTION live
+    // and nothing nulls it — but the load order follows the reference
+    // anyway, so the file reads in dependency order even where the
+    // dependency is not enforced.
+    //
+    // Staging, and the table `vcs commit` consumes. Nothing in the port
+    // reads it yet; it arrives with `file set --stage`, whose only
+    // consumer is the commit path. So this is the second table carried
+    // for a writer rather than a reader, after `edit_intents`. See the
+    // TempleDB report *vcs commit: the widest door, measured*.
+    //
+    // `content_text` and `content_blob` are NOT carried. The staged
+    // *hash* is what `vcs commit` reads — "content_hash in working_state
+    // is the hash of the file on disk (set by detect_changes /
+    // refresh). Use it for the commit" — and those two columns are the
+    // workspace's copy of bytes `content_blobs` already holds under
+    // that hash. Mirroring them would store the staged content twice
+    // for no reader, on top of the `text_lower` copy
+    // `content_blobs` already pays for.
+    TableSpec {
+        name: "vcs_working_state",
+        columns: &[
+            "id",
+            "project_id",
+            "branch_id",
+            "file_id",
+            "content_hash",
+            "state",
+            "last_modified",
+            "staged_by_session_id",
+            "intent_id",
+        ],
+        types: &[
+            Type::INT8,
+            Type::INT8,
+            Type::INT8,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::INT8,
+            Type::INT8,
         ],
         key: &["id"],
         page: 2000,

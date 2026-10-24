@@ -180,6 +180,21 @@ pub(crate) const TABLES: &[TableSpec] = &[
         key: &["id"],
         page: 2000,
     },
+    // Before `vcs_commits` by convention rather than by constraint:
+    // `session_id` declares no foreign key here, because `vcs session
+    // prune` can delete a session whose commits still name it. Ordered
+    // this way so the file reads in dependency order even where the
+    // dependency is not enforced.
+    TableSpec {
+        name: "vcs_sessions",
+        // Two columns of ten. `session.rs` asks exactly one question of
+        // this table — is the id the caller named still live — so `id`
+        // and `ended_at` are what it carries.
+        columns: &["id", "ended_at"],
+        types: &[Type::INT8, Type::TEXT],
+        key: &["id"],
+        page: 2000,
+    },
     TableSpec {
         name: "vcs_commits",
         columns: &[
@@ -236,6 +251,44 @@ pub(crate) const TABLES: &[TableSpec] = &[
         // No surrogate key; this is the join table's own primary key.
         // See the note on `TableSpec::key`.
         key: &["commit_id", "parent_commit_id"],
+        page: 2000,
+    },
+    // After `projects`, which it references. The one table here that
+    // exists for a writer rather than a reader, so its projection is
+    // the columns `record_intent` supplies rather than the columns a
+    // query names — twelve of fourteen, with `cancelled_at` and
+    // `applied_commit_id` left to `intent cancel` and `vcs commit`.
+    TableSpec {
+        name: "edit_intents",
+        columns: &[
+            "id",
+            "session_id",
+            "project_id",
+            "file_path",
+            "base_revision",
+            "new_content_hash",
+            "patch_summary",
+            "author",
+            "description",
+            "status",
+            "created_at",
+            "applied_at",
+        ],
+        types: &[
+            Type::INT8,
+            Type::INT8,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+        ],
+        key: &["id"],
         page: 2000,
     },
     TableSpec {
@@ -642,9 +695,9 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
 ///
 /// Kept beside [`TABLES`] rather than derived from it because being an
 /// identity column is a property of the DDL, not of the copy, and a
-/// table gains one only when a write path needs it. Two today; the list
-/// grows with the writer.
-const IDENTITY_TABLES: &[&str] = &["project_files", "file_contents"];
+/// table gains one only when a write path needs it. Three today; the
+/// list grows with the writer.
+const IDENTITY_TABLES: &[&str] = &["project_files", "file_contents", "edit_intents"];
 
 /// `setval` each identity sequence to the table's current `MAX(id)`.
 ///
@@ -1036,6 +1089,7 @@ mod tests {
         before("project_files", "file_contents");
         before("content_blobs", "file_contents");
         before("projects", "vcs_commits");
+        before("projects", "edit_intents");
         before("vcs_commits", "vcs_file_states");
         before("entities", "relations");
     }

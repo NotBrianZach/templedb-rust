@@ -138,7 +138,7 @@ fn or_else<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
 }
 
 /// Render every pane, at the instant given.
-pub fn render(facts: &SummaryFacts, clock: &Clock, session_id: &str, color: bool) -> Vec<String> {
+pub fn render(facts: &SummaryFacts, clock: &Clock, addressee: &str, color: bool) -> Vec<String> {
     let p = Paint { color };
     let mut out = Vec::new();
 
@@ -154,7 +154,7 @@ pub fn render(facts: &SummaryFacts, clock: &Clock, session_id: &str, color: bool
     reconciliations(&mut out, facts, clock, p);
     fleet(&mut out, facts, clock, p);
     hygiene(&mut out, facts, p);
-    handoffs(&mut out, facts, session_id, p);
+    handoffs(&mut out, facts, addressee, p);
 
     out.push(String::new());
     out
@@ -574,7 +574,13 @@ fn hygiene(out: &mut Vec<String>, facts: &SummaryFacts, p: Paint) {
     ));
 }
 
-fn handoffs(out: &mut Vec<String>, facts: &SummaryFacts, session_id: &str, p: Paint) {
+/// `addressee` is the handoff *address* — the string the notes were
+/// sent to — and `inbox` below is the counts. Two names because the
+/// parameter was `session_id` and the local was `inbox`, which made a
+/// `{inbox}` in the format string below silently mean the wrong one;
+/// the compiler caught it, which it would not have done had both been
+/// strings.
+fn handoffs(out: &mut Vec<String>, facts: &SummaryFacts, addressee: &str, p: Paint) {
     out.push(String::new());
     out.push(p.c("── Handoff inbox ──", Colour::Accent));
     let inbox = &facts.handoffs;
@@ -587,7 +593,7 @@ fn handoffs(out: &mut Vec<String>, facts: &SummaryFacts, session_id: &str, p: Pa
     }
     if inbox.direct != 0 {
         out.push(format!(
-            "  {} unacked note(s) for session {session_id}",
+            "  {} unacked note(s) for session {addressee}",
             p.c(&inbox.direct.to_string(), Colour::Yellow),
         ));
     }
@@ -600,7 +606,7 @@ fn handoffs(out: &mut Vec<String>, facts: &SummaryFacts, session_id: &str, p: Pa
     out.push(format!(
         "  {}",
         p.c(
-            &format!("view: templedb handoff list --for {session_id}"),
+            &format!("view: templedb handoff list --for {addressee}"),
             Colour::Muted
         ),
     ));

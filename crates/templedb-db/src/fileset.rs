@@ -17,24 +17,23 @@
 //! Stated first, because the design document's sharpest finding is that
 //! **the guards are the deliverable** — "a port that reproduces the SQL
 //! and not these is a regression even if every byte of output matches".
-//! This reproduces the SQL and two of the guards. The rest are absent,
-//! and the writer is behind an opt-in
+//! This reproduces the SQL and five of the seven guards. The rest are
+//! absent, and the writer is behind an opt-in
 //! ([`OPT_IN_ENV`](crate::OPT_IN_ENV)) precisely because that is not
 //! visible from a command line:
 //!
 //! | absent | what it protects against |
 //! |---|---|
-//! | the mojibake guard | UTF-8 read as Latin-1 and written back; valid UTF-8 all the way down, so nothing downstream notices. `bza`'s `page.tsx` shipped that way for two weeks |
-//! | `edit_intents` | provenance — who set this, when, from which session. Its table is outside the mirrored subset |
-//! | auto-staging and `--stage` | needs sessions, which the port does not have |
+//! | auto-staging and `--stage` | needs a staged-by session, and a decision about what an unpinned `--stage` should own |
+//! | `--session` | the pin is resolved; nothing here reads it yet |
 //! | `--commit` / `-m` | needs `vcs commit`, which is the step after this one |
-//! | `--verify` | reads back `is_current` after the write. Cheap to add and not yet added |
 //! | `deploy_stage_runs` | chain observability; outside the subset |
 //! | binary content | Python falls back to `content_blob` for undecodable stdin. This takes text only |
 //!
-//! Two guards *are* here: `--if-match` optimistic concurrency, and the
-//! un-delete that revives a soft-deleted row. Both are below, with the
-//! incidents that produced them.
+//! Five guards *are* here: `--if-match` optimistic concurrency, the
+//! un-delete that revives a soft-deleted row, the mojibake check,
+//! `--verify`, and the `edit_intents` record. Each is below with the
+//! incident that produced it.
 //!
 //! # Postgres, not the live SQLite
 //!
@@ -48,6 +47,7 @@ use sha2::{Digest, Sha256};
 
 use crate::clock::Clock;
 use crate::pgtext;
+use crate::session::SessionId;
 
 /// What a write did, for the caller to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,11 @@ pub struct SetOutcome {
     pub created: bool,
     pub size_bytes: i64,
     pub line_count: i64,
+    /// The `edit_intents` row this write recorded, or `None` when
+    /// `--skip-intent` was passed. Python prints it as `intent: #N` "so
+    /// scripted callers can inspect / cancel it later", which is the
+    /// only reason it is carried out of here.
+    pub intent_id: Option<i64>,
 }
 
 /// sha256 of the UTF-8 bytes, lowercase hex — the same digest Python
@@ -356,6 +361,17 @@ pub struct SetOptions<'a> {
     pub if_match: Option<&'a str>,
     /// Skip the double-encoding guard.
     pub allow_mojibake: bool,
+    /// Do not record an `edit_intents` row. Python's `--skip-intent`.
+    pub skip_intent: bool,
+    /// The session this write belongs to, if the caller pinned one.
+    /// Stored on the intent and nothing else — `--stage` is what would
+    /// make it mean more, and that is not ported.
+    pub session: Option<SessionId>,
+    /// `edit_intents.author`: `TEMPLEDB_AUTHOR`, then `USER`, then
+    /// NULL. Resolved at the entry point rather than read here, for the
+    /// reason the clock and the session are — a query module that reads
+    /// the environment cannot be tested at a fixed value.
+    pub author: Option<&'a str>,
 }
 
 /// The `is_current` content *text* for one path, for the mojibake
@@ -402,12 +418,118 @@ fn current_hash(
     Ok(row.map(|r| r.get::<_, String>(0)))
 }
 
+/// What the write just did, for the intent to describe.
+///
+/// A struct rather than four more parameters: `record_intent` would
+/// otherwise take eight, and `(.., &hash, size, previous)` at the one
+/// call site says nothing about which `i64` is which.
+struct Wrote<'a> {
+    file_path: &'a str,
+    hash: &'a str,
+    size_bytes: i64,
+    previous: Option<&'a str>,
+}
+
+/// Record this write in `edit_intents` and return the row's id.
+///
+/// Guard five of seven, and the one the design document describes as
+/// provenance: "who set this, when, from which session". Python's
+/// `_record_and_apply_intent`, with the same column values and a
+/// different failure contract — see below.
+///
+/// # Inside the transaction, where Python's is after it
+///
+/// This is the one place the port deliberately departs from Python's
+/// *structure* rather than from a value, so the reasoning matters.
+///
+/// Python records the intent **after** the write, in its own `execute`,
+/// and swallows every error: "intent recording must not break the write
+/// path". The ordering is load-bearing over there and the comment says
+/// why — the prior arrangement wrote the intent first and caused the
+/// 2026-09-14 *intent applied but `file cat` returns nothing* bug, where
+/// a failed write left a `status = 'applied'` row that survived the
+/// abort and lied to every later provenance query.
+///
+/// This port has something Python does not: the write is already one
+/// transaction across three tables. Putting the intent inside it makes
+/// that bug **unreachable by construction** rather than by ordering —
+/// either the write and its provenance both exist or neither does, and
+/// no sequence of failures can produce the lying row. The cost is the
+/// property Python chose instead: here an intent failure *does* fail the
+/// write.
+///
+/// That trade is the right way round for this command. A silent
+/// provenance gap is exactly what the stale-base overwrite of
+/// 2026-10-04 had no trace of, and `file set` is opt-in, partial and
+/// behind an environment variable — a caller who wants the write without
+/// the record can say so with `--skip-intent`, which is louder than
+/// discovering later that the row is missing.
+fn record_intent(
+    tx: &mut postgres::Transaction<'_>,
+    now: &str,
+    project_id: i64,
+    wrote: &Wrote<'_>,
+    opts: &SetOptions<'_>,
+) -> Result<i64> {
+    let Wrote {
+        file_path,
+        hash,
+        size_bytes,
+        previous,
+    } = *wrote;
+    // `'new-file'` rather than NULL when there is no prior content,
+    // which is Python's choice and a considered one: the two cases stay
+    // distinguishable from a column that is merely unfilled. Worth
+    // keeping because the column spent 886 rows holding the literal
+    // `'current'` — migration 123 catalogues it as a constant — so "the
+    // field designed to record what an edit was made against never
+    // recorded anything", and a stale-base overwrite left nothing to
+    // audit.
+    let base_revision = previous.unwrap_or("new-file");
+    // Python's `f"{len(content_bytes)} bytes"`, byte count and not
+    // character count.
+    let patch_summary = format!("{size_bytes} bytes");
+    // `session_id` comes from the resolved pin, not from a second read
+    // of the environment — and that is a real difference. Python's
+    // intent path does *not* call `get_current_session()`; it reads
+    // `TEMPLEDB_SESSION_ID` directly and swallows a parse failure to
+    // NULL, so it will happily record an id for a session that has
+    // ended. This records a live id or NULL, because there is one
+    // resolver in this port and it checks liveness.
+    let session = opts.session.map(SessionId::get);
+    // `description` is the literal `'file set'` on Python's side: the
+    // column says which surface made the edit, and this is that
+    // surface. `status` is `'applied'` because the write above has
+    // already happened — in this transaction, which is what makes the
+    // claim true rather than hopeful.
+    let row = tx.query_one(
+        "INSERT INTO edit_intents
+             (session_id, project_id, file_path, base_revision,
+              new_content_hash, patch_summary, author, description,
+              status, created_at, applied_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'file set', 'applied', $8, $8)
+         RETURNING id",
+        &[
+            &session,
+            &project_id,
+            &file_path,
+            &base_revision,
+            &hash,
+            &patch_summary,
+            &opts.author,
+            &now,
+        ],
+    )?;
+    Ok(row.get(0))
+}
+
 /// Write `content` as the current contents of `project_id`/`file_path`.
 ///
 /// Mirrors Python's `_write_content_to_db` across three tables, in the
-/// order Python uses, inside one transaction. The ordering is not
-/// incidental: the blob has to exist before a `file_contents` row
-/// references its hash.
+/// order Python uses, inside one transaction — plus the `edit_intents`
+/// record, which makes four. The ordering is not incidental: the blob
+/// has to exist before a `file_contents` row references its hash, and
+/// the intent goes last because it asserts that the write happened.
 pub fn set_file(
     tx: &mut postgres::Transaction<'_>,
     clock: &Clock,
@@ -520,6 +642,25 @@ pub fn set_file(
         &[&file_id, &hash, &size_bytes, &lines, &now],
     )?;
 
+    // Last, and inside the same transaction. See `record_intent` for
+    // why that differs from Python's ordering and what it buys.
+    let intent_id = if opts.skip_intent {
+        None
+    } else {
+        Some(record_intent(
+            tx,
+            &now,
+            project_id,
+            &Wrote {
+                file_path,
+                hash: &hash,
+                size_bytes,
+                previous: previous.as_deref(),
+            },
+            opts,
+        )?)
+    };
+
     Ok(SetOutcome {
         unchanged: previous.as_deref() == Some(hash.as_str()),
         hash,
@@ -528,6 +669,7 @@ pub fn set_file(
         created,
         size_bytes,
         line_count: lines,
+        intent_id,
     })
 }
 

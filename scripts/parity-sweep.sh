@@ -75,18 +75,27 @@ INVOCATIONS=(
     "source snapshot templedb src/cli/commands/entity.py --meta"
     "source snapshot templedb CHANGELOG.md --rev fff643edfa4a --meta"
     "vcs log templedb --all-sessions -n 10"
-    # The default view, which Python widens with your staging session's
-    # commits and this port does not. A deliberate divergence, kept in
-    # the sweep so that it stays *visible* rather than forgotten.
+    # The default view: published plus the pinned session's commits. Both
+    # implementations are pinned to the same live session by
+    # TEMPLEDB_SESSION_ID below, which is what makes this row diffable at
+    # all — unpinned, Python guesses from the process tree and creates a
+    # row, and this port declines.
+    #
+    # `templedb` is normally the *left-half-only* case: it has far more
+    # commits than `-n 10` shows, so a session's own ones are almost
+    # always below the cutoff and the default view equals the published
+    # one. The union's right half is covered by the rows the pin block
+    # appends, against a project discovered to have some. Both cases
+    # matter and neither can be hardcoded, because which sessions own
+    # what changes daily.
     "vcs log templedb -n 10"
-    # The published view, which needs no session on either side and is
-    # this port's default. Byte-identical exactly when your session has
-    # nothing pending: Python's `if visibility == 'published' and
-    # pending` adds a one-line advisory otherwise, and `just check` runs
-    # *before* a publish, which is when pending is non-zero. So this row
-    # passes when it can and is listed in EXPECTED for when it cannot —
-    # the one arrangement that never reports a false failure.
     "vcs log templedb --published -n 10"
+    # Python's `--session` is a deprecated no-op — the view it asks for
+    # is the default — and so is this port's. The row exists because
+    # "accepted and ignored" is exactly the claim that rots silently: a
+    # version that made the flag mean something would still pass every
+    # other row here.
+    "vcs log templedb --session -n 10"
     "vcs branch templedb"
     # Three blobs typed text/x-prolog: the misclassification case.
     "vcs show templedb 40E93339139FA809 --no-color"
@@ -144,13 +153,107 @@ EXPECTED=(
     "project list"
     # Python's query has no ORDER BY; this sorts. See the README.
     "entity explore"
-    # Python's default view includes your staging session's commits.
-    "vcs log templedb -n"
-    # Only when the session has pending commits; see the row's comment.
-    "vcs log templedb --published"
     # Substring not stemmed, and a different layout.
     "search content"
 )
+
+# Pin both implementations to the same live VCS session.
+#
+# The session-scoped rows above are not comparable without a pin, in
+# either direction: Python resolves "your session" through seven steps,
+# four of which guess from the process tree and two of which **insert a
+# row**, while this port resolves only what the caller named. Pinning
+# `TEMPLEDB_SESSION_ID` is step 1 on Python's side and outranks all the
+# guessing — including `TEMPLEDB_SESSION`, which the agent wrapper this
+# is usually run under exports.
+#
+# The id comes from Python's own `vcs session list --active`, because
+# that is the authority on which sessions exist and this script must not
+# create one. Parsing another implementation's table is normally a bad
+# idea; it is defensible here because the session identity is not what is
+# being diffed — it is the fixture the diff runs against.
+#
+# Then a project is chosen *with* it, and that is the part worth
+# explaining. Any live session makes the fixed rows diffable, but a
+# session owning nothing exercises only the left half of
+# `session_id IS NULL OR session_id = ?` — and an implementation that
+# dropped the right half entirely would still pass every such row. So the
+# pair is searched for: the first (session, project) whose default view
+# carries an `(unpublished)` line, which is the only visible evidence
+# that the union contributed anything.
+#
+# Searched rather than hardcoded because it cannot be fixed in advance.
+# A session's commits sink below `-n 10` as a project gains history and
+# vanish entirely when it is published, so any pair written down here
+# would stop covering the branch without failing.
+SESSION_PROJECTS=(woofs_projects templedb-rust bza templedb nixos_anywhere_vultr_woofs)
+owns_project=""
+if [[ -z ${TEMPLEDB_SESSION_ID:-} ]]; then
+    mapfile -t live_sessions < <(templedb vcs session list --active 2>/dev/null \
+        | awk 'NR > 1 && $2 == "active" { print $1 }' | head -50)
+    # Asked as "does the default view carry an `(unpublished)` line",
+    # not as "does it differ from the published view". The two always
+    # differ — their header labels do — and the first version of this
+    # probe compared whole outputs and so reported every candidate as
+    # owning commits. Probed with this port alone: the question is
+    # whether the fixture reaches the branch, not whether the two
+    # implementations agree about it, and asking Python would mean
+    # letting it create a session for no extra information.
+    for cand in "${live_sessions[@]}"; do
+        for proj in "${SESSION_PROJECTS[@]}"; do
+            if TEMPLEDB_SESSION_ID=$cand "$RS" vcs log "$proj" -n 10 2>/dev/null \
+               | grep -q '(unpublished)$'
+            then
+                TEMPLEDB_SESSION_ID=$cand
+                owns_project=$proj
+                break 2
+            fi
+        done
+    done
+    # No pair found, which is the normal state just after a publish. The
+    # newest live session still makes the fixed rows diffable.
+    TEMPLEDB_SESSION_ID="${TEMPLEDB_SESSION_ID:-${live_sessions[0]:-}}"
+fi
+
+if [[ -n ${TEMPLEDB_SESSION_ID:-} ]]; then
+    export TEMPLEDB_SESSION_ID
+    if [[ -n $owns_project ]]; then
+        # The union's right half, on a project the pinned session owns
+        # commits in. Three rows, so the published view and the no-op
+        # flag are diffed against the same non-trivial fixture — and so
+        # that the advisory line, which only appears under `--published`
+        # with a non-zero count, is diffed at all.
+        INVOCATIONS+=(
+            "vcs log $owns_project -n 10"
+            "vcs log $owns_project --published -n 10"
+            "vcs log $owns_project --session -n 10"
+        )
+        printf 'pinned    TEMPLEDB_SESSION_ID=%s, which owns unpublished commits in %s\n' \
+            "$TEMPLEDB_SESSION_ID" "$owns_project"
+    else
+        # Loud, because the rows below will all pass and three of them
+        # will have checked less than they look like they checked.
+        printf 'pinned    TEMPLEDB_SESSION_ID=%s, which owns no unpublished commits in any of: %s\n' \
+            "$TEMPLEDB_SESSION_ID" "${SESSION_PROJECTS[*]}"
+        printf 'pinned    so the session view is diffed on its published half only\n'
+    fi
+elif [[ $MODE == python ]]; then
+    # No live session, so the pin is impossible and the session-scoped
+    # rows cannot be compared against Python. Said out loud and moved to
+    # EXPECTED rather than skipped: a row that silently stops being
+    # checked reads as a row that passed.
+    #
+    # Only in `python` mode. The other two compare this port against
+    # itself, so an unpinned run has both sides declining to resolve and
+    # the rows agree — there is nothing a missing pin can hide there.
+    echo "no live VCS session to pin; the session-scoped rows cannot be diffed" >&2
+    echo "  start one with \`templedb vcs session start\` to check them" >&2
+    EXPECTED+=(
+        "vcs log templedb -n"
+        "vcs log templedb --published"
+        "vcs log templedb --session"
+    )
+fi
 
 # `summary` is compared one pane at a time, not as one blob.
 #
@@ -242,9 +345,8 @@ FLAGS_EXPECTED=(
     "vcs branch p|-d"
     "vcs branch p|--delete"
     # Needs the staging session, which is a write and six environment
-    # fallbacks. See `vcs log has no session-scoped default`.
+    # fallbacks.
     "vcs diff p f|--staged"
-    "vcs log p|--session"
     # Dead unless --no-fts is passed too, and what it selects is this
     # port's default behaviour.
     "search content q|-i"
@@ -267,14 +369,17 @@ FLAGS_EXPECTED=(
     # exactly what happened to `--verify` and `--allow-mojibake`, both
     # of which were here for one commit and are now implemented.
     #
-    # Nothing to skip without `edit_intents`, whose table is outside
-    # the mirrored subset.
-    "file set p f|--skip-intent"
-    # Staging and committing both need sessions, which the port has no
-    # part of yet.
+    # `--stage` / `-s` is message-only in Python — the auto-stage is
+    # unconditional — and the auto-stage itself writes
+    # `vcs_working_state`, which nothing ported reads. It goes with
+    # `vcs commit`, which is its only consumer. `--commit` needs that
+    # command too.
+    #
+    # `--skip-intent` and `--session` have both left this list, on
+    # 2026-10-23, after `--verify` and `--allow-mojibake`. Four flags
+    # picked up by a per-flag list rather than a waved-at exception.
     "file set p f|-s"
     "file set p f|--stage"
-    "file set p f|--session"
     "file set p f|--commit"
     "file set p f|--commit-msg"
     "file set p f|-m"

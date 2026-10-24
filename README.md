@@ -29,12 +29,12 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs entity paths FROM TO [--max-depth] [--direction] [--via]` | byte-identical, exit codes included |
 | `templedb-rs entity dead-imports [--slug] [--limit]` | byte-identical across 5 variants |
 | `templedb-rs entity observations <kind>/<ref> [--limit]` | byte-identical across 6 variants |
-| `templedb-rs vcs log <proj> [-n] [--branch] [--all-sessions] [--published]` | byte-identical; Python's session-scoped default and `--session` not ported |
+| `templedb-rs vcs log <proj> [-n] [--branch] [--session] [--all-sessions] [--published]` | byte-identical, **all three views**, with the session-scoped default closed 2026-10-23 — see *Sessions* |
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
-| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake]` | **the first write.** Postgres only, opt-in, four of Python’s seven guards — see *The first write* |
+| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [--session]` | **the first write.** Postgres only, opt-in, five of Python’s seven guards — see *The first write* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -67,7 +67,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-296 unit tests, run by `cargo test`: 264 in `templedb-db` and 32 in
+314 unit tests, run by `cargo test`: 282 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -120,8 +120,9 @@ revision of this README advertised `cargo test` with no tests in the
 tree.
 
 **Not implemented.** Everything else — which is most of it. No VCS
-operations, no sessions, no checkouts, no ingest, no doctor, no publish,
-no Nix integration, no GUI. See *Porting order* below.
+operations, no session *management* (sessions are accepted when named
+and never created — see *Sessions*), no checkouts, no ingest, no doctor,
+no publish, no Nix integration, no GUI. See *Porting order* below.
 
 No writes to the live database, either — and that is still true now
 that the binary has a write command. There are two write paths in it,
@@ -211,7 +212,7 @@ not a chain of pairwise comparisons that could have drifted together.
 `search content` is deliberately excluded from the regression axis,
 because changing its answer was the point.
 
-Both axes are now run over **one sweep of 50 invocations covering every
+Both axes are now run over **one sweep of 54 invocations covering every
 implemented command**, and it is committed as
 `scripts/parity-sweep.sh` rather than retyped each time:
 
@@ -607,19 +608,40 @@ The blob bug surfaced from a `--side-by-side` sweep that happened to
 also run the unified renderer; the other three surfaced only once every
 implemented command was diffed in one pass.
 
-So that is now the method: a single sweep over all 50 invocations
+So that is now the method: a single sweep over all 54 invocations
 (`scripts/parity-sweep.sh`), run against Python and across both
 backends, rather than a per-command harness retired when the command is
-declared done. Five differences remain and every one is deliberate and
-documented — `project list`'s layout, `entity explore`'s ordering,
-`vcs log`'s session default, and two `search content` invocations. The
-sixth was `entity paths`'s exit code, closed on 2026-10-17; see *The
-error statuses*.
+declared done. Four differences remain and every one is deliberate and
+documented — `project list`'s layout, `entity explore`'s ordering, and
+two `search content` invocations. The fifth was `entity paths`'s exit
+code, closed on 2026-10-17; the sixth was `vcs log`'s session default,
+closed on 2026-10-23 — see *The error statuses* and *Sessions*.
 
 ## Bugs found while porting
 
 Reimplementing a query means reading the schema it runs against, which is
 a different kind of attention than using it.
+
+- **`vcs session prune` would refuse to delete 9 of the 558 sessions it
+  offers to.** Found 2026-10-23 while deciding whether the mirror should
+  declare `edit_intents.session_id`'s foreign key. The live column does
+  declare one, `foreign_keys` is on, and `prune_sessions` guards only on
+  `vcs_working_state.staged_by_session_id` — it never consults
+  `edit_intents`. 218 intent rows reference a session that has already
+  ended, and 20 of those name a session that is *prunable* by the
+  command's own criteria. The delete is one batched
+  `DELETE ... WHERE id IN (...)`, so one offending row fails the whole
+  statement: `--dry-run` reports 558 and the real run cannot do any of
+  them.
+
+  Not reproduced and not reachable here — this port does not prune — and
+  recorded for two reasons. It is why the mirror does not declare that
+  FK: the live constraint is a latent failure rather than a guarantee,
+  and a mirror enforcing it would refuse rows the source holds. And it
+  is the shape the sessions report warned about from the other side:
+  `edit_intents.session_id` is "most of the point" of the table, and a
+  cleanup path that does not know the column exists is how the point
+  gets lost.
 
 - **`search content` attributed matches to the wrong project.**
   `file_contents_fts` indexes `(file_path UNINDEXED, content_text)` with
@@ -940,14 +962,47 @@ Differences that are not deliberate and are not yet closed.
   pane as "nothing waiting on you". Python's fleet pane *does* vanish
   when the agent tables are absent, so silence there would have been
   faithful — which is exactly why it is not safe.
-- **The Postgres schema covers 17 tables and 1 view.** That is the whole
+- **`vcs log` unpinned prints a different header label**, and only the
+  label. With no `TEMPLEDB_SESSION_ID`, Python invents a session and
+  says `default view (published + your unpublished)`; this says
+  `published only`. The *rows* are the same — a session created a
+  moment ago owns nothing — so the divergence is one line, in one
+  direction, and it is the honest one: the port has not resolved a
+  session and does not claim to have. Closing it would mean creating a
+  session row, which is the thing the architecture forbids. Pinning the
+  variable makes the two byte-identical, which is what the sweep does.
+- ~~**Two session decisions are open.**~~ **Both closed 2026-10-23.**
+  Whether to refuse outright when `TEMPLEDB_SESSION` is set: no, warn —
+  see *Sessions*. And whether an unpinned `file set --stage` should
+  refuse or stage with a NULL owner: neither, because the question had a
+  false premise in both halves. `--stage` is message-only in Python and
+  a NULL owner means *unstaged* rather than *unknown*; the auto-stage
+  waits for `vcs commit`, which is its only reader. Written up under
+  *Why the auto-stage waits for `vcs commit`*.
+- **`edit_intents` is mirrored at twelve of fourteen columns**, and the
+  two omitted are the ones a *reader* would want: `cancelled_at` and
+  `applied_commit_id`. They belong to `intent cancel` and to the commit
+  link `vcs commit` would make, neither of which is ported, so nothing
+  here could verify them — but 785 live rows carry an
+  `applied_commit_id`, which means the mirror is missing a real column
+  of real data rather than a NULL one. It moves when a reader appears.
+- **The intent's own write path is partial in one way worth naming.**
+  Python links the just-staged `vcs_working_state` row to the intent it
+  created (`SET intent_id = ?`, migration 088). That is not reproduced,
+  because staging is not ported and the table is outside the subset.
+  Python calls the link cosmetic — "the commit path doesn't need it, but
+  downstream provenance queries do" — so the gap is in those queries,
+  not in the write.
+- **The Postgres schema covers 19 tables and 1 view.** That is the whole
   set the port reads, out of 163 tables and 45 views. Columns are
   likewise limited to the ones the queries name — four of
   `ingestion_runs`'s fourteen, three of `fleet_machines`'s
-  twenty-seven, eight of `projects`'s. Anything not yet ported has
-  nothing to mirror and no way to verify a mirror, so the boundary
-  follows the readers, and it moves when one does: `project list`'s two
-  filters added `is_nix_project` and `project_category` on 2026-10-21.
+  twenty-seven, two of `vcs_sessions`'s ten, eight of `projects`'s.
+  Anything not yet ported has nothing to mirror and no way to verify a
+  mirror, so the boundary follows the readers, and it moves when one
+  does: `project list`'s two filters added `is_nix_project` and
+  `project_category` on 2026-10-21, and `vcs log`'s default view added
+  `vcs_sessions` on 2026-10-23.
 
 ## Building
 
@@ -988,7 +1043,7 @@ No Postgres server is needed to build or to run `cargo test`.
 ```bash
 just pg-up          # initdb if absent, start, create both databases + the ro role
 just mirror         # copy the read subset from live SQLite into templedb_parity
-just sweep-pg       # the 50 invocations, SQLite vs Postgres
+just sweep-pg       # the 54 invocations, SQLite vs Postgres
 just pg-verify-ro   # prove the read-only role is enforced, not assumed
 just pg-down        # stop; pg-nuke throws the cluster away
 ```
@@ -1068,6 +1123,23 @@ that matters for what comes next: it is the same comparison the write
 path's verification rests on, and it now holds over a column the two
 engines cannot represent the same way.
 
+Re-measured 2026-10-23 with `vcs_sessions` added and `vcs log`'s three
+views ported: **54 of 54 invocations, 7 of 7 `summary` panes, 20 of 20
+flag surfaces and 8 of 8 `project list` filters identical**, and **all
+18 tables digest identically over 216,318 rows**. The new thing this
+exercises is the session lookup itself — `ended_at IS NULL` against the
+mirrored table rather than the live file — so a pinned session resolves
+the same through the replica as through SQLite, which is the property
+`file set --session` will stand on.
+
+Re-measured again the same day with `edit_intents`: **54 of 54
+invocations, 7 of 7 panes, 20 of 20 flag surfaces, 8 of 8 filters**, and
+**all 19 tables digest identically over 217,919 rows**. Nothing reads
+`edit_intents` here, so what the digest covers is the copy itself — the
+twelve-column projection over 1,220 rows, 976 of them with a NULL
+`session_id` — which is the only check a write-only table can have
+before something reads it.
+
 **The sweep refuses to run on a stale mirror**, and that guard was
 written the same afternoon it was needed. `sweep-pg` diffs SQLite
 against Postgres, so it only tests *this port* while both hold the same
@@ -1084,7 +1156,7 @@ interrupted run must not leave counts vouching for a copy that rolled
 back.
 
 ```bash
-just pg-check         # fresh: all 17 tables match the source
+just pg-check         # fresh: all 19 tables match the source
 just mirror-refresh   # when it isn't
 just sweep-pg-fresh   # refresh, then sweep -- the form to actually use
 ```
@@ -1137,7 +1209,7 @@ nix flake check        # the hermetic half only
 
 `just check` is what to run before publishing. It is three things in
 order: `cargo test --workspace`, the two CPython oracles (`difflib` and
-the clock), and `scripts/parity-sweep.sh python` — all 50 invocations
+the clock), and `scripts/parity-sweep.sh python` — all 54 invocations
 diffed against the Python `templedb`, then three stages for what a
 whole-stdout diff cannot reach: `summary` one pane at a time, the flag
 surfaces of 20 commands, and `project list`'s filters by which projects
@@ -1148,18 +1220,27 @@ does.
 A current clean run reads:
 
 ```
-summary   6 of 7 claimed panes identical, 2 not ported
+pinned    TEMPLEDB_SESSION_ID=1172, which owns unpublished commits in templedb-rust
+summary   7 of 7 claimed panes identical, 2 not ported
 flags     20 of 20 commands agree (deliberate divergences allowed)
 filters   8 of 8 project-list filters select the same projects
 
-templedb-rs vs python, 50 invocations: 45 stdout-identical
-(15 differing on stderr only), 23 deliberate, 0 unexpected
+templedb-rs vs python, 54 invocations: 50 stdout-identical
+(15 differing on stderr only), 18 deliberate, 0 unexpected
 ```
 
-The deliberate count went from 16 to 23 when `file set` landed: seven
+The `pinned` line is the sweep reporting which session it put both
+implementations in, and whether that session owns anything — see
+*Sessions*. Three of the 54 rows are appended by that search rather than
+written down, so the count moves with the data; the line says what was
+covered.
+
+The deliberate count went from 16 to 23 when `file set` landed — seven
 of its flags are absent on purpose and each is listed individually, so
 porting any one of them shows up here as a change rather than
-disappearing into a waved-at exception.
+disappearing into a waved-at exception — and down to 18 as sessions, the
+intent record and the session pin closed `vcs log`'s default view, its
+`--session` flag, and `file set`'s `--skip-intent` and `--session`.
 
 `just write-test` is **not** part of `just check`, because it needs a
 Postgres server and `check` is meant to run anywhere the build does.
@@ -1255,20 +1336,24 @@ crates/templedb-db/    data layer, one module per command family
                        that carries a non-default one
   clock.rs             one injectable instant; julianday and _age_hint,
                        reproduced to the bit. No SQL, no backend
+  session.rs           resolve-or-decline: the session the caller named,
+                       validated live. Two of Python's seven steps, and
+                       never the two that write
   writer.rs            PgWriter — the one writable handle, outside the
                        Store trait on purpose. Opt-in, scratch-only
-  fileset.rs           `file set`: the first write, and its two guards
+  fileset.rs           `file set`: the first write, and its five guards
   pgtext.rs            the NUL escape: SQLite TEXT holds U+0000 and
                        Postgres text cannot. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
 schema/postgres/       the DDL the mirror targets
 crates/templedb-cli/   clap binary `templedb-rs`, formatting only
-  main.rs              the command tree, and the two impure inputs
-                       `summary` needs: the clock and the session id
+  main.rs              the command tree, and the impure inputs resolved
+                       at the edge: the clock, the handoff identity, and
+                       the VCS session pin
   summary_view.rs      summary's interpretation layer: facts plus an
                        instant to lines. Ages, colour, column widths
 scripts/
-  parity-sweep.sh      all 50 invocations, against Python / the other
+  parity-sweep.sh      all 54 invocations, against Python / the other
                        backend / a previous build. Plus three stages for
                        the commands whose whole stdout cannot be
                        diffed: `summary` one pane at a time, the flag
@@ -1329,7 +1414,8 @@ Writes last, and only once the read layer is trusted.
    completes every read-only command in the `entity` family.
    `observations_archive` is the ninth table in the Postgres subset.
 5. **Done** — `vcs log`, with `vcs_branches` as the tenth table. Its
-   session-scoped default is deliberately absent: see below.
+   session-scoped default was deliberately absent until step 16 closed
+   it.
 6. **Done** — `vcs show`, metadata and changed-file list. Its per-file
    diff followed in step 8.
 7. **Done** — `project show` and `vcs branch`, the two deterministic
@@ -1345,9 +1431,9 @@ Writes last, and only once the read layer is trusted.
 10. **Done** — `vcs diff --side-by-side`, which is
     `difflib.context_diff`: a second renderer over the
     `grouped_opcodes` this port already had, and the last output format
-    in the `vcs` family. The read layer is now as complete as it can
-    get without sessions. See below for what the flag is actually
-    called for.
+    in the `vcs` family. The read layer was then as complete as it could
+    get without sessions, which is what step 16 went and got. See below
+    for what the flag is actually called for.
 11. **Done** — the all-commands audit. Every implemented command
     diffed against Python in one sweep, rather than per-command
     harnesses retired on completion. Nine of the twelve bugs this
@@ -1486,6 +1572,57 @@ Writes last, and only once the read layer is trusted.
     2026-10-21. What is *not* covered is an update in place — counts
     catch inserts and deletes — which is precisely the gap
     `templedb-rs state` fills.
+
+16. **Done** — sessions, as *resolve never, accept always*. Not a
+    command either: `session.rs` is one function at the CLI edge that
+    accepts the session the caller named and declines to guess, which is
+    two of Python's seven resolution steps and neither of the two that
+    write. It closed the last read-layer divergence — `vcs log`'s
+    session-scoped default — and with it that command's `--session` flag
+    surface, and it added `vcs_sessions` as the eighteenth mirrored
+    table at two of its ten columns.
+
+    The precondition document is the TempleDB report *Sessions: the
+    identity the port has been refusing to resolve* (2026-10-23), which
+    names five blocked items and argues they are one item. This closes
+    its first three steps.
+
+17. **Done** — the `edit_intents` record, which is the report's step 4
+    and guard five of `file set`'s seven. The nineteenth mirrored table,
+    at twelve of its fourteen columns — and the first one here that
+    exists for a *writer* rather than a reader, so the projection is the
+    columns the writer supplies rather than the columns a query names.
+
+    It also closed `--skip-intent`, the third `file set` flag to leave
+    the sweep's allow-list. One structural divergence from Python, argued
+    under *The intent record*: the insert goes inside the write's
+    transaction rather than after it, which makes the 2026-09-14 lying
+    `status = 'applied'` row unreachable by construction instead of by
+    ordering, at the price of an intent failure failing the write.
+
+18. **Done, and smaller than planned** — `--session <ID>` on `file set`,
+    which the sessions report lists as its step 5 and guard six. Integer
+    only, outranking `TEMPLEDB_SESSION_ID`, resolved against the write
+    target inside the write transaction.
+
+    Guard six was supposed to be `--stage` as well, and investigating
+    the decision the README had been carrying dissolved it rather than
+    settling it: `--stage` is message-only in Python, the auto-stage is
+    unconditional, and `staged_by_session_id IS NULL` means *unstaged*
+    rather than *unowned* in all five readers. The auto-stage therefore
+    moves to `vcs commit`, which is the only thing that reads what it
+    writes. See *Why the auto-stage waits for `vcs commit`* — the
+    finding is that a table gaining a *writer* with no reader is the one
+    shape this port's boundary rule does not cover, and `edit_intents`
+    got in on being provenance rather than on being written.
+
+    What is left of `file set`: `--stage` / `-s` and `--commit` / `-m`,
+    both of which are now `vcs commit`'s business, and binary content.
+
+    One capability closes permanently as a result: `--session <name>`.
+    The name path creates when absent, and a port that creates session
+    rows has no read-only guarantee left to argue from. See *Sessions*
+    below for the whole argument and what it cost.
 
 ### The state digest, and why it must not sort
 
@@ -2141,25 +2278,33 @@ reaching it by habit.
 The design document's sharpest finding is that **the guards are the
 deliverable**: "a port that reproduces the SQL and not these is a
 regression even if every byte of output matches." This reproduces the
-SQL and **two of the seven guards**. The rest are absent and named,
+SQL and **five of the seven guards**. The rest are absent and named,
 because an unnamed omission in a write path is how the incidents in
 that document happened:
 
 | absent | what it was for |
 |---|---|
-| `edit_intents` | provenance: who set this, when, from which session. Table is outside the mirrored subset |
-| `--stage` / `--session` | needs sessions, which the port has no part of |
+| `--stage` / `-s` and the auto-stage | writes `vcs_working_state`, whose only consumer is `vcs commit`. See *Why the auto-stage waits for `vcs commit`* |
 | `--commit` / `-m` | needs `vcs commit`, the step after this |
-| `--skip-intent` | nothing to skip without `edit_intents` |
 | binary content | Python falls back to `content_blob` for undecodable stdin — which is why `.authinfo.gpg` can be stored at all. This takes text only, and refuses rather than mangling |
+
+`--session <ID>` **is** here, as of 2026-10-23, and it is an id and not
+a name: Python accepts `ID|NAME` and its name path creates the session
+when none matches. It outranks `TEMPLEDB_SESSION_ID`, which is Python's
+precedence, and it is resolved against the write target inside the write
+transaction — the same reasoning as the exact-slug resolution, one
+column over. Verified at the command line: a live id lands on the
+intent, the flag wins over an env var naming a dead session, an ended id
+exits 1, and a name is refused as a name rather than as a parse error.
 
 Every one of those flags is listed individually in the sweep's
 flag-surface allow-list rather than waved at, so porting one shows up
-as a change. That is not hypothetical: **`--verify` and
-`--allow-mojibake` were on this list for exactly one commit**, and the
-list is how they got picked up.
+as a change. That is not hypothetical, and it has now happened three
+times: **`--verify` and `--allow-mojibake` were on this list for
+exactly one commit**, and `--skip-intent` left it on 2026-10-23. The
+list is how all three got picked up.
 
-The four guards that *are* here:
+The five guards that *are* here:
 
 - **`--if-match`.** `file set` replaces the whole file, so content read
   earlier is a lock on all of it: anything written in between is
@@ -2189,6 +2334,128 @@ The four guards that *are* here:
   commit**, deliberately: inside the writing transaction it would read
   its own uncommitted effect and could only ever agree, which is a
   check that cannot fail and therefore is not one.
+- **The `edit_intents` record**, landed 2026-10-23. Provenance: who set
+  this, when, from which session, and *against what*. See below — it is
+  the one guard where the port's structure departs from Python's rather
+  than its values.
+
+#### The intent record, and the one place this is not Python's shape
+
+Guard five, and the `edit_intents` table is the nineteenth mirrored one.
+The values are Python's: `description = 'file set'`,
+`status = 'applied'`, `patch_summary` a *byte* count, `author` from
+`TEMPLEDB_AUTHOR` then `USER` then NULL, and `base_revision` the
+previous content hash or the literal `'new-file'`.
+
+That last column is the interesting one, because it spent most of its
+life holding nothing. It was the literal `'current'` on all 886 rows
+migration 123 catalogued — which is why that baseline lists it as a
+`constant` — so **the field designed to record what an edit was made
+against never recorded anything**, and the stale-base overwrite of
+2026-10-04 left no trace to audit. It records the real base now, on both
+sides. `'new-file'` rather than NULL when there is no prior content,
+which is Python's choice and the right one: it keeps "there was nothing
+here" distinguishable from "nobody filled this in".
+
+**The insert is inside the write's transaction, where Python's is after
+it.** This is the only place the port departs from Python's *structure*,
+so the reasoning is worth stating.
+
+Python records the intent after the write, in its own statement, and
+swallows every error — "intent recording must not break the write path".
+The ordering is load-bearing over there and its comment says why: the
+previous arrangement wrote the intent *first* and caused the 2026-09-14
+*intent applied but `file cat` returns nothing* bug, where a failed write
+left a `status = 'applied'` row that survived the abort and lied to every
+later provenance query.
+
+This port has something Python does not: the write was already one
+transaction across three tables. Putting the intent inside it makes that
+bug **unreachable by construction** rather than by ordering — either the
+write and its provenance both exist or neither does, and no sequence of
+failures can produce the lying row. The cost is the property Python chose
+instead: here an intent failure *does* fail the write.
+
+That trade is the right way round for this command. A silent provenance
+gap is exactly what the 2026-10-04 overwrite had, and `file set` is
+opt-in, partial and behind an environment variable — a caller who wants
+the write without the record says `--skip-intent`, which is louder than
+discovering later that the row is missing. A test asserts the refused
+case directly rather than trusting the claim: a stale `--if-match`
+leaves the row count unchanged.
+
+One divergence in the value, not the structure. **Python's intent path
+does not resolve a session** — it reads `TEMPLEDB_SESSION_ID` directly
+and swallows a parse failure to NULL, so it will record an id for a
+session that has ended. This port has one resolver and it checks
+liveness, so the column holds a live id or NULL. Verified at the command
+line: an unpinned write records NULL, a pinned one records the id, and a
+pin naming an ended session is refused before the write rather than
+stamped into the provenance.
+
+#### Why the auto-stage waits for `vcs commit`
+
+This was going to be guard six, and reading the code changed the
+question. The README carried it as a decision — *does an unpinned
+`file set --stage` refuse, or stage with a NULL `staged_by_session_id`?*
+— and both halves of that turned out to be the wrong thing to be
+deciding.
+
+**`--stage` is message-only in Python.** The auto-stage is
+unconditional: `_write_content_to_db` upserts a `vcs_working_state` row
+with `staged_by_session_id` on every write, and `--stage` changes
+`✓ Set <path>` to `✓ Set and staged <path>` and nothing else. A
+follow-up `stage_files()` is deliberately skipped, because
+`_refresh_ws_row_from_disk` re-reads the checkout and would revert the
+row's hash to the pre-write one. So porting `--stage` as a flag that
+"requires a session" would make it *stricter* than a flag that does
+nothing over there, and the thing that actually needs a session is a
+side effect of every `file set`.
+
+**And a NULL owner is not an ambiguous state, it is the wrong one.**
+`staged_by_session_id IS NOT NULL` *is* the staged flag — migration 083
+dropped the `staged BOOLEAN` compat mirror in its favour, and
+`unstage_files` is literally `SET staged_by_session_id = NULL`. So the
+proposal came to "stage the row by writing the value that means
+unstaged", and five readers agree on that reading:
+
+| reader | predicate | a NULL-owned row |
+|---|---|---|
+| `vcs status` | `staged = [... == sid]` | listed as **modified**, never staged |
+| `vcs commit` | `WHERE staged_by_session_id = ?` | never committed |
+| `templedb publish` | `COUNT(*) ... IS NOT NULL`, else skip the commit | **silently ships nothing** |
+| the importer's refresh | deletes every row, restores only `IS NOT NULL` | deleted on the next sync |
+| `vcs session reconcile` | default `orphan_stages` → `SET ... = NULL` | *produces* this state, to mean unstaged |
+
+The publish row is the one that settles it, because it is the
+`set bza flake.nix` incident again — the write reports success and the
+publish ships nothing, which is exactly what the un-delete guard exists
+to prevent. The importer row is the sharpest, because that preservation
+snapshot was written *for this command*: its comment says the rows it
+saves are the ones "written by `templedb file set` + auto-stage", since
+otherwise a disk re-scan replaces the intended blob and `vcs commit`
+commits stale on-disk content. A NULL-owned stage is the one row that
+mechanism cannot save.
+
+Python already has a word for it. `commit.py` calls these rows "the
+orphans this path and the stale-session reaper both produce… precisely
+the ones that were never getting cleaned up", and 133 live rows are in
+that state today (102 `added`, 28 `deleted`, 3 `modified`).
+
+**So the answer is neither.** The auto-stage is not deferred for want of
+a session — it has one now — but because `vcs_working_state` has no
+reader here and its whole purpose is to be consumed by `vcs commit`.
+Writing it would be the first time this port mirrored a table for
+nobody, and unlike `edit_intents`, where the row *is* the product, a
+working-state row that nothing reads is not provenance, it is litter.
+It also has a second half the port has no equivalent for: Python mirrors
+the write into the active checkout, and its comment records what a
+missed mirror costs — the refresh classifies a staged file with no file
+on disk as `deleted` and the next commit hard-deletes it, which
+announced "Files: 2" and committed one on 2026-09-24.
+
+The auto-stage therefore lands *with* `vcs commit`, as part of it, and
+the open decision is closed by having become irrelevant.
 
 #### The refusal codes, which are the contract
 
@@ -2221,14 +2488,18 @@ mojibake, 2 for `--if-match`, 0 for a `--verify` that passes.
 **`id` had no default.** The schema was built for `mirror`, which
 copies rows that already have ids, so every `id` is a plain
 `bigint PRIMARY KEY`. A writer has nothing to generate one from. So
-`project_files.id` and `file_contents.id` are now
+`project_files.id`, `file_contents.id` and — since the intent record —
+`edit_intents.id` are now
 `GENERATED BY DEFAULT AS IDENTITY` — `BY DEFAULT` and not `ALWAYS`,
 because `mirror` must keep supplying explicit ids and `ALWAYS` would
 reject its `COPY`. The consequence is that `COPY` does not advance the
 sequence, so a freshly mirrored database would hand out id 1 and
-collide; `mirror` now calls `setval` on both sequences inside the copy's
-transaction. Inside, unlike `ANALYZE`: a mirror whose sequences are
-behind is not merely unoptimised, it is one the first write breaks.
+collide; `mirror` now calls `setval` on each of those sequences inside
+the copy's transaction. Inside, unlike `ANALYZE`: a mirror whose
+sequences are behind is not merely unoptimised, it is one the first
+write breaks. `edit_intents` makes that visible rather than merely
+true — its id is the one thing `file set` *prints* from the table, so a
+sequence left behind shows up in the output.
 
 **Resolution is exact, not fuzzy.** Every read command takes a fuzzy
 project name and Python's `file set` does too. This takes an exact
@@ -2247,7 +2518,7 @@ writes Postgres, so there is no shared input. The technique is the one
 the design document calls **cross-read** — the port writes, and the
 already-trusted read layer reads it back.
 
-`crates/templedb-db/tests/write_parity.rs`, nine tests, `#[ignore]`d
+`crates/templedb-db/tests/write_parity.rs`, fourteen tests, `#[ignore]`d
 and run by `just write-test`. The read-back goes through
 `templedb_db::read_file` — the actual ported `file cat` query, not SQL
 written for the test — so a write `file cat` cannot see is a failure.
@@ -2262,19 +2533,34 @@ document listed replacing the in-memory SQLite fixture as the one
 question blocking this work; it is a *cutover* question, and step 15b
 says why.
 
-What the nine cover: creating a file, replacing one in place through
-the `ON CONFLICT (file_id, is_current)` arm, a no-op rewrite, the
-un-delete, empty content, `--if-match` letting a match through *and
+What the fourteen cover: creating a file, replacing one in place
+through the `ON CONFLICT (file_id, is_current)` arm, a no-op rewrite,
+the un-delete, empty content, `--if-match` letting a match through *and
 refusing a stale base without writing*, content containing a NUL,
 `--verify` agreeing after a write *and catching a row reverted behind
 the writer's back*, and the mojibake guard refusing through the write
 path with `--allow-mojibake` letting the same content past.
 
-Two of those are written to be able to fail, which is the only kind
-worth having: the `--verify` test reverts the row with its own `UPDATE`
-before checking, and the mojibake test corrupts a string the way the
-incident did — encode to UTF-8, read the bytes back as Latin-1 — rather
-than hand-writing a sequence that happens to match the pattern.
+Five of them are the intent record, added with it on 2026-10-23: that
+every write leaves a row with Python's values, that `base_revision`
+chains — `'new-file'` then the previous hash — that `patch_summary`
+counts bytes and not characters (asserted with multibyte content, the
+only input that tells the two apart), that `--skip-intent` writes the
+file *and* records nothing, that a refused write leaves no row at all,
+and that a pinned session is stamped while an ended one is refused
+before the write. The provenance rows are read back through `Store`
+rather than the writer's own connection, which is the cross-read rule
+applied to this table too: the write is only verified if something else
+can see it.
+
+Four of the fourteen are written to be able to fail, which is the only
+kind worth having: the `--verify` test reverts the row with its own
+`UPDATE` before checking; the mojibake test corrupts a string the way
+the incident did — encode to UTF-8, read the bytes back as Latin-1 —
+rather than hand-writing a sequence that happens to match the pattern;
+the refused-intent test asserts the row count is *unchanged* rather
+than merely non-zero; and the session test creates a real ended row to
+be refused rather than naming an id that happens not to exist.
 
 That last one ties the write path to `pgtext`: the escape had only ever
 been exercised by `mirror`, and a writer inserting raw text would be
@@ -2419,14 +2705,15 @@ of them on commands reported as byte-identical:
 | command | flag | disposition |
 |---|---|---|
 | `vcs log` | `--published` | **ported** — see below |
-| `vcs log` | `--session` | not ported, deliberately |
+| `vcs log` | `--session` | **ported** 2026-10-23 — see *Sessions* |
 | `vcs branch` | `-d` / `--delete` | a write; cannot be ported |
 | `project list` | `--nix-only`, `--category` | **ported** — see below |
 
-`vcs branch -d` is a write and a read-only port cannot have it. Both of
-the others are closed, which is the useful thing about a check that
-names a gap rather than describing one: the list was four items long
-for about an hour.
+`vcs branch -d` is a write and a read-only port cannot have it. All
+three of the others are closed, which is the useful thing about a check
+that names a gap rather than describing one: the list was four items long
+for about an hour, and the last of the three took two days and a design
+document rather than an hour — the flag was never the work.
 
 **`project list`'s two filters** needed two more mirrored columns,
 `is_nix_project` and `project_category`, bringing the `projects`
@@ -2475,26 +2762,22 @@ correct. The stage now drops table furniture by name, and a sabotage
 run — making `--nix-only` a no-op — confirms it reports two failures
 and exits non-zero.
 
-**`--published` is now accepted, and `--session` is not.** The two look
-symmetrical and are not. `--published` selects behaviour this port
-*has* — it is already the default — and it is the most portable of
-Python's three views, the only one needing no session at all. A script
+**`--published` was accepted 2026-10-21 and `--session` on 2026-10-23.**
+The two looked asymmetrical and the asymmetry had an expiry date.
+`--published` selected behaviour this port already had, and a script
 written `vcs log --published` worked against Python and exited 2 here,
-which is the opposite of what a port is for. `--session` asks for the
-current session's unpublished commits, which this port cannot produce;
-accepting it would promise session inclusion and silently deliver none.
-That is the same test `search content --no-fts` fails, and it is the
-whole rule: **a no-op flag is only harmful when the thing it names is
-absent.**
+which is the opposite of what a port is for. `--session` asked for the
+current session's unpublished commits, which this port could not then
+produce, so accepting it would have promised session inclusion and
+silently delivered none — the same test `search content --no-fts` fails.
+That rule did not change; **the thing the flag names stopped being
+absent.** Python marks it `[deprecated no-op — this is now the default]`
+and it is now a no-op on both sides, for the same reason on both sides.
 
-Measured: `vcs log --published` is byte-identical to Python when your
-session has nothing pending, which is the state just after a publish.
-Python adds a one-line `N pending commit(s) in your session` advisory
-otherwise — `if visibility == 'published' and pending` — and that needs
-the session. So the sweep row passes when it can and is listed in
-`EXPECTED` for when it cannot, which is the one arrangement that never
-reports a false failure. `just check` runs before a publish, when
-pending is usually non-zero.
+`--published` is no longer a no-op either: with a session resolved it
+selects a genuinely narrower view, and it carries Python's one-line
+`N pending commit(s) in your session` advisory, byte for byte, when the
+pinned session has commits on the active branch.
 
 One precedence difference, chosen rather than inherited: Python lets
 `--published` override `--all-sessions`, and here the two conflict and
@@ -2502,35 +2785,156 @@ clap refuses the pair with exit 2. Reproducing the override would mean
 `--published` silently discarding the one view this port renders
 identically to Python's.
 
-### `vcs log` has no session-scoped default, and says so
+### Sessions: resolve never, accept always
 
-Python's `vcs log` has three views. `--published` shows commits with
-`session_id IS NULL`; `--all-sessions` shows everything; and the
-**default** shows published commits *plus the ones owned by your current
-staging session*.
+Landed 2026-10-23, as `crates/templedb-db/src/session.rs`. The
+precondition document is the TempleDB report *Sessions: the identity the
+port has been refusing to resolve*, written the same day; this is what
+implementing it came to.
 
-That default is not ported, because resolving "your session" goes
-through six fallbacks — a `--session` override, `TEMPLEDB_SESSION_ID`,
-an instance cache, `TEMPLEDB_SESSION`, a lookup keyed on the
-session-leader PID within the last 24 hours, then one keyed on the PPID
-— and **creates a session row** if none of them hit. Environment-
-dependent and a write, so neither half belongs in this crate.
+Python's `VcsService.get_current_session()` resolves through seven
+steps, and **two of them insert a row**:
 
-So `templedb-rs vcs log` defaults to the published view, and prints
-which view it used in the header exactly as Python does. That makes the
-difference visible in the output rather than something you have to know:
+| # | source | behaviour |
+|---|---|---|
+| 0 | `--session <id\|name>` | explicit pin; outranks both env vars |
+| 1 | `TEMPLEDB_SESSION_ID` | must name a row with `ended_at IS NULL` |
+| 2 | instance cache | per-process memoisation |
+| 3 | `TEMPLEDB_SESSION` | a declared *name*; **creates if absent** |
+| 4 | `os.getsid(0)` | `(author, host, sid)` started within 24 hours |
+| 5 | `os.getppid()` | the same lookup on the parent pid |
+| 6 | — | **creates** `<host>-<sid>-<short-ts>` |
 
-```
-Commit log for templedb [published only]
-```
+This port is steps 0 and 1, and only the non-writing halves of them. It
+reads `TEMPLEDB_SESSION_ID`, it accepts an explicit integer id, it checks
+`ended_at IS NULL`, and it does nothing else. With no session identified
+every session-scoped behaviour falls back to the published view and says
+so in the header.
 
-against Python's default of `[default view (published + your
-unpublished)]`. `--all-sessions` consults no session at all and is
-byte-identical to Python's.
+The argument against the rest is not that it is hard. It is that **the
+four automatic steps are heuristics for "same human, same terminal,
+recently", and each one was added because the previous one fanned
+out** — step 4 keys on the session leader rather than the parent because
+`x=$(templedb ...)` forks a subshell with a fresh pid, and step 3 exists
+because agent wrappers spawn every tool call under its own session leader
+anyway. A port that reimplements them inherits a tuning problem with no
+way to validate it: there is no byte diff for "did these two invocations
+agree about which session they were in".
 
-One thing Python prints that this does not: under `--published` it adds
-a `N pending commit(s) in your session` advisory. That needs the session
-too.
+**The obvious middle option is rejected explicitly, because it looks
+free.** Doing steps 4 and 5 without step 6 — resolve read-only, never
+create — finds a session when one happens to exist and finds none when it
+does not, so the same command in the same terminal answers differently
+depending on whether the Python implementation has run there in the last
+24 hours. Correct, unpredictable, and impossible to test. Refusing to
+resolve at all is *worse* in capability and *better* in every property
+this port holds.
+
+**`--session <name>` closes permanently**, not until later. The name path
+creates when absent; a port that creates session rows has given up the
+read-only guarantee the whole architecture rests on. Accepting a name
+that happens to resolve and refusing one that does not would be worse
+again — a flag that works or writes depending on data. Python classifies
+the flag's argument with `str.isdigit()`, so `--session my-agent` is not
+a malformed id over there but a different feature, and the refusal here
+says so rather than reporting a parse error.
+
+#### What the two origins do differently, reproduced
+
+`--session` is classified by `isdigit()` and `TEMPLEDB_SESSION_ID` is
+parsed by `int()`, which is not the same test. `--session -5` is a
+*name* to Python and is refused here; `TEMPLEDB_SESSION_ID=-5` is a
+well-formed id to Python that matches no row, and is the same here.
+Reproduced rather than tidied, because a script that exports the variable
+gets the same answer from both. Both are trimmed and an empty value reads
+as unset, which is Python's `.strip()` and truth test.
+
+`ended_at IS NULL` is load-bearing rather than decorative. Python's
+lookup accepted an *ended* session until 2026-10-07, contradicting its
+own error message and `CheckoutRepository.current_session_id()`, which
+had always required liveness — the split let staging adopt a dead session
+that checkout-role resolution then refused.
+
+Both refusals exit 1, which is Python's: its `ValidationError` and
+`ResourceNotFoundError` both leave the CLI decorator as `return 1`.
+Verified at the command line across four inputs — an unknown id, a
+non-integer, an *ended* id and a negative one — with identical exit codes
+and empty stdout on both sides. The two messages are byte-identical on
+stderr as well, single quotes included, which is unusual here and worth
+having where it is free.
+
+#### `vcs log`'s three views, and the one that was missing
+
+All three now agree with Python. `--all-sessions` always did, because it
+consults no session. `--published` is `session_id IS NULL`. The default
+is `session_id IS NULL OR session_id = ?`, and it prints Python's header
+label — `default view (published + your unpublished)` — plus Python's
+`N pending commit(s) in your session` advisory under `--published`.
+
+Measured 2026-10-23: **54 of 54 sweep invocations stdout-identical, with
+both implementations pinned to the same live session.** The pin is what
+makes these rows comparable at all, and the sweep now sets it itself:
+`parity-sweep.sh` reads a live id from Python's own `vcs session list
+--active` — the authority on which sessions exist, and the one thing this
+script must not create — then searches for a *project* the session owns
+unpublished commits in, and appends three rows against it.
+
+That search is the part worth explaining, because the first version of it
+was wrong in the flattering direction. It compared the default view's
+whole output against the published view's and took any difference as
+evidence the session owned commits — but the two *always* differ, in the
+header label, so every candidate looked good and the union's right half
+was never actually covered. It now greps for an `(unpublished)` line,
+which is the only visible evidence that
+`session_id = ?` contributed anything. The pair cannot be hardcoded: a
+session's commits sink below `-n 10` as a project gains history and
+vanish entirely when it is published, so a written-down pair would stop
+covering the branch without failing. When no pair exists the run says so
+in a line of its own, because three rows will pass having checked less
+than they look like they checked.
+
+The remaining difference is one header line, in one direction. Unpinned,
+Python invents a session — whose view *is* the published set, since a
+fresh session owns nothing — and prints `default view`; this port prints
+`published only`. Same rows, honest label.
+
+#### `TEMPLEDB_SESSION` is warned about, not refused
+
+The name variable is what the agent wrapper exports, so this port
+routinely runs with it set and will ignore it. Ignoring a variable that
+changes the answer is the failure worth being loud about, so `vcs log`
+prints a one-line warning on stderr naming the variable and what to set
+instead.
+
+A warning rather than a refusal, which was the open question the report
+left. Erroring would be loud and correct and would make the port unusable
+in exactly the environment it is developed in — this session's own
+`TEMPLEDB_SESSION=claude-code-agent-9285` is what the warning fired on
+first. The warning is suppressed when a session *was* pinned, because
+then Python ignores the name too: steps 0 and 1 both outrank step 3, so
+the two agree and there is nothing to report. Warning anyway would train
+the reader to ignore the warning.
+
+#### The eighteenth mirrored table, at two of ten columns
+
+`vcs_sessions` joined the subset, and the boundary still follows the
+readers: `session.rs` asks one question of it — is the id the caller
+named still live — so `id` and `ended_at` are carried and the other eight
+columns are not. They belong to `vcs session list` / `show` / `prune`,
+none of which is ported, and a column with no reader has nothing to
+verify a mirror against.
+
+Still no foreign key from `vcs_commits.session_id`, now that the
+referenced table is present. `vcs session prune` deletes ended sessions
+and nothing nulls the commits that named them, so a dangling
+`session_id` is a state the live database can reach and a mirror
+enforcing the constraint would refuse to load it. Same reasoning as
+`content_hash`, where 509 rows already name a pruned blob.
+
+Measured after the copy: **all 18 tables digest identically across
+SQLite and Postgres over 216,318 rows**, and the cross-backend sweep is
+54 of 54 with 7 of 7 summary panes — so the session lookup answers the
+same through the mirror as through the live file.
 
 ### The tie-break, and getting it backwards first
 

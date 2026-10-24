@@ -52,7 +52,7 @@ oracle:
     cd crates/templedb-db && cargo test --test difflib_parity -- --ignored
     cd crates/templedb-db && cargo test --test clock_parity -- --ignored
 
-# All 49 implemented invocations, diffed against the Python templedb,
+# All 54 implemented invocations, diffed against the Python templedb,
 # plus `summary` compared one pane at a time — its whole stdout can
 # never match, because two of Python's nine panes are not ported.
 #
@@ -60,14 +60,14 @@ oracle:
 # PATH. Exits with the number of *unexpected* differences, so a
 # deliberate divergence does not fail it — the list lives in the script.
 
-# All 49 invocations plus summary's panes, diffed against the Python templedb.
+# All 54 invocations plus summary's panes, diffed against the Python templedb.
 sweep: build
     bash scripts/parity-sweep.sh python
 
 # The same sweep across backends. PGURL is a mirrored Postgres; see
 # `templedb-rs mirror`.
 
-# SQLite vs a mirrored Postgres, same 49 invocations.
+# SQLite vs a mirrored Postgres, same 54 invocations.
 sweep-backends PGURL: build
     bash scripts/parity-sweep.sh backends {{PGURL}}
 

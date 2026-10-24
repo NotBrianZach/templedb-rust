@@ -88,9 +88,15 @@ impl Fixture {
     ) -> anyhow::Result<templedb_db::SetOutcome> {
         let clock = Clock::at("2026-10-21 12:00:00").unwrap();
         let mut tx = self.writer.transaction()?;
+        // The default write: intent recorded, no session pinned, an
+        // author so the column is exercised rather than left NULL on
+        // every row.
         let opts = templedb_db::SetOptions {
             if_match,
             allow_mojibake: false,
+            skip_intent: false,
+            session: None,
+            author: Some("write-parity"),
         };
         let outcome = set_file(&mut tx, &clock, self.project_id, path, content, &opts);
         match outcome {
@@ -142,6 +148,53 @@ impl Fixture {
             )
             .unwrap()?;
         Some((row.get_i64(0).unwrap(), row.get_i64(1).unwrap()))
+    }
+
+    /// Every `edit_intents` row for one path, oldest first, as
+    /// `(base_revision, new_content_hash, patch_summary, author,
+    /// description, status, session_id)`.
+    ///
+    /// Read through [`Store`] rather than the writer's own connection,
+    /// which is the cross-read rule applied to the provenance table
+    /// too: the write is only verified if something *else* can see it.
+    #[allow(clippy::type_complexity)]
+    fn intents(
+        &self,
+        path: &str,
+    ) -> Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i64>,
+    )> {
+        let url = scratch_url().unwrap();
+        let store = templedb_db::PgStore::connect(&url).unwrap();
+        store
+            .query(
+                "SELECT base_revision, new_content_hash, patch_summary, author,
+                        description, status, session_id
+                   FROM edit_intents
+                  WHERE project_id = ?1 AND file_path = ?2
+                  ORDER BY id",
+                &[Value::from(self.project_id), Value::from(path)],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.get_string(0).unwrap(),
+                    r.get_string(1).unwrap(),
+                    r.get_opt_string(2).unwrap(),
+                    r.get_opt_string(3).unwrap(),
+                    r.get_opt_string(4).unwrap(),
+                    r.get_string(5).unwrap(),
+                    r.get_opt_i64(6).unwrap(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -382,6 +435,7 @@ fn the_mojibake_guard_refuses_through_the_write_path() {
     let opts = templedb_db::SetOptions {
         if_match: None,
         allow_mojibake: true,
+        ..Default::default()
     };
     let clock = Clock::at("2026-10-21 12:00:00").unwrap();
     let mut tx = f.writer.transaction().unwrap();
@@ -406,4 +460,206 @@ fn empty_content_is_written_with_zero_lines() {
     assert_eq!(out.size_bytes, 0);
     assert_eq!(f.read_back("empty.txt").as_deref(), Some(""));
     assert_eq!(f.stats("empty.txt"), Some((0, 0)));
+}
+
+/// Guard five: every write leaves an `edit_intents` row, and the values
+/// are Python's.
+///
+/// `base_revision` is the interesting one. It is `'new-file'` for the
+/// first write and the *previous content hash* for the second, which is
+/// what makes a stale-base overwrite auditable after the fact — the
+/// column held the literal `'current'` on all 886 rows migration 123
+/// catalogued, so the field designed to record what an edit was made
+/// against recorded nothing at all.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn every_write_records_an_intent_with_pythons_values() {
+    let mut f = fixture!("wp-intent");
+
+    let first = f.set("src/a.rs", "one\n", None).unwrap();
+    let second = f.set("src/a.rs", "two\n", None).unwrap();
+
+    // Both ids are real and distinct, and the command reports them.
+    let (id1, id2) = (
+        first.intent_id.expect("first write records an intent"),
+        second.intent_id.expect("second write records an intent"),
+    );
+    assert_ne!(id1, id2);
+    assert!(id1 > 0 && id2 > id1, "ids are {id1} and {id2}");
+
+    let rows = f.intents("src/a.rs");
+    assert_eq!(rows.len(), 2, "one row per write: {rows:?}");
+
+    // First write: no prior content.
+    assert_eq!(rows[0].0, "new-file");
+    assert_eq!(rows[0].1, templedb_db::content_hash("one\n"));
+    assert_eq!(rows[0].2.as_deref(), Some("4 bytes"));
+    assert_eq!(rows[0].3.as_deref(), Some("write-parity"));
+    assert_eq!(rows[0].4.as_deref(), Some("file set"));
+    assert_eq!(rows[0].5, "applied");
+    // No pin, so NULL — which is what the column already permits and
+    // what 976 of the 1,220 live rows hold.
+    assert_eq!(rows[0].6, None);
+
+    // Second write: the base is the hash the first write left.
+    assert_eq!(rows[1].0, templedb_db::content_hash("one\n"));
+    assert_eq!(rows[1].1, templedb_db::content_hash("two\n"));
+    assert_eq!(rows[1].2.as_deref(), Some("4 bytes"));
+}
+
+/// `--skip-intent` writes the file and records nothing. Both halves
+/// asserted, because a flag that skipped the write as well would pass
+/// the half that only checks the table.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn skip_intent_writes_the_file_and_records_nothing() {
+    let mut f = fixture!("wp-skip-intent");
+    let clock = Clock::at("2026-10-23 12:00:00").unwrap();
+    let opts = templedb_db::SetOptions {
+        skip_intent: true,
+        ..Default::default()
+    };
+    let mut tx = f.writer.transaction().unwrap();
+    let out = set_file(&mut tx, &clock, f.project_id, "q.rs", "q\n", &opts).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(out.intent_id, None);
+    assert_eq!(f.read_back("q.rs").as_deref(), Some("q\n"));
+    assert!(f.intents("q.rs").is_empty());
+}
+
+/// `patch_summary` is a *byte* count, not a character count — Python's
+/// `len(content_bytes)`. Asserted with multibyte content, which is the
+/// only input that tells the two apart.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn the_patch_summary_counts_bytes_not_characters() {
+    let mut f = fixture!("wp-intent-bytes");
+    // Four characters, seven bytes: é and ✓ are two and three.
+    let content = "aé✓\n";
+    assert_eq!(content.chars().count(), 4);
+    assert_eq!(content.len(), 7);
+
+    f.set("u.txt", content, None).unwrap();
+    assert_eq!(f.intents("u.txt")[0].2.as_deref(), Some("7 bytes"));
+}
+
+/// A refused write records no intent, which is the whole reason the
+/// insert is inside the transaction.
+///
+/// Python gets this by *ordering* — intent after write — and its
+/// comment records what the other order cost: the 2026-09-14 "intent
+/// applied but file_cat returns nothing" bug, where a failed write left
+/// a `status = 'applied'` row that survived the abort. Here the
+/// rollback covers both tables, so no ordering can produce that row.
+/// Written as a test rather than trusted, because "it is in the
+/// transaction" is exactly the kind of claim that stops being true
+/// silently.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_refused_write_records_no_intent() {
+    let mut f = fixture!("wp-intent-refused");
+    f.set("r.rs", "base\n", None).unwrap();
+    let before = f.intents("r.rs").len();
+    assert_eq!(before, 1);
+
+    // A stale `--if-match`, which refuses after `record_intent` would
+    // have been reached had it been outside the transaction.
+    let err = f.set("r.rs", "new\n", Some("deadbeef")).unwrap_err();
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NOT_FOUND);
+
+    assert_eq!(f.read_back("r.rs").as_deref(), Some("base\n"));
+    assert_eq!(
+        f.intents("r.rs").len(),
+        before,
+        "a refused write left a provenance row claiming it applied"
+    );
+}
+
+/// A pinned session is stamped on the intent, and it is the *resolved*
+/// one — so an id naming a session that has ended is refused rather
+/// than recorded.
+///
+/// That last half is a deliberate divergence. Python's intent path does
+/// not call `get_current_session()`; it reads `TEMPLEDB_SESSION_ID`
+/// directly and swallows a parse failure to NULL, so it records dead
+/// session ids. This port has one resolver and it checks liveness.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_pinned_session_is_recorded_and_a_dead_one_is_refused() {
+    let mut f = fixture!("wp-intent-session");
+
+    // Two sessions this test owns: one live, one ended. Ids well above
+    // anything the mirror carries, for the same reason the fixture's
+    // project id is.
+    let (live, dead) = {
+        let mut tx = f.writer.transaction().unwrap();
+        let row = tx
+            .query_one(
+                "INSERT INTO vcs_sessions (id, ended_at) VALUES
+                     ((SELECT COALESCE(MAX(id), 0) + 1000 FROM vcs_sessions), NULL)
+                 RETURNING id",
+                &[],
+            )
+            .unwrap();
+        let live: i64 = row.get(0);
+        let row = tx
+            .query_one(
+                "INSERT INTO vcs_sessions (id, ended_at)
+                 VALUES ($1, '2026-10-07 12:00:00') RETURNING id",
+                &[&(live + 1)],
+            )
+            .unwrap();
+        let dead: i64 = row.get(0);
+        tx.commit().unwrap();
+        (live, dead)
+    };
+
+    // The live one resolves and lands on the intent.
+    let session = {
+        let mut tx = f.writer.transaction().unwrap();
+        let s = templedb_db::resolve_session_tx(&mut tx, Some(&live.to_string())).unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    assert_eq!(session.map(|s| s.get()), Some(live));
+
+    let clock = Clock::at("2026-10-23 12:00:00").unwrap();
+    let opts = templedb_db::SetOptions {
+        session,
+        author: Some("write-parity"),
+        ..Default::default()
+    };
+    let mut tx = f.writer.transaction().unwrap();
+    set_file(&mut tx, &clock, f.project_id, "s.rs", "s\n", &opts).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(f.intents("s.rs")[0].6, Some(live));
+
+    // The ended one never becomes a SessionId at all, so it cannot
+    // reach the column.
+    let mut tx = f.writer.transaction().unwrap();
+    let err = templedb_db::resolve_session_tx(&mut tx, Some(&dead.to_string())).unwrap_err();
+    drop(tx);
+    assert!(
+        format!("{err}").contains("references no live session"),
+        "{err}"
+    );
+
+    // Clean up the two session rows; `Fixture`'s `Drop` only takes the
+    // project. In a block so the borrow of `f.writer` ends before `f`
+    // itself is dropped — an `if let` here holds it one scope too long
+    // and the destructor cannot run.
+    //
+    // `unwrap`, not a swallowed error: a session row this test leaves
+    // behind is a row the *next* run of it collides with, and failing
+    // loudly here is how that gets noticed.
+    {
+        let mut tx = f.writer.transaction().unwrap();
+        tx.execute(
+            "DELETE FROM vcs_sessions WHERE id IN ($1, $2)",
+            &[&live, &dead],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
 }

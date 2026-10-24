@@ -1,41 +1,47 @@
 //! `templedb vcs ...` reads.
 //!
-//! # Why only part of `vcs log` is here
+//! # `vcs log`'s three views, and the one that took a session
 //!
-//! The Python command has three visibility modes and its default is the
-//! one this port cannot reproduce. `--published` shows commits with
-//! `session_id IS NULL` — the shared branch view; `--all-sessions`
-//! shows everything; and the default shows the published set *plus the
-//! commits owned by your current session*.
+//! The Python command has three visibility modes. `--published` shows
+//! commits with `session_id IS NULL` — the shared branch view;
+//! `--all-sessions` shows everything; and the default shows the
+//! published set *plus the commits owned by your current session*.
 //!
-//! That last one resolves the session through
-//! `VCSService.get_current_session()`, which is six fallbacks deep —
-//! a `--session` override, then `TEMPLEDB_SESSION_ID`, then an
-//! instance cache, then `TEMPLEDB_SESSION`, then a lookup keyed on the
-//! session-leader PID within the last 24 hours, then one keyed on the
-//! PPID — and if none of them hit, it **creates a session row**. So the
-//! default view is both environment-dependent and a write path. Neither
-//! belongs in this crate.
+//! The default was absent from this port until 2026-10-23, because
+//! resolving "your session" goes through
+//! `VCSService.get_current_session()` — seven steps deep, and **two of
+//! them insert a row**. A read command that creates a session is the one
+//! thing this crate is built to make impossible.
 //!
-//! So [`commit_log`] takes the visibility explicitly and the CLI
-//! defaults to [`Visibility::Published`], which is the reproducible
-//! shared view. The command prints which view it used, exactly as the
-//! Python one does, so the output says what it is rather than leaving
-//! the reader to assume it matches a `templedb vcs log` run.
+//! What closed the gap is not a reimplementation of those seven steps
+//! but a decision to port two of them: `session.rs` accepts a session
+//! the caller *named* and declines to guess otherwise. So [`commit_log`]
+//! takes the visibility explicitly, and the CLI passes
+//! [`Visibility::Session`] when a session resolved and
+//! [`Visibility::Published`] when none did — printing which view it
+//! used, exactly as the Python command does, so the output says what it
+//! is rather than leaving the reader to assume.
+//!
+//! The practical difference from Python is narrow and one-directional:
+//! with `TEMPLEDB_SESSION_ID` set, the two agree byte for byte; without
+//! it, Python invents a session (which owns no commits, so its default
+//! view *is* the published set) and this port says `published only`
+//! instead of `default view`. One header line, and the honest one.
 
 use crate::like::escape_like;
+use crate::session::SessionId;
 use crate::store::Store;
 use crate::value::Value;
 use anyhow::{Context, Result};
 
 /// Which commits a log should include.
-///
-/// Python's default — published plus the caller's own session — is
-/// absent on purpose; see the module note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     /// `session_id IS NULL`: the shared branch view.
     Published,
+    /// Published, plus the commits owned by this session. Python's
+    /// default, and this port's whenever a session resolved.
+    Session(SessionId),
     /// No session filter at all.
     All,
 }
@@ -46,6 +52,7 @@ impl Visibility {
     pub fn label(self) -> &'static str {
         match self {
             Visibility::Published => "published only",
+            Visibility::Session(_) => "default view (published + your unpublished)",
             Visibility::All => "all commits (no session filter)",
         }
     }
@@ -141,6 +148,12 @@ pub fn commit_log(
     // reproduced rather than improved because the two are diffed.
     let visibility_clause = match visibility {
         Visibility::Published => " AND c.session_id IS NULL",
+        // `?4` and not `?3`: the parameters are positional, so the
+        // session has to come after the limit rather than beside the
+        // clause it belongs to. Pushed below, only when this arm is
+        // taken — a `?4` with no fourth parameter is an error on both
+        // backends, which is the right failure for a mismatch here.
+        Visibility::Session(_) => " AND (c.session_id IS NULL OR c.session_id = ?4)",
         Visibility::All => "",
     };
     // `CAST(?2 AS TEXT) IS NULL` rather than `?2 IS NULL`: Postgres
@@ -157,15 +170,17 @@ pub fn commit_log(
           LIMIT ?3"
     );
 
+    let mut params = vec![
+        Value::from(project_id),
+        Value::from(branch),
+        Value::from(limit),
+    ];
+    if let Visibility::Session(session) = visibility {
+        params.push(Value::from(session.get()));
+    }
+
     let rows = store
-        .query(
-            &sql,
-            &[
-                Value::from(project_id),
-                Value::from(branch),
-                Value::from(limit),
-            ],
-        )
+        .query(&sql, &params)
         .context("reading commit history")?;
 
     rows.iter()
@@ -180,6 +195,73 @@ pub fn commit_log(
             })
         })
         .collect()
+}
+
+/// The project's active branch: `projects.active_branch_id`, or whichever
+/// branch is flagged default.
+///
+/// Python's `get_active_branch`, and both halves of it. Extracted when
+/// `vcs log`'s pending advisory became the second caller — the first is
+/// [`branches`], which marks the active row with a `*`.
+///
+/// The fallback's `ORDER BY id` is this port's addition. Nothing stops
+/// two branches of one project from both being flagged default, and
+/// Python's `LIMIT 1` with no ordering takes the planner's pick; ordering
+/// makes the pick at least the same on every run and on both backends.
+fn active_branch_id(store: &dyn Store, project_id: i64) -> Result<Option<i64>> {
+    let active = store
+        .query_opt(
+            "SELECT vb.id
+               FROM projects p
+               JOIN vcs_branches vb ON vb.id = p.active_branch_id
+              WHERE p.id = ?1",
+            &[Value::from(project_id)],
+        )
+        .context("resolving the active branch")?;
+    match active {
+        Some(r) => Ok(Some(r.get_i64(0)?)),
+        None => store
+            .query_opt(
+                "SELECT id FROM vcs_branches
+                  WHERE project_id = ?1 AND is_default = 1
+                  ORDER BY id LIMIT 1",
+                &[Value::from(project_id)],
+            )
+            .context("resolving the default branch")?
+            .map(|r| r.get_i64(0))
+            .transpose(),
+    }
+}
+
+/// How many commits on the active branch belong to `session` — the
+/// number `vcs log --published` puts in its advisory line.
+///
+/// Scoped to the *active* branch and not to the project, which is
+/// Python's choice and worth stating because it reads like an oversight:
+/// the advisory says "re-run with `--session` to include", and `--session`
+/// is not branch-scoped, so a session holding commits on another branch
+/// is counted as zero here and then appears in the fuller view. Kept as
+/// Python has it, because the number is on stdout.
+///
+/// Returns 0 when the project has no resolvable branch at all. Python
+/// skips the whole block in that case, which is the same answer by a
+/// different route: the advisory prints only on a non-zero count.
+pub fn pending_in_session(store: &dyn Store, project_id: i64, session: SessionId) -> Result<i64> {
+    let Some(branch_id) = active_branch_id(store, project_id)? else {
+        return Ok(0);
+    };
+    let rows = store
+        .query(
+            "SELECT COUNT(*) FROM vcs_commits
+              WHERE project_id = ?1 AND branch_id = ?2 AND session_id = ?3",
+            &[
+                Value::from(project_id),
+                Value::from(branch_id),
+                Value::from(session.get()),
+            ],
+        )
+        .context("counting the session's pending commits")?;
+    rows.first().map_or(Ok(0), |r| r.get_i64(0))
 }
 
 /// One commit's metadata, as `vcs show` heads its output with.
@@ -689,44 +771,13 @@ pub struct BranchEntry {
 /// Only the listing path. Creating and deleting branches are writes and
 /// stay with the rest of the write paths.
 ///
-/// # Resolving the active branch
-///
-/// Python tries `projects.active_branch_id` first and falls back to
-/// whichever branch has `is_default = 1`. Both are reproduced,
-/// including the fallback's `LIMIT 1` — nothing stops two branches of
-/// one project from both being flagged default, and in that case Python
-/// takes the planner's pick. The fallback here orders by `id` so the
-/// pick is at least the same on every run.
-///
 /// # Ordering
 ///
 /// `ORDER BY is_default DESC, branch_name`, as Python has it, and this
 /// time no tie-break is needed: `UNIQUE(project_id, branch_name)` makes
 /// the second key total on its own.
 pub fn branches(store: &dyn Store, project_id: i64) -> Result<Vec<BranchEntry>> {
-    // `active_branch_id` first, then the default-branch fallback.
-    let active = store
-        .query_opt(
-            "SELECT vb.id
-               FROM projects p
-               JOIN vcs_branches vb ON vb.id = p.active_branch_id
-              WHERE p.id = ?1",
-            &[Value::from(project_id)],
-        )
-        .context("resolving the active branch")?;
-    let active_id = match active {
-        Some(r) => Some(r.get_i64(0)?),
-        None => store
-            .query_opt(
-                "SELECT id FROM vcs_branches
-                  WHERE project_id = ?1 AND is_default = 1
-                  ORDER BY id LIMIT 1",
-                &[Value::from(project_id)],
-            )
-            .context("resolving the default branch")?
-            .map(|r| r.get_i64(0))
-            .transpose()?,
-    };
+    let active_id = active_branch_id(store, project_id)?;
 
     let rows = store
         .query(
@@ -768,6 +819,12 @@ mod tests {
         entries.iter().map(|e| e.commit_hash.as_str()).collect()
     }
 
+    /// A pinned session, without going through [`resolve`](crate::session::resolve)
+    /// and its environment. The fixture's live ids are 7 and 9.
+    fn session(id: i64) -> SessionId {
+        SessionId::in_test(id)
+    }
+
     /// Newest first, and the published view hides session-owned
     /// commits. `C3` is unpublished.
     #[test]
@@ -789,6 +846,82 @@ mod tests {
         let unpublished = all.iter().find(|e| e.commit_hash == "C3").unwrap();
         assert_eq!(unpublished.session_id, Some(7));
         assert_eq!(all[0].session_id, None);
+    }
+
+    /// The default view: published plus *this* session's commits. C3
+    /// belongs to session 7, so pinning 7 includes it and pinning 9 —
+    /// also live, owning nothing — does not.
+    #[test]
+    fn the_session_view_includes_only_its_own_unpublished_commits() {
+        let c = testdb::fixture();
+        let mine = commit_log(&c, 1, None, Visibility::Session(session(7)), 10).unwrap();
+        assert_eq!(hashes(&mine), ["C4", "C2", "C3", "C1", "ABCD1234EFFF"]);
+
+        let theirs = commit_log(&c, 1, None, Visibility::Session(session(9)), 10).unwrap();
+        assert_eq!(hashes(&theirs), ["C4", "C2", "C1", "ABCD1234EFFF"]);
+        // Which is the published view exactly, and that is the point:
+        // a session owning nothing sees what everyone sees.
+        assert_eq!(
+            hashes(&theirs),
+            hashes(&commit_log(&c, 1, None, Visibility::Published, 10).unwrap())
+        );
+    }
+
+    /// `IS NULL OR = ?`, not `= ?`. An implementation that filtered on
+    /// the session alone would drop every published commit, and the
+    /// shape of the bug is a log that suddenly holds one entry.
+    #[test]
+    fn the_session_view_does_not_replace_the_published_set() {
+        let c = testdb::fixture();
+        let mine = commit_log(&c, 1, None, Visibility::Session(session(7)), 10).unwrap();
+        assert!(mine.iter().any(|e| e.session_id == Some(7)));
+        assert!(mine.iter().any(|e| e.session_id.is_none()));
+    }
+
+    /// The three labels are on stdout, so they are part of the
+    /// contract rather than decoration.
+    #[test]
+    fn each_view_prints_pythons_label() {
+        assert_eq!(Visibility::Published.label(), "published only");
+        assert_eq!(
+            Visibility::Session(session(7)).label(),
+            "default view (published + your unpublished)"
+        );
+        assert_eq!(Visibility::All.label(), "all commits (no session filter)");
+    }
+
+    /// Scoped to the active branch, which for `alpha` is `feature`
+    /// (pinned by `active_branch_id`) — and that is where C3 sits.
+    #[test]
+    fn pending_counts_the_sessions_commits_on_the_active_branch() {
+        let c = testdb::fixture();
+        assert_eq!(pending_in_session(&c, 1, session(7)).unwrap(), 1);
+        // A live session owning nothing has nothing pending, which is
+        // the state just after a publish and the reason the advisory is
+        // conditional.
+        assert_eq!(pending_in_session(&c, 1, session(9)).unwrap(), 0);
+    }
+
+    /// Python's branch scoping, reproduced including what it costs.
+    /// `beta`'s active branch is `main` by the `is_default` fallback,
+    /// and session 7 owns nothing there — so a session with commits
+    /// elsewhere still counts zero. The advisory says "re-run with
+    /// --session to include", which is not branch-scoped, so the two
+    /// numbers can disagree. Kept as Python has it: it is on stdout.
+    #[test]
+    fn pending_is_branch_scoped_even_though_the_advisory_is_not() {
+        let c = testdb::fixture();
+        assert_eq!(pending_in_session(&c, 2, session(7)).unwrap(), 0);
+    }
+
+    /// A project with no branch at all returns 0 rather than erroring.
+    /// Python skips the block entirely in that case, which is the same
+    /// answer by a different route — the advisory prints only on a
+    /// non-zero count.
+    #[test]
+    fn pending_is_zero_for_a_project_with_no_resolvable_branch() {
+        let c = testdb::fixture();
+        assert_eq!(pending_in_session(&c, 3, session(7)).unwrap(), 0);
     }
 
     /// `C2` and `C3` share a timestamp. `id ASC` shows them in the
@@ -866,12 +999,6 @@ mod tests {
             "an inner join should have dropped C9: {:?}",
             hashes(&all)
         );
-    }
-
-    #[test]
-    fn labels_match_the_python_header() {
-        assert_eq!(Visibility::Published.label(), "published only");
-        assert_eq!(Visibility::All.label(), "all commits (no session filter)");
     }
 
     #[test]

@@ -504,19 +504,28 @@ pub fn live_reconciliations(store: &dyn Store, limit: i64) -> Result<Vec<Reconci
         .collect()
 }
 
-/// Unacked notes addressed to `session_id`, and unacked broadcasts.
+/// Unacked notes addressed to `inbox`, and unacked broadcasts.
 ///
-/// `session_id` is an argument for the same reason `today` is: Python
-/// builds it from `TEMPLEDB_SESSION_ID` or `(hostname, getppid())` at
-/// the point of use, which makes the pane a function of which shell
-/// invoked the command. Resolving it at the edge at least puts the
-/// dependency somewhere a caller can see and a test can fix.
-pub fn handoff_inbox(store: &dyn Store, session_id: &str) -> Result<HandoffInbox> {
+/// `inbox` is a **string address** matched against
+/// `handoff_notes.to_session`, not a [`SessionId`](crate::SessionId).
+/// The parameter was called `session_id` until 2026-10-23 and that name
+/// was the problem: the two identities read one environment variable
+/// and mean different things, so a signature saying `session_id` next
+/// to a module that resolves VCS sessions reads as an invitation to
+/// pass the wrong one. `&str` is what stops it being possible; the name
+/// is what stops it being attempted.
+///
+/// It is an argument for the same reason `today` is: Python builds it
+/// from `TEMPLEDB_SESSION_ID` or `(hostname, getppid())` at the point
+/// of use, which makes the pane a function of which shell invoked the
+/// command. Resolving it at the edge at least puts the dependency
+/// somewhere a caller can see and a test can fix.
+pub fn handoff_inbox(store: &dyn Store, inbox: &str) -> Result<HandoffInbox> {
     let direct = count(
         store,
         "SELECT COUNT(*) FROM handoff_notes
           WHERE to_session = ?1 AND acked_at IS NULL",
-        &[Value::from(session_id)],
+        &[Value::from(inbox)],
         "direct handoffs",
     )?;
     let broadcast = count(
@@ -554,7 +563,7 @@ pub struct SummaryFacts {
 ///
 /// Takes the clock only to derive `date('now')` for the review-due
 /// count, and the session id for the inbox. Neither is read here.
-pub fn observe(store: &dyn Store, clock: &Clock, session_id: &str) -> Result<SummaryFacts> {
+pub fn observe(store: &dyn Store, clock: &Clock, inbox: &str) -> Result<SummaryFacts> {
     Ok(SummaryFacts {
         graph: graph_facts(store)?,
         adapters: ingest_adapters(store)?,
@@ -563,7 +572,7 @@ pub fn observe(store: &dyn Store, clock: &Clock, session_id: &str) -> Result<Sum
         reconciliations: live_reconciliations(store, 50)?,
         machines: fleet_reconciles(store)?,
         hygiene: hygiene(store)?,
-        handoffs: handoff_inbox(store, session_id)?,
+        handoffs: handoff_inbox(store, inbox)?,
     })
 }
 

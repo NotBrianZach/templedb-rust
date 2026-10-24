@@ -245,6 +245,36 @@ enum FileCmd {
         /// pass. Exits 3.
         #[arg(long)]
         allow_mojibake: bool,
+        /// Do not record an `edit_intents` row for this write.
+        ///
+        /// The record is provenance — who set this, when, from which
+        /// session — and it is written inside the same transaction as
+        /// the write, so unlike Python's it cannot fail independently
+        /// of it. That is also why this flag matters more here than
+        /// there: Python swallows an intent failure and still writes,
+        /// and this refuses the write. A caller who wants the one
+        /// without the other says so.
+        #[arg(long)]
+        skip_intent: bool,
+        /// Record the intent against this session. A numeric id naming
+        /// a live row; outranks `TEMPLEDB_SESSION_ID`.
+        ///
+        /// An id and not a name. Python accepts `ID|NAME` and its name
+        /// path *creates* the session when none matches, which is the
+        /// one thing this port will not do — see *Sessions* in the
+        /// README. `--session 1163` works; `--session my-agent` is
+        /// refused and says why.
+        ///
+        /// Python's reason for having the flag at all applies here
+        /// unchanged, and it is a subprocess problem: identity is
+        /// resolved independently by whichever process writes, so
+        /// `templedb reports reindex` shelling out to `file set` lands
+        /// its stage in a session the parent is not looking at. That
+        /// bit twice on 2026-10-08, each time blocking a publish. The
+        /// port has no stage to misplace yet, but the intent's
+        /// `session_id` is the same column answering the same question.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
     },
     /// List tracked files, optionally under a path prefix
     Ls {
@@ -347,14 +377,14 @@ enum EntityCmd {
 enum VcsCmd {
     /// Show commit history.
     ///
-    /// Defaults to the published view — commits on the shared branch.
-    /// The Python command's default additionally includes commits owned
-    /// by your current staging session, which this port does not
-    /// reproduce: resolving "your session" runs six fallbacks over
-    /// environment variables and process ids and creates a session row
-    /// if none of them hit, which is both environment-dependent and a
-    /// write. The view is printed in the header either way, so the
-    /// output says which one you got.
+    /// Defaults to Python's default view — the published commits plus
+    /// the ones owned by your session — when a session is identified,
+    /// and to the published view alone when none is. A session is
+    /// identified by `TEMPLEDB_SESSION_ID` naming a live row and by
+    /// nothing else: Python would additionally guess from the process
+    /// tree and *create* a row if it had to, which is a write a read
+    /// command must not perform. The view is printed in the header
+    /// either way, so the output says which one you got.
     Log {
         project: String,
         /// Number of commits to show
@@ -363,33 +393,35 @@ enum VcsCmd {
         /// Filter by branch name (exact)
         #[arg(short, long)]
         branch: Option<String>,
+        /// Accepted and ignored, as Python's is: including your
+        /// session's unpublished commits is the default.
+        ///
+        /// Python marks it `[deprecated no-op — this is now the
+        /// default]` and that is exactly what it is on both sides. The
+        /// `--no-fts` test applies and passes: a no-op flag is only
+        /// harmful when the thing it names is absent, and here the
+        /// default view it asks for is the default view you get.
+        #[arg(long)]
+        session: bool,
         /// Show every commit, including other sessions' unpublished
-        /// ones. This is the one view that is identical to Python's,
-        /// because it consults no session at all.
+        /// ones. The one view that consults no session at all.
         #[arg(long)]
         all_sessions: bool,
-        /// Show only published commits — which is already the default
-        /// here.
+        /// Show only published commits, hiding your session's
+        /// unpublished ones.
         ///
-        /// Accepted because it selects behaviour this port *has*, and
-        /// because it is the most portable of Python's three views: it
-        /// is the only one that needs no session. A script written
-        /// `vcs log --published` works against Python and exited 2
-        /// against this binary until 2026-10-21, which is the opposite
-        /// of the compatibility a port is for.
-        ///
-        /// Deliberately not the same decision as `search content`'s
-        /// `--no-fts`, which is *not* accepted. That one promises
-        /// different matching and would silently deliver none; this one
-        /// promises the published view and delivers exactly it. A no-op
-        /// flag is only harmful when the thing it names is absent.
+        /// No longer a no-op: until the session view landed this
+        /// selected the behaviour the port already had, and now it
+        /// selects a narrower one. It is still the most portable of
+        /// Python's three views, being the only one that needs no
+        /// session at all.
         ///
         /// `--all-sessions` wins if both are passed, which is Python's
         /// precedence inverted — its `--published` overrides
         /// `--all-sessions`. Reproducing the inversion would mean
-        /// `--published` silently discarding the one view this port
-        /// renders identically; conflicting flags are better refused,
-        /// so clap refuses them.
+        /// `--published` silently discarding a view the caller asked
+        /// for; conflicting flags are better refused, so clap refuses
+        /// them.
         #[arg(long, conflicts_with = "all_sessions")]
         published: bool,
     },
@@ -746,6 +778,8 @@ fn run() -> Result<i32> {
                 if_match,
                 verify,
                 allow_mojibake,
+                skip_intent,
+                session: pin,
             } => {
                 // Read the content before opening anything, so a
                 // refusal on stdin does not leave a connection or a
@@ -785,11 +819,26 @@ fn run() -> Result<i32> {
 
                 let mut writer = templedb_db::PgWriter::open()?;
                 let clock = templedb_db::Clock::from_env()?;
+                // The author, like the clock and the session, is read
+                // here and nowhere deeper. Python's order exactly:
+                // TEMPLEDB_AUTHOR, then USER, then NULL — and an
+                // exported-but-empty variable falls through, because
+                // Python's `or` treats `''` as unset.
+                let author = edit_author();
+                let mut tx = writer.transaction()?;
+                // Resolved against the *write* target and inside the
+                // write transaction, for the same reason the slug is:
+                // the reader and the writer point at different
+                // databases, and validating a session against one while
+                // stamping it into the other would be a nasty bug.
+                let session = templedb_db::resolve_session_tx(&mut tx, pin.as_deref())?;
                 let opts = templedb_db::SetOptions {
                     if_match: if_match.as_deref(),
                     allow_mojibake,
+                    skip_intent,
+                    session,
+                    author: author.as_deref(),
                 };
-                let mut tx = writer.transaction()?;
                 let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
                 let outcome =
                     templedb_db::set_file(&mut tx, &clock, project_id, &path, &content, &opts);
@@ -825,6 +874,16 @@ fn run() -> Result<i32> {
                     notes.push("unchanged".to_string());
                 } else if let Some(prev) = &outcome.previous {
                     notes.push(format!("was {}", &prev[..12.min(prev.len())]));
+                }
+                // Python prints `  intent: #N` on stdout, after its
+                // `✓ Set <path>` line. Here it joins the stderr
+                // commentary, because this command's stdout is the hash
+                // and nothing else — a script chains on it. The id is
+                // still worth printing for the reason Python gives:
+                // "so scripted callers can inspect / cancel it later".
+                match outcome.intent_id {
+                    Some(id) => notes.push(format!("intent #{id}")),
+                    None => notes.push("no intent recorded".to_string()),
                 }
                 eprintln!(
                     "{project}/{path}: {} bytes, {} lines{}",
@@ -1210,24 +1269,66 @@ fn run() -> Result<i32> {
                 n,
                 branch,
                 all_sessions,
-                // Accepted and intentionally unread: the published view
-                // is this port's default, so the flag names what the
-                // `else` arm below already does. Bound rather than
-                // matched with `..` so that adding a third view cannot
+                published,
+                // Accepted and intentionally unread, as Python's is:
+                // the session view is the default on both sides, so the
+                // flag names what happens anyway. Bound rather than
+                // matched with `..` so that adding a fourth view cannot
                 // quietly leave this one unhandled.
-                published: _,
+                session: _,
             } => {
                 let p = resolve_project_row(&store, &project)?;
-                let visibility = if all_sessions {
-                    templedb_db::Visibility::All
-                } else {
-                    templedb_db::Visibility::Published
+                // Before the queries, and at the edge: the identity is
+                // an argument from here down, exactly as the clock is.
+                // `None` for the pin because `vcs log` has no
+                // `--session <id>` — Python's is a boolean no-op on this
+                // command, and the `ID|NAME` form lives on the staging
+                // commands.
+                let session = templedb_db::resolve_session(store.as_ref(), None)?;
+                if let Some(name) = templedb_db::ignored_name(session) {
+                    eprintln!(
+                        "warning: {} is set to {name:?} and this port does not resolve a \
+                         session by name, so the view below may differ from Python's. \
+                         Set {} to an id to pin one.",
+                        templedb_db::SESSION_NAME_ENV,
+                        templedb_db::SESSION_ID_ENV
+                    );
+                }
+                let visibility = match (all_sessions, published, session) {
+                    (true, _, _) => templedb_db::Visibility::All,
+                    // `--published` is the only way to ask for the
+                    // narrow view once a session resolves.
+                    (_, true, _) => templedb_db::Visibility::Published,
+                    (_, _, Some(s)) => templedb_db::Visibility::Session(s),
+                    // Python invents a session here. Its view is then
+                    // the published set anyway — a fresh session owns
+                    // nothing — so the rows agree and only the header
+                    // label differs.
+                    (_, _, None) => templedb_db::Visibility::Published,
                 };
                 let commits =
                     templedb_db::commit_log(&store, p.id, branch.as_deref(), visibility, n)?;
 
                 println!();
                 println!("Commit log for {} [{}]", p.slug, visibility.label());
+                // The advisory, which Python prints only under the
+                // published view and only when the count is non-zero.
+                // It needs a session, and when none resolved there is
+                // nothing to count: Python would have created one, and a
+                // session created a moment ago owns no commits, so the
+                // line is absent on both sides for the same reason.
+                if visibility == templedb_db::Visibility::Published {
+                    if let Some(s) = session {
+                        let pending = templedb_db::pending_in_session(store.as_ref(), p.id, s)?;
+                        if pending > 0 {
+                            println!(
+                                "  * {pending} pending commit(s) in your session \
+                                 — re-run with --session to include, or `templedb publish` \
+                                 to fast-forward onto shared HEAD."
+                            );
+                        }
+                    }
+                }
                 println!();
                 if commits.is_empty() {
                     println!("No commits found");
@@ -1524,12 +1625,17 @@ fn run() -> Result<i32> {
             // deeper. `Clock::from_env` honours `TEMPLEDB_RS_NOW`, which
             // is what makes a rendered pane reproducible at all.
             let clock = templedb_db::Clock::from_env()?;
-            let session = session_id();
+            // The handoff address, NOT a VCS session id. `summary` has
+            // no business resolving the latter: no pane reads
+            // `vcs_sessions`, and passing a validated integer here
+            // would silently change which notes the inbox matches. See
+            // `handoff_identity`.
+            let inbox = handoff_identity();
             // One call, so no pane can read a database that moved
             // between it and the pane above — the live file is being
             // written by the Python implementation while this runs.
-            let facts = templedb_db::observe(store.as_ref(), &clock, &session)?;
-            for line in summary_view::render(&facts, &clock, &session, !no_color) {
+            let facts = templedb_db::observe(store.as_ref(), &clock, &inbox)?;
+            for line in summary_view::render(&facts, &clock, &inbox, !no_color) {
                 println!("{line}");
             }
         }
@@ -1539,28 +1645,85 @@ fn run() -> Result<i32> {
     Ok(0)
 }
 
-/// Python's session identity: `TEMPLEDB_SESSION_ID`, or
+/// The **handoff** identity: `TEMPLEDB_SESSION_ID`, or
 /// `{hostname}-{getppid()}`.
 ///
-/// This is the third of `summary`'s three layers — environment — and it
-/// is two system calls rather than a query on purpose. The handoff
-/// inbox is scoped to it, which means the pane's answer depends on
-/// *which shell* invoked the command: the same database, read from two
-/// terminals, reports two different inbox counts. Resolving it at the
-/// entry point does not remove that dependency, but it puts it where a
-/// caller can see it and a test can fix it, which is the rule the
-/// write path will need when every insert stamps `datetime('now')`.
+/// # Not the VCS session, and the distinction is load-bearing
+///
+/// This returns a `String` address matched against
+/// `handoff_notes.to_session`. [`resolve_session`](templedb_db::resolve_session)
+/// returns an integer naming a live `vcs_sessions` row. They read the
+/// same environment variable and they are not the same identity — one
+/// is "who should see this note", the other is "which staging session
+/// owns this commit" — and nothing converts between them.
+///
+/// **Reproduced, including the conflation.** Python has these as two
+/// functions that happen to read one variable:
+/// `handoff.py::_current_session_id` returns a string "so unregistered
+/// shells still get a nameable sender", and
+/// `VcsService.get_current_session` returns a row that must exist and
+/// be live. So does this port, deliberately: `summary`'s handoff pane
+/// is byte-identical with Python's and unifying the two would break
+/// that to fix someone else's schema.
+///
+/// They are kept as separate functions with this note rather than
+/// folded together, because folding them is the obvious cleanup and it
+/// is wrong. The variable is one name for two things.
+///
+/// **What the conflation costs, in the live database.** One
+/// `handoff_notes` row has `to_session = '328'` — a note addressed by
+/// the integer scheme, from a sender using the `<hostname>-<ppid>` one.
+/// 328 is not a `vcs_sessions` id at all, so reading that note requires
+/// `TEMPLEDB_SESSION_ID=328`, which is the pin that makes `vcs log`
+/// exit 1 for naming no live session. The note is unacked and
+/// unreachable: the two meanings of its address are mutually exclusive.
+/// That is a TempleDB bug rather than a port bug, and it is why this
+/// comment is longer than the function.
+///
+/// # Why it is two system calls rather than a query
+///
+/// This is the third of `summary`'s three layers — environment. The
+/// handoff inbox is scoped to it, which means the pane's answer depends
+/// on *which shell* invoked the command: the same database, read from
+/// two terminals, reports two different inbox counts. Resolving it at
+/// the entry point does not remove that dependency, but it puts it
+/// where a caller can see it and a test can fix it.
 ///
 /// An exported-but-empty variable falls back, because Python's `or`
 /// treats `''` as unset — the same reading `conn.rs` gives an empty
 /// `TEMPLEDB_PATH`.
-fn session_id() -> String {
+fn handoff_identity() -> String {
     match std::env::var("TEMPLEDB_SESSION_ID") {
         Ok(v) if !v.is_empty() => v,
         // SAFETY: `getppid` takes no arguments, cannot fail, and
         // touches no memory this program owns.
         _ => format!("{}-{}", hostname(), unsafe { libc::getppid() }),
     }
+}
+
+/// `edit_intents.author`: `TEMPLEDB_AUTHOR`, then `USER`, then NULL.
+///
+/// Python's order and Python's emptiness rule — its `or` chain treats
+/// `''` as unset, so an exported-but-empty variable falls through rather
+/// than recording an empty author. The same reading `conn.rs` gives an
+/// empty `TEMPLEDB_PATH` and `session_id` gives an empty
+/// `TEMPLEDB_SESSION_ID`.
+///
+/// Not `_resolve_author()`, which is what the *commit* path uses: that
+/// one falls back to `git config user.name` and then the literal
+/// `'unknown'`. `file set`'s intent reads these two variables and
+/// nothing else, and reproducing the richer chain here would make the
+/// column disagree with Python's on the machines where git is
+/// configured and `USER` is not.
+fn edit_author() -> Option<String> {
+    for key in ["TEMPLEDB_AUTHOR", "USER"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// `socket.gethostname()`.

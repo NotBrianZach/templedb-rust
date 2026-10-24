@@ -1,11 +1,11 @@
 -- TempleDB, Postgres: the objects the Rust port reads.
 --
 -- SCOPE. This is not the schema. The live SQLite database has 163
--- tables, 45 views, 61 triggers and 361 indexes; this file has ten
+-- tables, 45 views, 61 triggers and 361 indexes; this file has nineteen
 -- tables and one view, because that is the entire set the Rust port
 -- touches today. The full translation is the next step toward Postgres
 -- as the primary store and belongs with the write-path design document,
--- not here: the remaining 153 tables have no reader in this codebase
+-- not here: the remaining 144 tables have no reader in this codebase
 -- yet, and mirroring data nothing reads would be work with no way to
 -- verify it.
 --
@@ -13,9 +13,15 @@
 -- keys the joins and uniqueness constraints need. The omitted columns
 -- are not all uninteresting — `project_files` alone has twenty — but
 -- several carry foreign keys to tables outside this subset
--- (`file_types`, `vcs_branches`, `vcs_sessions`), so including them
--- would drag the boundary somewhere arbitrary rather than somewhere
--- defensible.
+-- (`file_types`, `commit_files`), so including them would drag the
+-- boundary somewhere arbitrary rather than somewhere defensible. The
+-- boundary moves when a reader appears and not before: `vcs_sessions`
+-- arrived with `vcs log`'s default view, at two of its ten columns.
+--
+-- `edit_intents` is the one exception to "follow the readers", and it
+-- follows the same rule read sideways: nothing *reads* it here, a
+-- writer *writes* it, and the columns carried are the ones that writer
+-- supplies. Twelve of fourteen.
 --
 -- Load with:  psql -d templedb -f schema/postgres/001_read_subset.sql
 -- Populate with:  templedb-rs mirror --to <url>
@@ -244,6 +250,25 @@ CREATE TABLE vcs_branches (
     UNIQUE (project_id, branch_name)
 );
 
+-- The staging sessions a commit can belong to. Two columns of ten, and
+-- the boundary follows the readers as it does everywhere else: the port
+-- resolves a session the caller *named* and checks that it is live, so
+-- it reads `id` and `ended_at` and nothing more. `name`, `author`,
+-- `host`, `pid`, `started_at`, `ended_reason`,
+-- `expected_lifetime_seconds` and `reap_policy` belong to
+-- `vcs session list` / `show` / `prune`, none of which is ported — and a
+-- column with no reader has nothing to verify a mirror against.
+--
+-- `ended_at IS NULL` means active, which is the one predicate anything
+-- here asks. 842 rows live, 40 of them active.
+CREATE TABLE vcs_sessions (
+    id       bigint PRIMARY KEY,
+    ended_at text COLLATE "C"
+);
+
+-- Active sessions are 5% of the table and the only ones ever looked up.
+CREATE INDEX vcs_sessions_live ON vcs_sessions (id) WHERE ended_at IS NULL;
+
 CREATE TABLE vcs_commits (
     id               bigint PRIMARY KEY,
     project_id       bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -257,9 +282,16 @@ CREATE TABLE vcs_commits (
     author           text COLLATE "C" NOT NULL,
     commit_message   text COLLATE "C" NOT NULL,
     commit_timestamp text COLLATE "C" NOT NULL,
-    -- NULL means published. No FK to `vcs_sessions`, which is not in
-    -- this subset: the port reads the column only to decide whether to
-    -- print `(unpublished)`, never to resolve a session.
+    -- NULL means published; a value means the commit belongs to one
+    -- staging session. `vcs log`'s default view compares it against the
+    -- resolved session and the marker is printed from it either way.
+    --
+    -- Still no FK to `vcs_sessions`, now that the table is here.
+    -- `vcs session prune` deletes ended sessions, and nothing nulls the
+    -- commits that referenced them — so a dangling `session_id` is a
+    -- state the live database can reach, and a mirror that enforced the
+    -- constraint would refuse to load it. Same reasoning as
+    -- `content_hash`, where 509 rows already name a pruned blob.
     session_id       bigint
 );
 
@@ -304,6 +336,58 @@ CREATE TABLE vcs_commit_parents (
     parent_order     bigint NOT NULL,
     PRIMARY KEY (commit_id, parent_commit_id)
 );
+
+-- Provenance for `file set`: who set this, when, from which session.
+--
+-- The first table in this file that exists for a *writer* rather than a
+-- reader, and the column set is chosen accordingly: these are the ones
+-- `record_intent` writes, plus `id`. Twelve of fourteen.
+--
+-- The two omitted are `cancelled_at` and `applied_commit_id`, which
+-- belong to `intent cancel` and to the commit link `vcs commit` would
+-- make. Neither is ported, and `applied_commit_id` additionally
+-- references `vcs_commits` — a column carried for nobody that would also
+-- constrain the load order.
+--
+-- `created_at` is carried even though the writer lets it default,
+-- because `mirror` has to reproduce what the live rows hold and the
+-- cross-backend digest compares it. The DEFAULT exists for the writer;
+-- the column exists for the copy.
+CREATE TABLE edit_intents (
+    id               bigint PRIMARY KEY,
+    -- No FK to `vcs_sessions`, though the live schema declares one.
+    -- Same reasoning as `vcs_commits.session_id` and then some: the
+    -- live constraint is a latent bug rather than a guarantee, because
+    -- `prune_sessions` guards only on `vcs_working_state` and would hit
+    -- this FK on a batch delete. 976 of 1,220 rows are NULL and 218
+    -- reference a session that has already ended.
+    session_id       bigint,
+    project_id       bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    file_path        text COLLATE "C" NOT NULL,
+    -- `'current'` on all 886 rows migration 123 catalogued, which is
+    -- why it is a `constant` in that baseline: the field designed to
+    -- record what an edit was made against never recorded anything.
+    -- It does now — the previous content hash, or the literal
+    -- `'new-file'` — so the two cases stay distinguishable from a
+    -- column that is merely unfilled. DEFAULT reproduced for fidelity;
+    -- the writer always supplies a value.
+    base_revision    text COLLATE "C" NOT NULL DEFAULT 'current',
+    new_content_hash text COLLATE "C" NOT NULL,
+    patch_summary    text COLLATE "C",
+    author           text COLLATE "C",
+    description      text COLLATE "C",
+    -- CHECK'd to ('proposed','applied','cancelled') in SQLite and not
+    -- reproduced, for the reason `ingestion_runs` gives: a constraint
+    -- that rejects a future status turns a copy into a failure. The
+    -- writer only ever inserts 'applied'.
+    status           text COLLATE "C" NOT NULL DEFAULT 'proposed',
+    created_at       text COLLATE "C" NOT NULL,
+    applied_at       text COLLATE "C"
+);
+
+-- The provenance question is always "what happened to this file", so
+-- the index carries the pair and the time.
+CREATE INDEX edit_intents_file ON edit_intents (project_id, file_path, created_at DESC);
 
 CREATE TABLE entities (
     id               bigint PRIMARY KEY,
@@ -572,11 +656,17 @@ CREATE VIEW source_snapshots AS
 -- in `mirror.rs`. Getting this wrong is loud rather than silent, which
 -- is the one merciful thing about it.
 --
--- Only these two: they are what `file set` inserts into. The rest of
+-- Only these three: they are what `file set` inserts into. The rest of
 -- the subset keeps following the readers.
 ALTER TABLE project_files
     ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY;
 ALTER TABLE file_contents
+    ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY;
+-- `edit_intents` joined them on 2026-10-23 with the intent record. Its
+-- id is also the one thing the command *prints* from this table, so a
+-- sequence left behind by a mirror would be visible rather than merely
+-- wrong.
+ALTER TABLE edit_intents
     ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY;
 
 COMMIT;

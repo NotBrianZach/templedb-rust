@@ -77,6 +77,7 @@ mod mirror;
 mod pgtext;
 mod projects;
 mod search;
+mod session;
 mod source;
 mod statediff;
 mod store;
@@ -111,6 +112,10 @@ pub use projects::{
     list_projects, list_projects_filtered, project_detail, Project, ProjectDetail, ProjectFilter,
 };
 pub use search::{search_content, SearchHit};
+pub use session::{
+    ignored_name, resolve as resolve_session, resolve_tx as resolve_session_tx, SessionId,
+    SESSION_ID_ENV, SESSION_NAME_ENV,
+};
 pub use source::{revisions, snapshot, snapshot_body, Revision, Snapshot, SnapshotBody};
 pub use statediff::{capture, compare, diff, DbState, TableDelta, TableState};
 pub use store::Store;
@@ -123,8 +128,8 @@ pub use summary::{
 pub use value::{Row, Value};
 pub use vcs::{
     branches, commit_detail, commit_log, content_at_commit, content_versions, current_content,
-    parent_hash, version_text, BlobKind, BranchEntry, CommitContent, CommitDetail, CommitEntry,
-    ContentVersion, FileChange, Visibility,
+    parent_hash, pending_in_session, version_text, BlobKind, BranchEntry, CommitContent,
+    CommitDetail, CommitEntry, ContentVersion, FileChange, Visibility,
 };
 pub use writer::{PgWriter, OPT_IN_ENV, WRITE_URL_ENV};
 

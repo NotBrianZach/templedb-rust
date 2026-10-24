@@ -102,6 +102,15 @@ CREATE TABLE vcs_branches (
     UNIQUE(project_id, branch_name)
 );
 
+-- Only the two columns the port reads. The live table has ten; the
+-- other eight belong to `vcs session list`, which is not ported, and
+-- including them here would make the fixture and the Postgres subset
+-- describe different shapes.
+CREATE TABLE vcs_sessions (
+    id       INTEGER PRIMARY KEY,
+    ended_at TEXT
+);
+
 CREATE TABLE vcs_commits (
     id               INTEGER PRIMARY KEY,
     project_id       INTEGER NOT NULL,
@@ -131,6 +140,25 @@ CREATE TABLE vcs_commit_parents (
     parent_commit_id INTEGER NOT NULL,
     parent_order     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (commit_id, parent_commit_id)
+);
+
+-- `file set`'s provenance record. Written by the Postgres writer and
+-- never read here, so the fixture carries it only so the mirror's
+-- pagination and the cross-backend digest have the same shape on both
+-- sides. Twelve columns, matching the Postgres subset.
+CREATE TABLE edit_intents (
+    id               INTEGER PRIMARY KEY,
+    session_id       INTEGER,
+    project_id       INTEGER NOT NULL,
+    file_path        TEXT NOT NULL,
+    base_revision    TEXT NOT NULL DEFAULT 'current',
+    new_content_hash TEXT NOT NULL,
+    patch_summary    TEXT,
+    author           TEXT,
+    description      TEXT,
+    status           TEXT NOT NULL DEFAULT 'proposed',
+    created_at       TEXT NOT NULL,
+    applied_at       TEXT
 );
 
 CREATE TABLE entities (
@@ -415,6 +443,17 @@ INSERT INTO vcs_branches (id, project_id, branch_name, is_default, head_commit_i
     (2, 1, 'feature', 0,    NULL),
     (3, 2, 'main',    1,    20);
 
+-- Session 7 is live and owns commit C3, so the default view has
+-- something to include that the published view hides. Session 8 is
+-- ended: `session.rs` must refuse a pin naming it, which is the
+-- behaviour Python's lookup lacked until 2026-10-07. Session 9 is live
+-- and owns nothing, so "pinned but no unpublished commits" — the state
+-- just after a publish — is reachable too.
+INSERT INTO vcs_sessions (id, ended_at) VALUES
+    (7, NULL),
+    (8, '2026-10-07 12:00:00'),
+    (9, NULL);
+
 INSERT INTO vcs_commits
     (id, project_id, branch_id, commit_hash, author, commit_message,
      commit_timestamp, session_id)
@@ -473,6 +512,19 @@ INSERT INTO vcs_commit_parents (commit_id, parent_commit_id, parent_order) VALUE
     (14, 12, 0),
     (19, 12, 1),
     (19, 11, 0);
+
+-- Two intents on one file, so the digest has more than one row and the
+-- `(project_id, file_path, created_at DESC)` ordering has something to
+-- order. One carries a session and one does not, which is the live
+-- shape — 976 of 1,220 rows have a NULL `session_id`.
+INSERT INTO edit_intents
+    (id, session_id, project_id, file_path, base_revision, new_content_hash,
+     patch_summary, author, description, status, created_at, applied_at)
+VALUES
+    (1, NULL, 1, 'src/main.rs', 'new-file',   'h-main-old', '13 bytes', 'zach',
+        'file set', 'applied', '2026-10-04 00:00:00', '2026-10-04 00:00:00'),
+    (2, 7,    1, 'src/main.rs', 'h-main-old', 'h-main',     '26 bytes', 'zach',
+        'file set', 'applied', '2026-10-05 00:00:00', '2026-10-05 00:00:00');
 
 INSERT INTO entities (id, kind, external_ref, source_authority, label, observed_at) VALUES
     (1, 'Machine',    'box1',            'nix', 'box one',   '2026-10-01 00:00:00'),

@@ -64,6 +64,7 @@
 
 mod backend;
 mod clock;
+mod commit;
 mod conn;
 mod dialect;
 mod difflib;
@@ -90,6 +91,9 @@ mod writer;
 pub use backend::pg::PgStore;
 pub use backend::sqlite::SqliteStore;
 pub use clock::{julian_day, julian_day_ms, timestamp_of_ms, Age, Clock, Freshness, NOW_ENV};
+pub use commit::{
+    advance_branch_head, branch_head, commit_hash, commit_staged, CommitOptions, CommitOutcome,
+};
 pub use conn::{db_path, open_ro, target, Target, URL_ENV};
 pub use dialect::Dialect;
 pub use difflib::{context_diff, splitlines, unified_diff, Match, Opcode, SequenceMatcher, Tag};

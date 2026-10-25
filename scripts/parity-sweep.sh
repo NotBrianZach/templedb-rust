@@ -314,6 +314,15 @@ SUMMARY_EXPECTED=(
 # One command per read-only family, with placeholder arguments: both
 # implementations parse `--help` before validating positionals, so the
 # arguments only have to be present, not real.
+#
+# `vcs commit-staged` is deliberately NOT here, and adding it would
+# break the stage rather than extend it: the name is this port's, so
+# `templedb vcs commit-staged --help` fails on the other side and there
+# is no surface to compare. That is the intended consequence of giving
+# the staged-rows commit a name of its own instead of calling it
+# `vcs commit` -- see the README's *The second write*. The stage's
+# blind spot is therefore a command only Python has, which is the
+# README's *Flag surfaces* note.
 FLAG_COMMANDS=(
     "project list"
     "project show x"

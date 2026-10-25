@@ -3,7 +3,7 @@
 A Rust port of TempleDB, the project configuration and version control
 system. Binary name is `templedb-rs`. Reads SQLite or PostgreSQL.
 
-## Status: the read-only subset, plus one opt-in write
+## Status: the read-only subset, plus two opt-in writes
 
 Restarted 2026-10-04. The previous contents of this repo described a port
 that did not exist — it claimed "Basic CLI structure with clap" and
@@ -35,6 +35,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
 | `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [--session]` | **the first write.** Postgres only, opt-in, five of Python’s seven guards — see *The first write* |
+| `templedb-rs vcs commit-staged <proj> {-m\|-F} [-b] [--author] [--session]` | **the second write.** Postgres only, opt-in; the database half of Python's `vcs commit`, with the tree-dependent half refused and the name saying so — see *The second write* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -67,7 +68,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-314 unit tests, run by `cargo test`: 282 in `templedb-db` and 32 in
+324 unit tests, run by `cargo test`: 292 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -119,19 +120,26 @@ hundredth — is invisible on a fixture small enough to read. The previous
 revision of this README advertised `cargo test` with no tests in the
 tree.
 
-**Not implemented.** Everything else — which is most of it. No VCS
-operations, no session *management* (sessions are accepted when named
-and never created — see *Sessions*), no checkouts, no ingest, no doctor,
-no publish, no Nix integration, no GUI. See *Porting order* below.
+**Not implemented.** Everything else — which is most of it. No session
+*management* (sessions are accepted when named and never created — see
+*Sessions*), no checkouts, no ingest, no doctor, no publish, no Nix
+integration, no GUI. See *Porting order* below.
+
+`vcs commit` itself is **not** ported and is not going to be in this
+shape: five of its nine guards reconcile a workspace against the
+database, and this port has no workspace. What is ported is the half
+that is a database operation, under a different name —
+`vcs commit-staged` — so that the name does not promise a workflow that
+is refused. See *The second write*.
 
 No writes to the live database, either — and that is still true now
-that the binary has a write command. There are two write paths in it,
-`mirror` and `file set`, and both write only a Postgres database this
-port owns; neither can reach the SQLite file the Python implementation
-has authority over. `file set` additionally requires
-`TEMPLEDB_RS_ALLOW_WRITES=1` and a `TEMPLEDB_WRITE_URL` that is
-deliberately *not* the variable the readers use. See *Two backends* and
-*The first write*.
+that the binary has two write commands. There are three write paths in
+it, `mirror`, `file set` and `vcs commit-staged`, and all three write
+only a Postgres database this port owns; none can reach the SQLite file
+the Python implementation has authority over. The two commands
+additionally require `TEMPLEDB_RS_ALLOW_WRITES=1` and a
+`TEMPLEDB_WRITE_URL` that is deliberately *not* the variable the readers
+use. See *Two backends*, *The first write* and *The second write*.
 
 ### Measured, 3-run average on a 776 MB database
 
@@ -543,6 +551,16 @@ learned the hard way: session-scoped staging, checkout role resolution
 newer blob. A reader cannot violate any of them. Porting reads first lets
 both implementations run against one live database instead of competing
 for authority over it.
+
+Two of those invariants are now the reason a command is *not* ported
+rather than the reason none is. Checkout role resolution and the
+blob-age guards are what `vcs commit`'s five filesystem guards are made
+of, and the port has no filesystem to resolve — so the half of commit
+that is a database operation is ported under a name of its own and the
+half that reconciles a tree is refused. The decision above is what
+makes that the right answer instead of a compromise: a port that grew a
+workspace scanner to finish the command would be competing for
+authority again. See *The second write*.
 
 Two bugs from the Python side are already designed out here:
 
@@ -1006,11 +1024,35 @@ Differences that are not deliberate and are not yet closed.
 - **Three of the 21 tables have no reader at all**, which is the one
   place the rule above reads sideways: `edit_intents` (12 of 14 columns),
   `vcs_working_state` (9 of 11) and `vcs_commit_metadata` (3 of 40) are
-  carried for a *writer*. The first is written today; the other two
-  arrive with `file set --stage` and `vcs commit`, so for now the only
-  thing verifying them is the cross-backend digest over the copy. That
-  is a weaker claim than every other table here has, and it is stated
-  rather than left to be inferred from a passing sweep.
+  carried for a *writer*. Two of the three are written today —
+  `edit_intents` by `file set` and `vcs_working_state` by
+  `vcs commit-staged`, which reads, unstages and reaps it — so each has
+  a cross-read behind it as well as the digest. `vcs_commit_metadata`
+  does not: measured while porting the commit, **nothing in the port's
+  reach writes it**, because only `templedb commit <slug> <dir>` does.
+  For that one table the cross-backend digest over the copy is still
+  the only thing verifying it, which is a weaker claim than every other
+  table here has and is stated rather than left to be inferred from a
+  passing sweep.
+- **One column is carried for a writer that no reader in *either*
+  implementation names**: `vcs_file_states.file_path`, migration 118's
+  denormalised path. `vcs show` resolves paths by joining
+  `project_files` on both sides. It is carried because
+  `vcs commit-staged` is the only path in the system that hard-deletes
+  that `project_files` row, so for a committed deletion this is the last
+  record of which file the state belonged to. The consequence is
+  asserted rather than wished away: after a committed deletion
+  `vcs show` lists nothing, because its reader inner-joins the row that
+  is gone. See *The second write*.
+- **`vcs_branches.head_commit_id` is the first column whose two sides
+  are not a copy of each other.** Every other cross-backend comparison
+  in this README compares SQLite against Postgres after `mirror`
+  copied it. That column is advanced by a trigger on the live side and
+  by an application-level compare-and-swap here, because the port has
+  none of the 61 live triggers. The CAS is *more* correct than Python's
+  arrangement allows — see *The second write* — but "produced by
+  different mechanisms" is a different claim from "identical after a
+  copy", and only the digest-after-mirror half is covered by the sweep.
 - **`vcs_commit_metadata` is 3 of 40 columns because 37 are unanimously
   empty**, not because the port is being frugal. Measured over all 436
   live rows: `intent`, `change_type`, `scope`, `tags`, `ai_tool`,
@@ -1150,13 +1192,23 @@ mirrored table rather than the live file — so a pinned session resolves
 the same through the replica as through SQLite, which is the property
 `file set --session` will stand on.
 
+Re-measured 2026-10-25 with `vcs_file_states.file_path`, the column
+`vcs commit-staged` writes: **51 of 51 invocations stdout-identical, 7
+of 7 panes, 20 of 20 flag surfaces, 8 of 8 filters, 0 unexpected**, and
+**all 21 tables digest identically over 223,811 rows** —
+`vcs_file_states` at 7,200 of them, now with the path in the projection.
+`vcs commit-staged` is absent from the flag-surface stage on purpose:
+the name is this port's, so there is nothing on the other side to
+compare it against. That is the point of the name; see *The second
+write*.
+
 Re-measured 2026-10-24 with `vcs_working_state` and
 `vcs_commit_metadata`: **54 of 54 invocations, 7 of 7 panes, 20 of 20
 flag surfaces, 8 of 8 filters**, and **all 21 tables digest identically
-over 222,890 rows**. Three of those 21 now have no reader at all, so
-the digest over the copy is the only thing verifying them until
-`file set --stage` and `vcs commit` land — a weaker claim than the
-other eighteen carry, and named as such in *Known gaps*.
+over 222,890 rows**. Three of those 21 had no reader at all at the
+time, so the digest over the copy was the only thing verifying them.
+Two now have a writer behind them as well; `vcs_commit_metadata` still
+does not, and is named as such in *Known gaps*.
 
 Re-measured earlier the same week with `edit_intents`: **54 of 54
 invocations, 7 of 7 panes, 20 of 20 flag surfaces, 8 of 8 filters**, and
@@ -1235,8 +1287,8 @@ nix flake check        # the hermetic half only
 
 `just check` is what to run before publishing. It is three things in
 order: `cargo test --workspace`, the two CPython oracles (`difflib` and
-the clock), and `scripts/parity-sweep.sh python` — all 54 invocations
-diffed against the Python `templedb`, then three stages for what a
+the clock), and `scripts/parity-sweep.sh python` — every implemented
+invocation diffed against the Python `templedb`, then three stages for what a
 whole-stdout diff cannot reach: `summary` one pane at a time, the flag
 surfaces of 20 commands, and `project list`'s filters by which projects
 they select. The sweep exits with the number of *unexpected*
@@ -1246,12 +1298,13 @@ does.
 A current clean run reads:
 
 ```
-pinned    TEMPLEDB_SESSION_ID=1172, which owns unpublished commits in templedb-rust
+pinned    TEMPLEDB_SESSION_ID=1178, which owns no unpublished commits in any of: ...
+pinned    so the session view is diffed on its published half only
 summary   7 of 7 claimed panes identical, 2 not ported
 flags     20 of 20 commands agree (deliberate divergences allowed)
 filters   8 of 8 project-list filters select the same projects
 
-templedb-rs vs python, 54 invocations: 50 stdout-identical
+templedb-rs vs python, 51 invocations: 47 stdout-identical
 (15 differing on stderr only), 18 deliberate, 0 unexpected
 ```
 
@@ -1271,6 +1324,18 @@ intent record and the session pin closed `vcs log`'s default view, its
 `just write-test` is **not** part of `just check`, because it needs a
 Postgres server and `check` is meant to run anywhere the build does.
 Run it alongside when touching the write path.
+
+`just pg-reschema` is the one to remember when a write path lands,
+because the subset DDL is not static — it has grown a column or an
+identity with every writer so far. `mirror --create-schema` is
+CREATE-only and cannot apply a change to a database that already has
+the tables, and the symptom is remote from the cause: `mirror` fails
+inside a binary `COPY` with a column-count mismatch. The recipe drops
+and re-applies both schemas from the file and restores the
+`templedb_ro` grants that `DROP SCHEMA` takes with it; follow it with
+`just mirror-refresh`. Destructive and deliberately not a dependency of
+anything — parity is a copy and scratch is disposable, so nothing is
+lost, but refilling parity is a 223,811-row recopy.
 
 Each of the three stages has been sabotage-tested — a deliberate
 regression introduced, then the stage confirmed to report it and the
@@ -1368,6 +1433,10 @@ crates/templedb-db/    data layer, one module per command family
   writer.rs            PgWriter — the one writable handle, outside the
                        Store trait on purpose. Opt-in, scratch-only
   fileset.rs           `file set`: the first write, and its five guards
+  commit.rs            `vcs commit-staged`: the database half of Python's
+                       `vcs commit`, with the tree-dependent half refused
+                       and the branch head advanced by a compare-and-swap
+                       the trigger over there makes impossible
   pgtext.rs            the NUL escape: SQLite TEXT holds U+0000 and
                        Postgres text cannot. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
@@ -1379,8 +1448,10 @@ crates/templedb-cli/   clap binary `templedb-rs`, formatting only
   summary_view.rs      summary's interpretation layer: facts plus an
                        instant to lines. Ages, colour, column widths
 scripts/
-  parity-sweep.sh      all 54 invocations, against Python / the other
-                       backend / a previous build. Plus three stages for
+  parity-sweep.sh      every implemented invocation, against Python /
+                       the other backend / a previous build — the count
+                       moves with the data, because three rows are found
+                       by searching it. Plus three stages for
                        the commands whose whole stdout cannot be
                        diffed: `summary` one pane at a time, the flag
                        surfaces of 20 commands, and `project list`'s
@@ -1389,8 +1460,9 @@ scripts/
 crates/templedb-db/tests/
   difflib_parity.rs    CPython difflib as an oracle (needs python3)
   clock_parity.rs      SQLite julianday as an oracle (needs python3)
-  write_parity.rs      `file set` against a real Postgres, read back
-                       through the ported reader (needs a server)
+  write_parity.rs      `file set` and `vcs commit-staged` against a real
+                       Postgres, read back through the ported readers
+                       (needs a server)
 ```
 
 Nothing from `rusqlite` or `postgres` is re-exported. The previous
@@ -1685,6 +1757,34 @@ Writes last, and only once the read layer is trusted.
 
     Measured: **all 21 tables digest identically across both backends
     over 222,890 rows**, 54 of 54 invocations on both axes.
+
+20. **Done** — `vcs commit-staged`, the report's step 4 and its step 3
+    together: the staged-rows write, and the branch-head
+    compare-and-swap that is the port's one chance to be correct where
+    Python cannot be. The report's open question — may the reduced
+    command be called `vcs commit` — was settled **no** on 2026-10-25 by
+    the `--no-fts` precedent, so the command has a name that does not
+    promise the tree half. See *The second write* for the whole
+    argument.
+
+    Its steps 3 and 5 came with it. The CAS has the test the report asks
+    for, two transactions on two connections racing on one branch; the
+    cross-read harness is three readers rather than one, because a
+    commit is visible to `vcs log`, `vcs show` *and* `file cat`.
+
+    Three of the report's measurements were over-counts and are
+    corrected under *The second write*: `vcs commit` writes **six**
+    tables, not seven, and touches neither `vcs_commit_metadata` nor
+    `vcs_session_heads` nor `vcs_commits.session_id` — all three belong
+    to `templedb commit <slug> <dir>`. The fourth table the work needed
+    turned out to be one column, `vcs_file_states.file_path`, which is
+    the only thing in the subset carried for a writer that *no reader in
+    either implementation* names.
+
+    Still open: **`file set --stage`**, the report's step 2 and now the
+    only thing between this and a closed loop. The port can consume
+    `vcs_working_state` and cannot produce it, so the fixture stages with
+    SQL and the pair is verified one half at a time.
 
 ### The state digest, and why it must not sort
 
@@ -2580,8 +2680,9 @@ writes Postgres, so there is no shared input. The technique is the one
 the design document calls **cross-read** — the port writes, and the
 already-trusted read layer reads it back.
 
-`crates/templedb-db/tests/write_parity.rs`, fourteen tests, `#[ignore]`d
-and run by `just write-test`. The read-back goes through
+`crates/templedb-db/tests/write_parity.rs` — fourteen of its 26 tests
+are this command's, `#[ignore]`d and run by `just write-test`. The
+read-back goes through
 `templedb_db::read_file` — the actual ported `file cat` query, not SQL
 written for the test — so a write `file cat` cannot see is a failure.
 That mattered immediately: the first version used a hand-written query
@@ -2630,6 +2731,367 @@ rejected for exactly the reason the mirror was. The hash is taken over
 the **original** bytes, not the escaped form, so `file cat | sha256sum`
 still equals the blob's own key — verified at the command line, where
 `file set` prints a hash matching `sha256sum` of the same content.
+
+### The second write, and the command that is not `vcs commit`
+
+Landed 2026-10-25. `templedb-rs vcs commit-staged <proj> -m <msg>
+--session <id>`, step 20.
+
+The design document — *vcs commit: the widest door, measured*,
+2026-10-24 — measured the door and recommended **against** porting it:
+seven tables, nine guards, one trigger, and one dependency that "is not
+a translation problem but a question about what the port is for". Five
+of the nine guards compare a filesystem against the database. Porting
+them means porting the workspace scanner, the checkout-role resolver
+and the mirror-to-disk step, which is a different project.
+
+So the recommendation was to split the door: port the three-quarters
+that is database work, refuse the quarter that reconciles a filesystem,
+and do it "under a name that does not promise the other half". That is
+what this is.
+
+#### Why the name is not `vcs commit`
+
+This was the document's one explicitly open question — "whether the
+reduced command may be called `vcs commit`… it should be settled before
+the name is used rather than after" — and it is settled by a precedent
+this port already set. The `--no-fts` argument is that **a flag is only
+harmless when the thing it names is present**: a flag promising
+different matching that delivers none is worse than an absent flag,
+because absence is visible and a no-op is not.
+
+A command name is the same argument at a larger scale. `vcs commit`
+over there means *scan the tree, reconcile it against the database,
+resolve conflicts, commit*. This cannot scan. Sharing the name would
+make `--amend`, `--force`, `--branch`-with-a-tree, `--strategy` and the
+whole workflow into things the command refuses rather than things it
+does not have.
+
+The name also describes the operation more accurately than "a reduced
+`vcs commit`" does. The document's own sentence: "That is not a reduced
+`vcs commit`; it is the operation `publish` already performs — its guard
+is `COUNT(*) … WHERE staged_by_session_id IS NOT NULL`, and it commits
+without scanning anything."
+
+One concrete benefit: the sweep's flag-surface stage has nothing to
+compare against, because there is no `templedb vcs commit-staged
+--help`. That is the honest outcome. Under the shared name the stage
+would have reported four or more absent flags as divergences on a
+command that cannot have them, and the allow-list would have had to
+grow a permanent exception for each.
+
+#### The trigger, which is the sharpest porting problem
+
+`update_branch_head_on_commit` is an `AFTER INSERT` trigger on
+`vcs_commits` that sets `vcs_branches.head_commit_id = NEW.id`. **This
+port has none of the live database's 61 triggers.** So a faithful port
+of the *code* leaves the branch head frozen forever — the one place
+where reproducing Python's statements and reproducing Python's
+behaviour come apart, and a case the sweep could never catch because
+`vcs branch` would keep printing whatever the mirror copied.
+
+The fix is to do the `UPDATE` in application code, and Python's own
+comment is a warning about exactly that:
+
+```text
+-- Branch head is auto-advanced by the `update_branch_head_on_commit`
+-- trigger ... so no manual UPDATE is required here. The previous
+-- app-level compare-and-swap was buggy: it always fired a
+-- false-positive HEAD_RACE error because the trigger had already set
+-- head_commit_id to the new commit id by the time the CAS's
+-- WHERE head_commit_id IS <old> ran.
+```
+
+That is a bug *caused by the trigger existing*. An implementation with
+no trigger can do the compare-and-swap correctly, because nothing has
+moved the column underneath it — and the comment's own closing
+sentence, "if cross-transaction race protection is needed, drop the
+trigger and do the UPDATE-with-CAS inside `create_commit()`", describes
+the situation this port is already in. **It is the first place the port
+is better rather than merely faithful**, and it is not a liberty taken:
+without it the command does not work at all.
+
+`IS NOT DISTINCT FROM` and not `=`, because the expected head is NULL
+for a branch with no commits and `NULL = NULL` is unknown — `=` would
+refuse every root commit. The CAS runs where the trigger would have
+fired, immediately after the commit row, so a `HEAD_RACE` refusal costs
+nothing and happens before any per-file work. Same reason `--if-match`
+is checked first in `file set`.
+
+It is a genuine compare-and-swap under Postgres's default
+`READ COMMITTED` rather than an optimistic guess. A concurrent
+transaction that has advanced the head blocks this `UPDATE` on the row
+lock; when it commits, the predicate is re-evaluated against the new
+row version, matches nothing, and the refusal fires.
+
+**The cost, stated:** every cross-backend comparison so far has compared
+SQLite against Postgres *after a copy*. `vcs_branches.head_commit_id` is
+now the first column whose contents are produced by different
+mechanisms on the two sides.
+
+#### What is refused, and where
+
+| refused | what Python does there |
+|---|---|
+| a workspace scan | reconciles staged paths against the resolved tree |
+| guards 4, 5, 6, 8 — version conflict, intent conflict, the snapshot refinement, `--allow-mass-delete` | all four compare a tree against the database |
+| `--strategy` and its resolution strategies | settle conflicts this port cannot detect |
+| `--amend` / `--force` | a different operation on one column; it is not staged-rows work |
+| a staged hash naming no blob | resolves the path, joins it onto `~/.config/templedb/checkouts/<slug>`, reads the bytes off disk and stores the blob |
+| a staged state of `'conflict'` | writes it, and the live `change_type` CHECK rejects the row |
+
+The last two are the ones worth reading twice.
+
+**The missing blob is where the tree half actually bites**, and it is
+why the split is a split rather than a trim. Python leaves the database
+at that point. This port refuses by name, with the hash it could not
+find and a pointer at `vcs status --refresh`, which is the command that
+stores the blob.
+
+**The `'conflict'` refusal is this port being stricter than Python on a
+value.** `detect_changes` can produce that state, and the live
+`vcs_file_states.change_type` CHECK allows only `added`, `modified`,
+`deleted`, `renamed` and `unmodified` — so Python's own INSERT is
+rejected by the constraint. The subset schema carries no CHECK, by the
+standing rule that a mirror must accept what the live database holds,
+which means this port would *silently* write a value the live schema
+forbids. A row that can never go home is worse than a refusal.
+
+#### What is ported, and the three guards that came with it
+
+Six tables written in one transaction, in Python's order: `vcs_commits`,
+`vcs_commit_parents`, `vcs_file_states`, `file_contents`,
+`project_files` (a `DELETE`) and `vcs_working_state`. Plus
+`vcs_branches`, by the compare-and-swap above.
+
+**`vcs commit-staged` is the only path in the system that hard-deletes
+a `project_files` row.** Everything else soft-deletes by flipping
+`status`, which is why `file set` needs an un-delete guard at all.
+
+- **Guard 2, the orphan reap.** `vcs_working_state.file_id` declares an
+  `ON DELETE CASCADE` FK live, but `sync_engine` and some migrations
+  bulk-delete with FK enforcement off, so rows pointing at a reaped
+  `project_files` row are a state the live database reaches. The
+  `vcs_file_states` FK then aborts the whole commit; that happened on
+  2026-09-19. Reaped and counted. Python wraps it in
+  `except Exception: pass` and this does not — the swallow is there
+  because the statement runs outside the commit's transaction over
+  there, and here it is inside one, so an ignored failure rolls the
+  commit back anyway.
+- **Guard 3, the content-hash refusal.** A staged non-deleted file with
+  no hash can only record the `'DELETED'` sentinel, which says *this
+  state names no content* — true for a deletion and a lie for anything
+  else, and unrecoverable, because no blob was stored under the hash
+  that is missing. 124 live rows were written that way before the guard
+  existed, and they feed 501 `source_snapshots` rows pointing at a
+  fabricated blob that claims 8,059 bytes and holds nothing. Exit 3.
+- **Guard 9's shape.** The session is resolved at the entry point and
+  threaded in, never read inside the transaction. Python's incident was
+  that session *creation* commits, which ended the caller's transaction
+  — so a later per-file failure rolled back the file states but could
+  not undo the commit row, leaving a commit with zero `vcs_file_states`
+  in the log and a broken parent chain. Reproduced on demand
+  2026-10-03. This port cannot hit it, because it never creates; the
+  shape of the fix survives anyway, and costs nothing.
+
+Guard 1 (`_has_write_tree`) and guard 7 (`--strategy force` still
+refusing intent conflicts) are preconditions for the tree half and go
+with it.
+
+The whole set is checked **before anything is written**, where Python
+checks inside the per-file loop after the commit row exists. Harmless
+there, because the transaction rolls back — but it means the refusal it
+prints is about file four while files one to three looked fine. Checking
+first is the same information, earlier.
+
+#### Three corrections to the design document's measurements
+
+Measured against the code while porting, and all three are the document
+over-counting rather than under:
+
+1. **`vcs commit` does not write `vcs_commit_metadata`.** The
+   document's table lists it. Only `templedb commit <slug> <dir>` does,
+   through `create_commit_metadata`. Same for `vcs_session_heads`,
+   listed as read/write for publish bookkeeping — `vcs commit` touches
+   neither.
+2. **It does not set `vcs_commits.session_id` either.** Migration 107
+   added the column and described the publish fast-forward, but its
+   writer side was only ever wired into the other commit command. So
+   every commit `vcs commit` makes is *already published*, which is also
+   what makes one visible to `vcs log`'s default view the moment it
+   lands. 73 of 1,444 live commits carry a session.
+3. **So the table count is six written, not seven** — and the fourth
+   mirrored table the work needed was `vcs_file_states.file_path`, one
+   column, rather than `vcs_commit_metadata`, which had already landed
+   with step 19.
+
+#### `vcs_commits.parent_commit_id` is not written, on purpose
+
+Python writes the parent edge twice: `vcs_commits.parent_commit_id`
+inside `create_commit`, and a `parent_order = 0` row in
+`vcs_commit_parents`. The column is not in the mirrored subset — no
+reader names it, `vcs show` walks the join table — and Python's own
+`create_commit` docstring records why keeping both is a hazard:
+"keeping them in sync was left to callers and they drifted: `vcs merge`
+wrote the join-table rows and never set `parent_commit_id`, so merge
+commits read as roots to anything walking the column."
+
+One declarer per fact, and the join table is the declarer. Written once,
+from the branch head's id rather than from a hash round-trip — Python
+resolves `head_commit_id` to a hash and the hash back to an id, which
+can only land on the same row or on nothing, and the nothing case is now
+refused explicitly: **a head naming a pruned commit is a refusal**, not
+a foreign-key violation three statements later. `vcs_branches
+.head_commit_id` carries no FK — in this subset by decision and in the
+live schema by omission — so a dangling head is a state both databases
+can reach, and `vcs_commit_parents` *does* reference `vcs_commits`.
+
+#### The one column carried for a writer that no reader has
+
+`vcs_file_states.file_path`, migration 118's denormalised path, is the
+twenty-first mirrored table's new column and the sharpest case of
+"follow the readers" read sideways: **nothing selects it in either
+implementation.** `vcs show` resolves paths by joining `project_files`
+on both sides.
+
+It is carried because this command hard-deletes that `project_files`
+row. Without the column, a committed deletion leaves a `vcs_file_states`
+row whose `file_id` resolves to nothing and no record of which file it
+was — the exact hole 118 closed. 7,183 of 7,197 live rows carry one; the
+14 that do not predate the column, so it stays nullable.
+
+The deletion test asserts the consequence rather than wishing it away:
+after a committed deletion, `vcs show` lists **nothing**, because its
+reader inner-joins `project_files` and that row is gone. The path
+survives only in the column. That is the state Python produces too.
+
+#### The commit id, and the float that is part of it
+
+`sha256(f"{slug}:{branch}:{message}:{time.time()}")[:16].upper()`.
+Sixteen hex characters over four fields, and deliberately **not**
+content-addressed — the clock is in the input precisely so the same tree
+committed twice gets different ids, which is what makes Python's
+`--amend` safe.
+
+Uppercase is load-bearing rather than cosmetic: `_amend_message`
+refuses to touch a commit whose hash is 40 characters *or lowercase*,
+because either shape means the row might be imported git history. A port
+minting lowercase ids would produce commits Python refuses to amend.
+
+The float is the fiddly part, and it is the same class of problem as
+`difflib` and the clock: Python interpolates `time.time()` through
+`str()`, which is `repr` — shortest round-trip, with one rule Rust does
+not share. **A float with no fractional part still shows `.0`.**
+`str(1761393045.0)` is `'1761393045.0'` and Rust's `{}` prints
+`1761393045`. That case is not exotic here, it is the common one under a
+pinned clock, because `Clock::at` parses whole seconds. Without the
+rule the two implementations compute different ids for the same stated
+instant, which is the one thing about this hash that *is* checkable —
+and a unit test checks it against a CPython-computed value rather than
+against sha256 working.
+
+Resolution is milliseconds, not microseconds, because that is what
+`Clock` holds — SQLite's own representation, for the reasons under *The
+clock seam*. So the two cannot agree on an id for the same *wall clock*
+instant; they agree on an id for the same *stated* instant, which is
+what `TEMPLEDB_RS_NOW` pins.
+
+#### What it needs that `file set` did not
+
+**Two more identity columns.** `vcs_commits.id` and
+`vcs_file_states.id` joined `project_files`, `file_contents` and
+`edit_intents` as `GENERATED BY DEFAULT AS IDENTITY`, and `mirror`'s
+`sync_sequences` list grew to five. The commit's id is load-bearing
+twice over rather than merely printed: `vcs_commit_parents` stores the
+parent edge by id, and the branch-head CAS writes it. A unit test now
+asserts the two lists agree in both directions, because they fail
+differently and both quietly — a name in the Rust list with no identity
+in the DDL makes `pg_get_serial_sequence` return NULL and
+`setval(NULL, …)` return NULL, advancing nothing; a table in the DDL and
+missing from the list keeps a sequence at 1, and the first write after a
+mirror collides on the primary key.
+
+**A way to re-apply the DDL.** `just pg-reschema`. The subset schema is
+not static — it has grown a column or an identity every time a write
+path landed — and `mirror --create-schema` is CREATE-only, so it cannot
+apply a change to a database that already has the tables. The symptom is
+remote from the cause: a `mirror` run fails inside a binary `COPY` with
+a column-count mismatch. Recreating both schemas from the file is the
+right move rather than writing `ALTER`s, because neither database is a
+source of truth — parity is a copy and scratch is disposable — so the
+DDL file stays the single declaration of the shape. The recipe
+re-applies the `templedb_ro` grants, which `DROP SCHEMA` takes with it.
+
+**A session, or a refusal.** This is where *resolve never, accept
+always* costs something visible. `vcs commit-staged` requires
+`TEMPLEDB_SESSION_ID` or `--session <id>`; Python guesses from the
+process tree and creates a row when that fails. The refusal names both,
+and when `TEMPLEDB_SESSION` is set it says so specifically — which is
+not hypothetical, because the agent wrapper this port is developed under
+exports exactly that.
+
+#### How it is verified
+
+Cross-read, as `file set`'s is, and a stronger one: **three** separately
+verified readers can see a commit. `vcs log` lists it, `vcs show` lists
+its changed files and diffs them, and `file cat` reads the content it
+made current. A commit none of them can see did not happen.
+
+`crates/templedb-db/tests/write_parity.rs` is now 26 tests, twelve of
+them this command's, `#[ignore]`d and run by `just write-test`. What
+they cover beyond the happy path:
+
+- **The race.** Two transactions on two connections, the second holding
+  a head the first has already replaced. Deterministic rather than
+  timing-dependent: the first transaction *commits* before the second's
+  `UPDATE` runs, so nothing blocks, and under `READ COMMITTED` the CAS
+  predicate is then evaluated against the new row version and matches
+  nothing. The head is asserted to still be the first commit's
+  afterwards — a refusal that half-applied would pass a test that only
+  checked the error.
+- **Both refusals leave nothing behind.** Guard 3 and the missing blob
+  each assert no commit row, no head movement, and the staging still
+  staged. A guard that rejects after writing is not a guard.
+- **Session isolation, from both sides.** One test commits beside
+  another session's staged rows and asserts they survive with their flag
+  intact; another asserts that "nothing staged" reports the *other*
+  session's count rather than saying nothing — Python's message, and the
+  footgun worth keeping, because an agent staging in one tool call and
+  committing in another is in two sessions.
+- **The deletion**, asserting the hard delete, the surviving
+  `file_path`, and that `vcs show` consequently lists nothing.
+- **The metrics quirk.** Python re-derives size and line count from
+  `content_blobs` rather than trusting the `file_contents` join, and it
+  has to: a modified file's staged hash is by definition not the current
+  one. The size is a *byte* count (asserted with multibyte content, the
+  only input that tells it from a character count) and an **empty**
+  `content_text` is falsy over there — so it takes the binary branch for
+  the size and leaves the line count NULL rather than 0. Both
+  reproduced.
+- **NUL content**, which ties this path to `pgtext` the way `file set`'s
+  test does: the staged blob is unescaped before it is measured, and
+  skipping that overcounts every file holding a NUL. One live file does.
+- **The tie-break, exercised deliberately for the first time.** Two
+  commits under a pinned clock share a `commit_timestamp`, so `vcs log`
+  falls through to `id ASC` — see *The tie-break, and getting it
+  backwards first*. Live data almost never has two commits in the same
+  second, so a write test is the only place that ordering can be
+  checked on purpose rather than hoped for.
+
+What cannot be tested here is the half that was refused. There is no
+workspace, so there is nothing to scan and no conflict to detect — which
+is the point of the command's name.
+
+#### What is still missing, and what it unblocks
+
+`file set --stage` is step 2 of the design document's five and is now
+the only thing between this and a closed loop. Until it lands, staging
+is done with SQL in the test fixture: the port can *consume*
+`vcs_working_state` and cannot produce it, so the pair "set, stage,
+commit, read back" is verified one half at a time. The document's own
+sequencing had `--stage` first; it landed second because the commit is
+what gives `vcs_working_state` a reader at all, and a `--stage` with no
+consumer would have been the litter the auto-stage argument warns about.
 
 ### The one place the two text types are not the same type
 
@@ -2776,6 +3238,18 @@ three of the others are closed, which is the useful thing about a check
 that names a gap rather than describing one: the list was four items long
 for about an hour, and the last of the three took two days and a design
 document rather than an hour — the flag was never the work.
+
+**The stage's one blind spot is a command that is absent entirely**, and
+`vcs commit` is now the case. The stage compares `--help` output for a
+list of commands, so it can only see a flag divergence on a command both
+sides have; a command only Python has is invisible to it, exactly as a
+missing flag was invisible to the output diff. That is a deliberate
+trade and it is what the naming decision bought. The alternative —
+calling the port's staged-rows commit `vcs commit` — would have made
+the divergence *visible* as four or more absent flags, at the cost of a
+name that promises a workflow it refuses, and a permanent allow-list
+entry for each flag. Absent and named in this file beats present and
+hollow; see *The second write*.
 
 **`project list`'s two filters** needed two more mirrored columns,
 `is_nix_project` and `project_category`, bringing the `projects`

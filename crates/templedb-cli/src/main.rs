@@ -11,7 +11,7 @@
 //! formats mirror it too, down to the box-drawing arrows in
 //! `entity trace`, so the two can be diffed rather than eyeballed.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use templedb_db::{Direction, ProjectLookup, SnapshotBody};
@@ -463,6 +463,58 @@ enum VcsCmd {
         /// Print the diff without ANSI colour.
         #[arg(long)]
         no_color: bool,
+    },
+    /// Commit this session's staged rows. **Writes.**
+    ///
+    /// Deliberately NOT called `vcs commit`. Python's scans a workspace,
+    /// reconciles it against the database, and carries nine guards —
+    /// five of which compare a tree this port does not have. This
+    /// command commits what is already staged and refuses anything that
+    /// would need a tree, which is the operation `publish` performs
+    /// rather than a reduced `vcs commit`. Sharing the name would
+    /// promise `--amend`, `--strategy` and the whole scan-and-reconcile
+    /// workflow and then refuse them.
+    ///
+    /// Writes the port's own Postgres — the one named by
+    /// `TEMPLEDB_WRITE_URL` — and never the live SQLite database.
+    /// Requires `TEMPLEDB_RS_ALLOW_WRITES=1`.
+    ///
+    /// Needs an explicit session: `TEMPLEDB_SESSION_ID` or
+    /// `--session <id>`. Python would guess from the process tree and
+    /// *create* a row if it had to; this accepts or declines. Staged
+    /// rows belong to a session, so there is nothing to commit without
+    /// one — it refuses rather than staging into a guess.
+    ///
+    /// Takes an exact slug, not a fuzzy name, for the reason `file set`
+    /// does: a mis-resolved write lands in the wrong project's history.
+    CommitStaged {
+        project: String,
+        /// Commit message.
+        ///
+        /// Prefer `-F` for anything containing backticks: an inline
+        /// message is a double-quoted shell string, so each backtick
+        /// span is command-substituted before argv is built. Commit
+        /// 217092EC lost three quoted command names that way and
+        /// reported success.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Read the message from a file; `-` for stdin.
+        #[arg(short = 'F', long = "message-file", value_name = "PATH")]
+        message_file: Option<String>,
+        /// Branch by exact name (default: the project's active branch).
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// `vcs_commits.author`. Defaults to `git config user.name`,
+        /// then the literal `unknown` — Python's chain.
+        #[arg(long)]
+        author: Option<String>,
+        /// Whose staged rows to commit. A numeric id naming a live row;
+        /// outranks `TEMPLEDB_SESSION_ID`.
+        ///
+        /// An id and not a name, as everywhere else in this port: the
+        /// name path *creates* the session over there.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
     },
     /// Show commit metadata, its changed-file list, and a diff of each
     /// file against the commit's first parent.
@@ -1352,6 +1404,108 @@ fn run() -> Result<i32> {
                     println!();
                 }
             }
+            VcsCmd::CommitStaged {
+                project,
+                message,
+                message_file,
+                branch,
+                author,
+                session: pin,
+            } => {
+                // The message first, before anything is opened: `-F -`
+                // reads stdin, and a refusal on it must not leave a
+                // connection or a transaction waiting. Same ordering
+                // `file set` uses for its content.
+                let message = resolve_commit_message(message.as_deref(), message_file.as_deref())?;
+
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                let author = commit_author(author.as_deref());
+                let mut tx = writer.transaction()?;
+                // Against the write target, inside the write
+                // transaction, for the reason `file set`'s is: the
+                // reader and the writer point at different databases,
+                // and a liveness claim about the wrong server is a
+                // nasty bug.
+                let session = templedb_db::resolve_session_tx(&mut tx, pin.as_deref())?;
+                let Some(session) = session else {
+                    // The documented cost of *resolve never, accept
+                    // always*. Python would guess from the process tree
+                    // and create a row rather than refuse.
+                    let scattered = match templedb_db::ignored_name(None) {
+                        Some(name) => format!(
+                            "\n{} is set to {name:?}, which this port does not resolve — \
+                             the name path creates the session when none matches. Pass the \
+                             id instead.",
+                            templedb_db::SESSION_NAME_ENV
+                        ),
+                        None => String::new(),
+                    };
+                    anyhow::bail!(
+                        "`vcs commit-staged` needs an explicit session: set {} or pass \
+                         --session <id>.\n\
+                         Staged rows belong to a session, so there is nothing to commit \
+                         without one. This port will not guess — Python resolves through \
+                         the process tree and creates a row when that fails.\n\
+                         Pick a live id from `templedb vcs session list --active`.{scattered}",
+                        templedb_db::SESSION_ID_ENV
+                    );
+                };
+                let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
+                let outcome = templedb_db::commit_staged(
+                    &mut tx,
+                    &clock,
+                    project_id,
+                    &project,
+                    &templedb_db::CommitOptions {
+                        message: &message,
+                        author: &author,
+                        branch: branch.as_deref(),
+                        session,
+                    },
+                );
+                // `?` before the commit, as `file set` does: on the
+                // error path `tx` drops un-committed and `postgres`
+                // rolls it back. Every refusal in this command —
+                // HEAD_RACE, guard 3, a missing blob — has to leave
+                // nothing behind, and the ordering here is what makes
+                // that true rather than hoped.
+                let outcome = outcome?;
+                tx.commit()?;
+
+                // stdout is the commit id and nothing else, so a script
+                // can chain on it — the same division `file set` and
+                // `file ls` use. Python prints seven labelled lines;
+                // this is not a diffable command, so the stdout
+                // contract is chosen for callers rather than copied.
+                println!("{}", outcome.hash);
+                let mut notes = vec![format!("{} file(s)", outcome.files)];
+                if outcome.deletions > 0 {
+                    notes.push(format!("{} deleted", outcome.deletions));
+                }
+                notes.push(match outcome.previous_head {
+                    Some(h) => format!("parent #{h}"),
+                    None => "root commit".to_string(),
+                });
+                if outcome.reaped > 0 {
+                    notes.push(format!("{} orphan(s) reaped", outcome.reaped));
+                }
+                eprintln!(
+                    "{project} [{}] #{}: {}",
+                    outcome.branch_name,
+                    outcome.commit_id,
+                    notes.join(", ")
+                );
+                if outcome.other_sessions_staged > 0 {
+                    // Python prints this too, and it is the footgun
+                    // worth repeating: an agent that stages in one tool
+                    // call and commits in another is in two sessions.
+                    eprintln!(
+                        "  note: {} file(s) staged in other sessions were not included",
+                        outcome.other_sessions_staged
+                    );
+                }
+            }
             VcsCmd::Branch { project } => {
                 let p = resolve_project_row(&store, &project)?;
                 let branches = templedb_db::branches(&store, p.id)?;
@@ -1724,6 +1878,94 @@ fn edit_author() -> Option<String> {
         }
     }
     None
+}
+
+/// The commit message, from `-m` or `-F`.
+///
+/// Python's `cli/commit_message.resolve_message`, whose docstring
+/// records why `-F` exists at all: "`-m` cannot carry this codebase's
+/// own prose. An inline message is a double-quoted shell string, so each
+/// backtick span in it is command-substituted before argv is built:
+/// commit 217092EC lost three quoted command names, printed three
+/// 'command not found' lines on stderr, and reported success."
+///
+/// Neither option is `required` on its own, because the rule is that
+/// *one* of the two must be present and `clap` cannot express that any
+/// more than `argparse` can. So the check is here, where the error gets
+/// to name both.
+///
+/// `rstrip('\n')` and nothing else, which is Python's: leading
+/// whitespace can be deliberate and a body's indentation certainly is.
+fn resolve_commit_message(inline: Option<&str>, path: Option<&str>) -> Result<String> {
+    match (inline, path) {
+        (Some(_), Some(_)) => anyhow::bail!("pass either -m or -F, not both."),
+        (None, Some(path)) => {
+            let text = if path == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("reading the commit message from stdin")?;
+                buf
+            } else {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("could not read the message file {path}"))?
+            };
+            let text = text.trim_end_matches('\n').to_string();
+            if text.trim().is_empty() {
+                anyhow::bail!("{path} holds no message.");
+            }
+            Ok(text)
+        }
+        (Some(inline), None) => {
+            // Python tests `if not inline`, so `-m ''` falls through to
+            // the same refusal as passing neither. Reproduced: an empty
+            // message is a pipe that produced nothing, not a decision.
+            if inline.is_empty() {
+                anyhow::bail!(
+                    "a commit message is required: -m \"…\" or -F <path> \
+                     (-F for anything with backticks)."
+                );
+            }
+            Ok(inline.to_string())
+        }
+        (None, None) => anyhow::bail!(
+            "a commit message is required: -m \"…\" or -F <path> \
+             (-F for anything with backticks)."
+        ),
+    }
+}
+
+/// `vcs_commits.author`: the flag, then `git config user.name`, then the
+/// literal `unknown`.
+///
+/// Python's `_get_author`, and a *different* chain from
+/// [`edit_author`]'s `TEMPLEDB_AUTHOR` / `USER` — which is also Python's
+/// doing: `edit_intents.author` and `vcs_commits.author` are filled by
+/// two unrelated code paths over there. Kept separate rather than
+/// unified, because the sessions design document's closing note is about
+/// exactly this hazard one table over: two identity schemes that "should
+/// not share a resolver, and today they nearly do".
+///
+/// A subprocess at the edge, like the clock and the session: a query
+/// module that shelled out could not be tested at a fixed value. Python
+/// passes `timeout=5`; `std::process` has no timeout and none is added,
+/// because `git config user.name` reads a local file and a hang there
+/// needs an environment pathological enough to have bigger problems.
+fn commit_author(explicit: Option<&str>) -> String {
+    if let Some(a) = explicit {
+        return a.to_string();
+    }
+    let from_git = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Python's fallback is the literal string, not NULL — and the column
+    // is NOT NULL, so there is nowhere else to go.
+    from_git.unwrap_or_else(|| "unknown".to_string())
 }
 
 /// `socket.gethostname()`.

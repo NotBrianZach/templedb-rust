@@ -226,6 +226,14 @@ pub(crate) const TABLES: &[TableSpec] = &[
             "id",
             "commit_id",
             "file_id",
+            // Migration 118's denormalised path. Nothing reads it in
+            // either implementation — `vcs show` resolves paths by
+            // joining `project_files` on both sides — and it is carried
+            // because `vcs commit-staged` hard-deletes that row for a
+            // committed deletion, which makes this the only surviving
+            // record of which file the state was. 7,183 of 7,197 live
+            // rows have one; the 14 that do not predate the column.
+            "file_path",
             "change_type",
             "content_hash",
             "file_size",
@@ -235,6 +243,7 @@ pub(crate) const TABLES: &[TableSpec] = &[
             Type::INT8,
             Type::INT8,
             Type::INT8,
+            Type::TEXT,
             Type::TEXT,
             Type::TEXT,
             Type::INT8,
@@ -773,9 +782,17 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
 ///
 /// Kept beside [`TABLES`] rather than derived from it because being an
 /// identity column is a property of the DDL, not of the copy, and a
-/// table gains one only when a write path needs it. Three today; the
-/// list grows with the writer.
-const IDENTITY_TABLES: &[&str] = &["project_files", "file_contents", "edit_intents"];
+/// table gains one only when a write path needs it. Five today; the
+/// list grows with the writer — `vcs_commits` and `vcs_file_states`
+/// joined it with `vcs commit-staged`, and missing one here is how a
+/// freshly mirrored database hands out an id that already exists.
+const IDENTITY_TABLES: &[&str] = &[
+    "project_files",
+    "file_contents",
+    "edit_intents",
+    "vcs_commits",
+    "vcs_file_states",
+];
 
 /// `setval` each identity sequence to the table's current `MAX(id)`.
 ///
@@ -1118,6 +1135,37 @@ mod tests {
             );
         }
         assert!(READ_SUBSET_DDL.contains("CREATE VIEW source_snapshots"));
+    }
+
+    /// Every table whose sequence this advances must actually have one,
+    /// and every table that has one must be advanced.
+    ///
+    /// The two halves fail differently and both are quiet until they are
+    /// not. A name here with no `GENERATED … AS IDENTITY` in the DDL
+    /// makes `pg_get_serial_sequence` return NULL and `setval(NULL, …)`
+    /// return NULL — no error, nothing advanced. A table in the DDL and
+    /// missing *here* keeps a sequence that starts at 1, so the first
+    /// write after a mirror collides on the primary key.
+    #[test]
+    fn the_identity_tables_are_exactly_the_ones_the_ddl_declares() {
+        for table in IDENTITY_TABLES {
+            assert!(
+                READ_SUBSET_DDL.contains(&format!("ALTER TABLE {table}\n    ALTER COLUMN id")),
+                "{table} is in IDENTITY_TABLES but the DDL gives it no identity, \
+                 so sync_sequences silently advances nothing"
+            );
+        }
+        for spec in TABLES {
+            let declared = READ_SUBSET_DDL
+                .contains(&format!("ALTER TABLE {}\n    ALTER COLUMN id", spec.name));
+            assert_eq!(
+                declared,
+                IDENTITY_TABLES.contains(&spec.name),
+                "{} has an identity in the DDL but is not in IDENTITY_TABLES (or \
+                 the reverse), so a mirror leaves its sequence at 1",
+                spec.name
+            );
+        }
     }
 
     /// Columns and types are positional and parallel; a spec where they

@@ -190,6 +190,26 @@ impl Clock {
         timestamp_of_ms(self.ms)
     }
 
+    /// This instant as `time.time()` would return it: seconds since the
+    /// Unix epoch, fractional.
+    ///
+    /// The one place a Python *float* rather than a SQLite timestamp is
+    /// the thing being reproduced. `vcs commit`'s id is
+    /// `sha256(f"{slug}:{branch}:{message}:{time.time()}")[:16].upper()`,
+    /// so the float's decimal rendering is an input to a hash and a
+    /// digit's difference changes every character of the answer.
+    ///
+    /// Resolution is milliseconds, not microseconds, because that is
+    /// what this type holds — see the note at the top of the module on
+    /// why the representation is SQLite's and not a more natural one.
+    /// `time.time()` is finer, so the two implementations cannot produce
+    /// the same id for the same *wall clock* instant; they produce the
+    /// same id for the same *stated* instant, which is what
+    /// [`NOW_ENV`] pins and what a test can assert.
+    pub fn unix_seconds(&self) -> f64 {
+        (self.ms - JD_EPOCH_MS) as f64 / 1000.0
+    }
+
     /// `(julianday('now') - julianday(ts)) * 24`, to the bit.
     ///
     /// Both operands are rounded to `f64` *before* the subtraction,

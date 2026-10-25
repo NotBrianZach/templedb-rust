@@ -1,4 +1,5 @@
-//! `file set` against a real Postgres, verified by reading it back.
+//! `file set` and `vcs commit-staged` against a real Postgres, verified
+//! by reading them back.
 //!
 //! `#[ignore]`d, like the two CPython oracles, because it needs a
 //! server. `just write-test` runs it. That keeps the property the
@@ -44,6 +45,12 @@ struct Fixture {
     writer: PgWriter,
     project_id: i64,
     slug: String,
+    /// `vcs_sessions` rows this fixture minted, to delete on the way
+    /// out. Nothing cascades them — the reap policy orphans staged rows
+    /// by design — and `MAX(id) + 1000` means a leaked row is walked
+    /// past rather than collided with, which is the kind of leak that
+    /// never fails and never stops growing.
+    sessions: Vec<i64>,
 }
 
 impl Fixture {
@@ -77,6 +84,7 @@ impl Fixture {
             writer,
             project_id,
             slug: slug.to_string(),
+            sessions: Vec::new(),
         }
     }
 
@@ -198,10 +206,273 @@ impl Fixture {
     }
 }
 
+/// The `vcs commit-staged` half of the fixture.
+///
+/// Everything here builds the state a commit *consumes* — a branch, a
+/// live session, staged `vcs_working_state` rows — because the port has
+/// no command that produces it yet. `file set --stage` is the next step
+/// and the one that closes this loop; until it lands, staging is done
+/// with SQL and the commit is the only part under test.
+///
+/// Ids are supplied explicitly for `vcs_branches`, `vcs_sessions` and
+/// `vcs_working_state`: only the five tables a write path inserts into
+/// carry an identity column, and these three are written here rather
+/// than by the port. `MAX(id) + 1000` keeps them clear of anything a
+/// mirror has copied, which is the same trick the project id uses.
+impl Fixture {
+    /// A branch to commit to, made the project's active one.
+    fn branch(&mut self, name: &str) -> i64 {
+        let mut tx = self.writer.transaction().unwrap();
+        let row = tx
+            .query_one(
+                "INSERT INTO vcs_branches (id, project_id, branch_name, is_default)
+                 VALUES ((SELECT COALESCE(MAX(id), 0) + 1000 FROM vcs_branches), $1, $2, 1)
+                 RETURNING id",
+                &[&self.project_id, &name],
+            )
+            .unwrap();
+        let id: i64 = row.get(0);
+        tx.execute(
+            "UPDATE projects SET active_branch_id = $1 WHERE id = $2",
+            &[&id, &self.project_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        id
+    }
+
+    /// A live session, and its `SessionId` through the real resolver.
+    ///
+    /// Through [`templedb_db::resolve_session_tx`] rather than a
+    /// hand-made newtype, because `SessionId` has no public constructor
+    /// on purpose: holding one is supposed to mean *this id named a live
+    /// row*, and a test that forged one would be testing a different
+    /// program.
+    fn session(&mut self) -> (i64, templedb_db::SessionId) {
+        let id = {
+            let mut tx = self.writer.transaction().unwrap();
+            let row = tx
+                .query_one(
+                    "INSERT INTO vcs_sessions (id, ended_at)
+                     VALUES ((SELECT COALESCE(MAX(id), 0) + 1000 FROM vcs_sessions), NULL)
+                     RETURNING id",
+                    &[],
+                )
+                .unwrap();
+            let id: i64 = row.get(0);
+            tx.commit().unwrap();
+            id
+        };
+        self.sessions.push(id);
+        let mut tx = self.writer.transaction().unwrap();
+        let resolved = templedb_db::resolve_session_tx(&mut tx, Some(&id.to_string()))
+            .unwrap()
+            .expect("the session just inserted must resolve");
+        tx.commit().unwrap();
+        (id, resolved)
+    }
+
+    /// The `project_files.id` for a path this fixture has written.
+    fn file_id(&mut self, path: &str) -> i64 {
+        let mut tx = self.writer.transaction().unwrap();
+        let row = tx
+            .query_one(
+                "SELECT id FROM project_files WHERE project_id = $1 AND file_path = $2",
+                &[&self.project_id, &path],
+            )
+            .unwrap();
+        let id: i64 = row.get(0);
+        tx.commit().unwrap();
+        id
+    }
+
+    /// Stage one file: the row `vcs status --refresh` would have written.
+    ///
+    /// `content_hash` is the hash of the file *as the scan saw it*,
+    /// which is the value the commit records — deliberately separate
+    /// from whatever `file_contents` currently holds, because that
+    /// difference is the whole content of a `modified` state.
+    fn stage(
+        &mut self,
+        branch_id: i64,
+        file_id: i64,
+        state: &str,
+        content_hash: Option<&str>,
+        session: Option<i64>,
+    ) {
+        let mut tx = self.writer.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO vcs_working_state
+                 (id, project_id, branch_id, file_id, content_hash, state,
+                  last_modified, staged_by_session_id)
+             VALUES ((SELECT COALESCE(MAX(id), 0) + 1000 FROM vcs_working_state),
+                     $1, $2, $3, $4, $5, '2026-10-25 09:00:00', $6)",
+            &[
+                &self.project_id,
+                &branch_id,
+                &file_id,
+                &content_hash,
+                &state,
+                &session,
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// Commit, on its own transaction, rolling back on a refusal.
+    fn commit(
+        &mut self,
+        message: &str,
+        branch: Option<&str>,
+        session: templedb_db::SessionId,
+    ) -> anyhow::Result<templedb_db::CommitOutcome> {
+        // A pinned clock, so `commit_hash` is a function of the inputs
+        // and the timestamps are assertable rather than excluded.
+        let clock = Clock::at("2026-10-25 12:00:00").unwrap();
+        let slug = self.slug.clone();
+        let project_id = self.project_id;
+        let mut tx = self.writer.transaction()?;
+        let outcome = templedb_db::commit_staged(
+            &mut tx,
+            &clock,
+            project_id,
+            &slug,
+            &templedb_db::CommitOptions {
+                message,
+                author: "write-parity",
+                branch,
+                session,
+            },
+        );
+        match outcome {
+            Ok(o) => {
+                tx.commit()?;
+                Ok(o)
+            }
+            Err(e) => {
+                drop(tx);
+                Err(e)
+            }
+        }
+    }
+
+    /// The commit log, **through the ported `vcs log` reader**.
+    fn log(&self) -> Vec<templedb_db::CommitEntry> {
+        let url = scratch_url().unwrap();
+        let store = templedb_db::PgStore::connect(&url).unwrap();
+        templedb_db::commit_log(
+            &store,
+            self.project_id,
+            None,
+            templedb_db::Visibility::Published,
+            10,
+        )
+        .unwrap()
+    }
+
+    /// `vcs show`'s changed-file list, through the ported reader.
+    fn changed(&self, hash: &str) -> Vec<templedb_db::FileChange> {
+        let url = scratch_url().unwrap();
+        let store = templedb_db::PgStore::connect(&url).unwrap();
+        templedb_db::commit_detail(&store, self.project_id, hash)
+            .unwrap()
+            .expect("the commit should be readable by hash")
+            .1
+    }
+
+    /// `vcs_branches.head_commit_id`, read back.
+    fn head(&mut self, branch_id: i64) -> Option<i64> {
+        let mut tx = self.writer.transaction().unwrap();
+        let head = templedb_db::branch_head(&mut tx, branch_id).unwrap();
+        tx.commit().unwrap();
+        head
+    }
+
+    /// `(state, staged_by_session_id)` for one staged file, or `None`
+    /// when the row is gone.
+    fn working_state(&mut self, file_id: i64) -> Option<(String, Option<i64>)> {
+        let mut tx = self.writer.transaction().unwrap();
+        let row = tx
+            .query_opt(
+                "SELECT state, staged_by_session_id FROM vcs_working_state
+                  WHERE project_id = $1 AND file_id = $2",
+                &[&self.project_id, &file_id],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        row.map(|r| (r.get(0), r.get(1)))
+    }
+
+    /// `vcs_file_states` for one commit, as
+    /// `(file_path, change_type, content_hash, file_size, line_count)`.
+    ///
+    /// Read with SQL rather than through a reader, because `file_path`
+    /// is the column no reader names — carried so a committed deletion
+    /// outlives the `project_files` row it hard-deletes, which is
+    /// exactly what the deletion test asserts.
+    #[allow(clippy::type_complexity)]
+    fn file_states(
+        &mut self,
+        commit_id: i64,
+    ) -> Vec<(
+        Option<String>,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> {
+        let mut tx = self.writer.transaction().unwrap();
+        let rows = tx
+            .query(
+                "SELECT file_path, change_type, content_hash, file_size, line_count
+                   FROM vcs_file_states WHERE commit_id = $1 ORDER BY id",
+                &[&commit_id],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        rows.iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .collect()
+    }
+
+    /// The parent ids recorded for a commit.
+    fn parents(&mut self, commit_id: i64) -> Vec<i64> {
+        let mut tx = self.writer.transaction().unwrap();
+        let rows = tx
+            .query(
+                "SELECT parent_commit_id FROM vcs_commit_parents
+                  WHERE commit_id = $1 ORDER BY parent_order",
+                &[&commit_id],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        rows.iter().map(|r| r.get(0)).collect()
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Ok(mut tx) = self.writer.transaction() {
+            // Order matters now that commits exist. `vcs_commits`
+            // cascades from `projects`, but `vcs_branches` is what
+            // `head_commit_id` points at and nothing cascades *that*
+            // pointer — so the branch rows go first, with the head
+            // nulled, or the commit delete trips over nothing and the
+            // branches are left behind for the next run to collide
+            // with.
+            let _ = tx.execute(
+                "UPDATE vcs_branches SET head_commit_id = NULL WHERE project_id = $1",
+                &[&self.project_id],
+            );
             let _ = tx.execute("DELETE FROM projects WHERE slug = $1", &[&self.slug]);
+            // After the project, because `vcs_working_state` and
+            // `edit_intents` reference these ids in columns that declare
+            // no FK and that nothing nulls — the project delete is what
+            // takes those rows away.
+            for id in &self.sessions {
+                let _ = tx.execute("DELETE FROM vcs_sessions WHERE id = $1", &[id]);
+            }
             let _ = tx.commit();
         }
     }
@@ -662,4 +933,611 @@ fn a_pinned_session_is_recorded_and_a_dead_one_is_refused() {
         .unwrap();
         tx.commit().unwrap();
     }
+}
+
+// --- vcs commit-staged ------------------------------------------------
+//
+// The cross-read for the commit path is a stronger one than `file set`'s,
+// because three *different* already-verified readers can see the result:
+// `vcs log` lists the commit, `vcs show` lists its changed files, and
+// `file cat` reads the content it made current. A commit none of them can
+// see did not happen.
+//
+// What cannot be tested here is the half that was refused. There is no
+// workspace, so there is nothing to scan and no conflict to detect —
+// which is the point of the command's name.
+
+/// The whole path, end to end: stage a modified file, commit it, and see
+/// the commit through three readers.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_commit_is_visible_to_vcs_log_vcs_show_and_file_cat() {
+    let mut f = fixture!("wp-commit");
+    let branch = f.branch("main");
+    let (_, session) = f.session();
+
+    // The file as the database holds it, then the file as the workspace
+    // scan saw it. The second hash is what gets committed: it is the
+    // staged hash, and the difference between the two is the entire
+    // content of a `modified` state.
+    f.set("src/main.rs", "fn main() {}\n", None).unwrap();
+    let staged = f.set("src/main.rs", "fn main() { go() }\n", None).unwrap();
+    let file_id = f.file_id("src/main.rs");
+    f.stage(
+        branch,
+        file_id,
+        "modified",
+        Some(&staged.hash),
+        Some(session.get()),
+    );
+
+    let out = f.commit("tighten main", None, session).unwrap();
+    assert_eq!(out.files, 1);
+    assert_eq!(out.deletions, 0);
+    assert_eq!(out.branch_name, "main");
+    assert_eq!(out.previous_head, None, "the branch had no commits");
+    assert_eq!(out.other_sessions_staged, 0);
+    assert_eq!(out.reaped, 0);
+    // The id is a function of the pinned clock and the four fields, so
+    // it is assertable rather than merely well-formed.
+    assert_eq!(
+        out.hash,
+        templedb_db::commit_hash(
+            "wp-commit",
+            "main",
+            "tighten main",
+            Clock::at("2026-10-25 12:00:00").unwrap().unix_seconds()
+        )
+    );
+
+    // Reader one: `vcs log`. The commit lands published — Python's
+    // `vcs commit` leaves `session_id` NULL too — so the *published*
+    // view sees it, which is the view that needs no session at all.
+    let log = f.log();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(log[0].commit_hash, out.hash);
+    assert_eq!(log[0].branch_name, "main");
+    assert_eq!(log[0].author, "write-parity");
+    assert_eq!(log[0].commit_message, "tighten main");
+    assert_eq!(log[0].commit_timestamp, "2026-10-25 12:00:00");
+    assert_eq!(log[0].session_id, None, "no session means published");
+
+    // Reader two: `vcs show`'s changed-file list.
+    let changed = f.changed(&out.hash);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].file_path, "src/main.rs");
+    assert_eq!(changed[0].change_type, "modified");
+    assert_eq!(changed[0].file_size, Some(19));
+    assert_eq!(changed[0].line_count, Some(2));
+
+    // Reader three: `file cat`, which sees the content the commit made
+    // current.
+    assert_eq!(
+        f.read_back("src/main.rs").as_deref(),
+        Some("fn main() { go() }\n")
+    );
+
+    // And the branch head, which no trigger advanced.
+    assert_eq!(f.head(branch), Some(out.commit_id));
+
+    // Unstaged, in place: the row survives with the flag cleared, which
+    // is what `NULL means not staged` has to mean.
+    assert_eq!(
+        f.working_state(file_id),
+        Some(("unmodified".to_string(), None))
+    );
+}
+
+/// The branch head advances, and a commit built on a head that has since
+/// moved is refused rather than overwriting it.
+///
+/// This is the test the design document asks for — "two commits racing
+/// on one branch" — and it is a real race rather than a simulated one:
+/// two transactions on two connections, the second holding a head the
+/// first has already replaced. It stays deterministic because the first
+/// transaction *commits* before the second's `UPDATE` runs, so nothing
+/// blocks; under `READ COMMITTED` the CAS predicate is then evaluated
+/// against the new row version and matches nothing.
+///
+/// Python cannot have this check. Its trigger writes the column during
+/// the `INSERT`, so an app-level compare-and-swap over there always
+/// found the new value already in place and reported `HEAD_RACE` on
+/// every commit — the false positive its comment records.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn the_branch_head_advances_and_a_racing_commit_is_refused() {
+    let mut f = fixture!("wp-commit-race");
+    let branch = f.branch("main");
+    let (_, session) = f.session();
+
+    let a = f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    f.stage(
+        branch,
+        file_id,
+        "modified",
+        Some(&a.hash),
+        Some(session.get()),
+    );
+
+    // A second connection, which is what makes this a race and not a
+    // sequence. Its transaction opens *before* the first commit lands
+    // and reads the head it then builds on.
+    let url = scratch_url().unwrap();
+    let mut other = PgWriter::connect(&url).unwrap();
+    let mut stale_tx = other.transaction().unwrap();
+    let stale_head = templedb_db::branch_head(&mut stale_tx, branch).unwrap();
+    assert_eq!(stale_head, None, "the branch starts empty");
+
+    // Session A commits. The head moves.
+    let first = f.commit("first", None, session).unwrap();
+    assert_eq!(f.head(branch), Some(first.commit_id));
+
+    // Session B now tries to advance from the head it read. The branch
+    // no longer points there, so the CAS matches no row and refuses.
+    let err = templedb_db::advance_branch_head(&mut stale_tx, branch, stale_head, 999_999)
+        .expect_err("a stale head must not be overwritten");
+    drop(stale_tx);
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NOT_FOUND);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("HEAD_RACE"), "{msg}");
+    assert!(msg.contains("Nothing has been written"), "{msg}");
+
+    // And the head is still the first commit's: the refusal did not
+    // half-apply.
+    assert_eq!(f.head(branch), Some(first.commit_id));
+}
+
+/// A second commit records its parent and advances the head from it.
+///
+/// The parent edge goes in `vcs_commit_parents` and nowhere else.
+/// `vcs_commits.parent_commit_id` is not in the mirrored subset — no
+/// reader names it, and Python's own `create_commit` docstring records
+/// the column drifting out of sync with this table when `vcs merge`
+/// wrote the rows and not the column.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_second_commit_records_its_parent_and_moves_the_head() {
+    let mut f = fixture!("wp-commit-parent");
+    let branch = f.branch("main");
+    let (_, session) = f.session();
+
+    let one = f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    f.stage(
+        branch,
+        file_id,
+        "modified",
+        Some(&one.hash),
+        Some(session.get()),
+    );
+    let first = f.commit("first", None, session).unwrap();
+    assert!(f.parents(first.commit_id).is_empty(), "a root commit");
+
+    // Stage again. The row is still there, unstaged — so re-staging is
+    // an UPDATE, which is what the real `file set --stage` will do.
+    let two = f.set("a.txt", "two\n", None).unwrap();
+    {
+        let mut tx = f.writer.transaction().unwrap();
+        tx.execute(
+            "UPDATE vcs_working_state
+                SET state = 'modified', content_hash = $1, staged_by_session_id = $2
+              WHERE project_id = $3 AND file_id = $4",
+            &[&two.hash, &session.get(), &f.project_id, &file_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let second = f.commit("second", None, session).unwrap();
+    assert_eq!(second.previous_head, Some(first.commit_id));
+    assert_eq!(f.parents(second.commit_id), vec![first.commit_id]);
+    assert_eq!(f.head(branch), Some(second.commit_id));
+    // The ids differ even though the clock is pinned, because the
+    // message is in the hash input.
+    assert_ne!(first.hash, second.hash);
+
+    // Both commits are in the log — and in *this* order, which is the
+    // tie-break rather than an accident. A pinned clock gives the two
+    // the same `commit_timestamp`, and `vcs log` orders by
+    // `commit_timestamp DESC, id ASC`, so the older id comes first. The
+    // README's *The tie-break, and getting it backwards first* is about
+    // exactly this ordering; a write test is the only place it can be
+    // exercised deliberately, because live data rarely has two commits
+    // in the same second.
+    let log = f.log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].commit_timestamp, log[1].commit_timestamp);
+    assert_eq!(log[0].commit_message, "first", "id ASC breaks the tie");
+    assert_eq!(log[1].commit_message, "second");
+}
+
+/// A committed deletion hard-deletes the `project_files` row and keeps
+/// the path in `vcs_file_states`.
+///
+/// This is the only path in the system that hard-deletes that row —
+/// everything else soft-deletes by flipping `status` — which is why the
+/// denormalised `file_path` has to be written: without it the state row
+/// is left pointing at a `file_id` that resolves to nothing, and nothing
+/// records which file it was.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_deletion_hard_deletes_the_file_and_keeps_its_path() {
+    let mut f = fixture!("wp-commit-delete");
+    let branch = f.branch("main");
+    let (_, session) = f.session();
+
+    f.set("doomed.txt", "bye\n", None).unwrap();
+    let file_id = f.file_id("doomed.txt");
+    // A deletion stages with no content hash, which is the one state
+    // where that is honest — guard 3 exists for all the others.
+    f.stage(branch, file_id, "deleted", None, Some(session.get()));
+
+    let out = f.commit("drop it", None, session).unwrap();
+    assert_eq!(out.files, 1);
+    assert_eq!(out.deletions, 1);
+
+    // The sentinel, and the path that outlives the row.
+    let states = f.file_states(out.commit_id);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].0.as_deref(), Some("doomed.txt"));
+    assert_eq!(states[0].1, "deleted");
+    assert_eq!(states[0].2.as_deref(), Some("DELETED"));
+
+    // The file is gone, not soft-deleted: `file cat` cannot see it and
+    // neither can a direct lookup.
+    assert!(f.read_back("doomed.txt").is_none());
+    {
+        let mut tx = f.writer.transaction().unwrap();
+        let row = tx
+            .query_opt(
+                "SELECT id FROM project_files WHERE project_id = $1 AND file_path = $2",
+                &[&f.project_id, &"doomed.txt"],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(row.is_none(), "the row should be hard-deleted, not flipped");
+    }
+    // And its working state went with it, rather than being unstaged.
+    assert_eq!(f.working_state(file_id), None);
+
+    // `vcs show` can still list the change, because it joins
+    // `project_files`... and that row is gone, so it cannot. Asserted
+    // rather than wished for: this is exactly the hole `file_path`
+    // exists to record, and it is recorded in the row above even though
+    // no reader reaches for it yet.
+    assert!(
+        f.changed(&out.hash).is_empty(),
+        "the reader inner-joins project_files, so a hard-deleted file \
+         drops out of the list — the path survives only in the column"
+    );
+}
+
+/// Nothing staged is exit 1 and a message that names the session, and it
+/// reports rows staged in *other* sessions rather than saying nothing.
+///
+/// That last part is Python's and it is the footgun worth keeping: an
+/// agent stages in one shell and commits in another, every tool call
+/// getting its own session leader, so "nothing staged" is the most
+/// misleading true statement the command can make.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn nothing_staged_refuses_and_points_at_the_other_session() {
+    let mut f = fixture!("wp-commit-empty");
+    let branch = f.branch("main");
+    let (_, mine) = f.session();
+    let (theirs_id, _) = f.session();
+
+    f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    f.stage(branch, file_id, "modified", Some("abc"), Some(theirs_id));
+
+    let err = f.commit("nothing of mine", None, mine).unwrap_err();
+    // Exit 1, following git: non-zero when nothing was committed,
+    // including when there was simply nothing to commit.
+    assert_eq!(templedb_db::code_of(&err), templedb_db::USAGE);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("nothing staged"), "{msg}");
+    assert!(msg.contains(&mine.to_string()), "{msg}");
+    assert!(
+        msg.contains("1 file(s) are staged in other sessions"),
+        "{msg}"
+    );
+
+    // The other session's row is untouched, which is the whole point of
+    // the column.
+    assert_eq!(
+        f.working_state(file_id),
+        Some(("modified".to_string(), Some(theirs_id)))
+    );
+    assert!(f.log().is_empty(), "no commit should exist");
+}
+
+/// Another session's staged rows survive a commit that ran beside them.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn another_sessions_staged_rows_survive_the_commit() {
+    let mut f = fixture!("wp-commit-isolation");
+    let branch = f.branch("main");
+    let (_, mine) = f.session();
+    let (theirs_id, _) = f.session();
+
+    let a = f.set("mine.txt", "mine\n", None).unwrap();
+    let b = f.set("theirs.txt", "theirs\n", None).unwrap();
+    let mine_id = f.file_id("mine.txt");
+    let theirs_file = f.file_id("theirs.txt");
+    f.stage(branch, mine_id, "modified", Some(&a.hash), Some(mine.get()));
+    f.stage(
+        branch,
+        theirs_file,
+        "modified",
+        Some(&b.hash),
+        Some(theirs_id),
+    );
+
+    let out = f.commit("just mine", None, mine).unwrap();
+    assert_eq!(out.files, 1, "only this session's row");
+    assert_eq!(out.other_sessions_staged, 1);
+    assert_eq!(f.changed(&out.hash).len(), 1);
+    assert_eq!(f.changed(&out.hash)[0].file_path, "mine.txt");
+
+    assert_eq!(
+        f.working_state(mine_id),
+        Some(("unmodified".to_string(), None))
+    );
+    assert_eq!(
+        f.working_state(theirs_file),
+        Some(("modified".to_string(), Some(theirs_id))),
+        "the other session's staging must not be cleared"
+    );
+}
+
+/// Guard 3: a staged non-deleted file with no content hash is refused,
+/// and the refusal leaves nothing behind.
+///
+/// The second half is what makes it a guard. Python checks inside the
+/// per-file loop, after the commit row has been inserted, and relies on
+/// the rollback; this checks the whole set first, so the commit row is
+/// never minted at all. Either way the test is the same: no commit, and
+/// the staging still staged.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_staged_file_with_no_hash_is_refused_and_writes_nothing() {
+    let mut f = fixture!("wp-commit-guard3");
+    let branch = f.branch("main");
+    let (session_id, session) = f.session();
+
+    f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    // 'modified' with no hash: the row 124 live `vcs_file_states` rows
+    // were written from before the guard existed.
+    f.stage(branch, file_id, "modified", None, Some(session_id));
+
+    let err = f.commit("should refuse", None, session).unwrap_err();
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NO_PATH);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("a.txt"), "{msg}");
+    assert!(msg.contains("DELETED"), "{msg}");
+
+    assert!(f.log().is_empty(), "no commit row");
+    assert_eq!(f.head(branch), None, "the head did not move");
+    assert_eq!(
+        f.working_state(file_id),
+        Some(("modified".to_string(), Some(session_id))),
+        "a refused commit must leave the staging intact"
+    );
+}
+
+/// A staged hash with no blob is refused, where Python reads the file
+/// off disk.
+///
+/// This is the tree-dependent half, refused by name. Python resolves the
+/// path, joins it onto `~/.config/templedb/checkouts/<slug>`, reads the
+/// bytes and stores the blob — the mirror-to-disk dependency the design
+/// document says settles whether the command can be ported at all.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn a_staged_hash_with_no_blob_is_refused_rather_than_read_from_disk() {
+    let mut f = fixture!("wp-commit-noblob");
+    let branch = f.branch("main");
+    let (session_id, session) = f.session();
+
+    f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    // A hash no blob was ever stored under — what a workspace scan
+    // leaves when the content was never ingested.
+    let phantom = templedb_db::content_hash("never stored anywhere\n");
+    f.stage(
+        branch,
+        file_id,
+        "modified",
+        Some(&phantom),
+        Some(session_id),
+    );
+
+    let err = f.commit("should refuse", None, session).unwrap_err();
+    assert_eq!(templedb_db::code_of(&err), templedb_db::NO_PATH);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("names no blob"), "{msg}");
+    assert!(msg.contains("no checkout"), "{msg}");
+    assert!(msg.contains(&phantom[..12]), "{msg}");
+
+    assert!(f.log().is_empty());
+    assert_eq!(f.head(branch), None);
+}
+
+/// Guard 2: working-state rows pointing at a reaped `project_files` row
+/// are deleted rather than aborting the commit on a foreign key.
+///
+/// `sync_engine` and some migrations bulk-delete with FK enforcement
+/// off, so these rows are a state the live database reaches. On
+/// 2026-09-19 one of them aborted a whole commit.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn orphaned_working_state_rows_are_reaped_instead_of_aborting() {
+    let mut f = fixture!("wp-commit-reap");
+    let branch = f.branch("main");
+    let (session_id, session) = f.session();
+
+    let a = f.set("real.txt", "real\n", None).unwrap();
+    let real = f.file_id("real.txt");
+    f.stage(branch, real, "modified", Some(&a.hash), Some(session_id));
+    // A staged row for a file that does not exist. `vcs_working_state`
+    // declares no FK on `file_id` in this subset precisely so the
+    // mirror can carry rows like it.
+    f.stage(
+        branch,
+        9_999_999,
+        "modified",
+        Some(&a.hash),
+        Some(session_id),
+    );
+
+    let out = f.commit("one real file", None, session).unwrap();
+    assert_eq!(out.reaped, 1, "the dangling row should be reaped");
+    assert_eq!(out.files, 1, "and not committed");
+    assert_eq!(f.changed(&out.hash).len(), 1);
+    assert_eq!(f.working_state(9_999_999), None);
+}
+
+/// A named branch is committed to, and a name that does not exist is
+/// refused rather than falling back to the active one.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn an_explicit_branch_is_honoured_and_an_unknown_one_refuses() {
+    let mut f = fixture!("wp-commit-branch");
+    let main = f.branch("main");
+    let (session_id, session) = f.session();
+
+    // A second branch, not the active one.
+    let dev = {
+        let mut tx = f.writer.transaction().unwrap();
+        let row = tx
+            .query_one(
+                "INSERT INTO vcs_branches (id, project_id, branch_name, is_default)
+                 VALUES ((SELECT COALESCE(MAX(id), 0) + 1000 FROM vcs_branches), $1, 'dev', 0)
+                 RETURNING id",
+                &[&f.project_id],
+            )
+            .unwrap();
+        let id: i64 = row.get(0);
+        tx.commit().unwrap();
+        id
+    };
+
+    let a = f.set("a.txt", "one\n", None).unwrap();
+    let file_id = f.file_id("a.txt");
+    // Staged on `dev`, which is the branch the commit has to be told
+    // about: the staged lookup is scoped to (project, branch, session).
+    f.stage(dev, file_id, "modified", Some(&a.hash), Some(session_id));
+
+    // Without `--branch` it resolves `main`, where nothing is staged.
+    let err = f.commit("wrong branch", None, session).unwrap_err();
+    assert!(format!("{err:#}").contains("nothing staged"), "{err:#}");
+
+    let out = f.commit("right branch", Some("dev"), session).unwrap();
+    assert_eq!(out.branch_name, "dev");
+    assert_eq!(f.head(dev), Some(out.commit_id));
+    assert_eq!(f.head(main), None, "the active branch did not move");
+
+    let err = f.commit("nowhere", Some("nope"), session).unwrap_err();
+    assert!(format!("{err:#}").contains("no branch \"nope\""), "{err:#}");
+}
+
+/// An `added` state records the blob's own numbers, not the current
+/// revision's — and an empty blob yields Python's NULL line count.
+///
+/// Python re-derives both from `content_blobs` rather than trusting the
+/// `file_contents` join, and it has to: a modified file's staged hash is
+/// by definition not the current one. The empty case is the quirk —
+/// `if content_text` is false for `''`, so it falls to the binary branch
+/// for the size and leaves the line count NULL rather than 0.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn the_recorded_size_and_lines_come_from_the_staged_blob() {
+    let mut f = fixture!("wp-commit-metrics");
+    let branch = f.branch("main");
+    let (session_id, session) = f.session();
+
+    // Multibyte, so a byte count and a character count differ: four
+    // characters, seven bytes.
+    let content = "aé✓\n";
+    assert_eq!(content.chars().count(), 4);
+    assert_eq!(content.len(), 7);
+    let wide = f.set("wide.txt", content, None).unwrap();
+    let empty = f.set("empty.txt", "", Some("deadbeef")).unwrap_err();
+    // `--if-match` on a new file refuses, so create it the plain way.
+    assert!(format!("{empty:#}").contains("no current content"));
+    let empty = {
+        let clock = Clock::at("2026-10-25 11:00:00").unwrap();
+        let mut tx = f.writer.transaction().unwrap();
+        let o = templedb_db::set_file(
+            &mut tx,
+            &clock,
+            f.project_id,
+            "empty.txt",
+            "",
+            &templedb_db::SetOptions::default(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        o
+    };
+
+    let wide_id = f.file_id("wide.txt");
+    let empty_id = f.file_id("empty.txt");
+    f.stage(branch, wide_id, "added", Some(&wide.hash), Some(session_id));
+    f.stage(
+        branch,
+        empty_id,
+        "added",
+        Some(&empty.hash),
+        Some(session_id),
+    );
+
+    let out = f.commit("metrics", None, session).unwrap();
+    let states = f.file_states(out.commit_id);
+    assert_eq!(states.len(), 2);
+
+    let wide_row = states
+        .iter()
+        .find(|s| s.0.as_deref() == Some("wide.txt"))
+        .unwrap();
+    assert_eq!(wide_row.3, Some(7), "bytes, not characters");
+    assert_eq!(wide_row.4, Some(2), "Python counts separators and adds one");
+
+    let empty_row = states
+        .iter()
+        .find(|s| s.0.as_deref() == Some("empty.txt"))
+        .unwrap();
+    assert_eq!(empty_row.3, Some(0));
+    assert_eq!(
+        empty_row.4, None,
+        "an empty content_text is falsy over there, so the line count is NULL"
+    );
+}
+
+/// Content containing a NUL survives being committed, with the size
+/// measured on the real bytes rather than the escaped form.
+///
+/// The same seam `file set`'s NUL test covers, one layer along: the
+/// staged blob is read back through `pgtext::unescape` before it is
+/// measured, and skipping that would overcount every file holding a NUL.
+/// One live file does.
+#[test]
+#[ignore = "needs a Postgres scratch database; run with `just write-test`"]
+fn committed_content_with_a_nul_is_measured_on_the_real_bytes() {
+    let mut f = fixture!("wp-commit-nul");
+    let branch = f.branch("main");
+    let (session_id, session) = f.session();
+
+    let content = "parts.join('\0')\n";
+    let out = f.set("e.ts", content, None).unwrap();
+    let file_id = f.file_id("e.ts");
+    f.stage(branch, file_id, "added", Some(&out.hash), Some(session_id));
+
+    let commit = f.commit("nul", None, session).unwrap();
+    let states = f.file_states(commit.commit_id);
+    assert_eq!(states[0].3, Some(content.len() as i64), "unescaped length");
+    assert_eq!(f.read_back("e.ts").as_deref(), Some(content));
 }

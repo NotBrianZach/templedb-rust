@@ -128,6 +128,12 @@ CREATE TABLE vcs_file_states (
     id           INTEGER PRIMARY KEY,
     commit_id    INTEGER NOT NULL,
     file_id      INTEGER NOT NULL,
+    -- Migration 118's denormalised path. Nullable here as it is live,
+    -- and both cases appear in the data below: the mirror carries it so
+    -- a committed deletion survives the hard-delete of its
+    -- `project_files` row, and nothing reads it in either
+    -- implementation.
+    file_path    TEXT,
     change_type  TEXT NOT NULL,
     content_hash TEXT,
     file_size    INTEGER,
@@ -504,24 +510,29 @@ VALUES
     (19, 1, 99, 'C9', 'zach', 'dangling',    '2026-02-04 00:00:00', NULL),
     (20, 2, 3, 'B1', 'zach',  'beta commit', '2026-02-01 00:00:00', NULL);
 
+-- `file_path` repeats what `project_files` holds, which is the point of
+-- the column: it is the only copy that survives a committed deletion,
+-- because `vcs commit-staged` hard-deletes the `project_files` row. The
+-- deletion row below leaves it NULL on purpose — 14 of the 7,197 live
+-- rows predate the column and the mirror has to carry those too.
 INSERT INTO vcs_file_states
-    (commit_id, file_id, change_type, content_hash, file_size, line_count)
+    (commit_id, file_id, file_path, change_type, content_hash, file_size, line_count)
 VALUES
-    (1, 1,  'modified', 'h-main-old', 13, 1),
-    (2, 9,  'modified', 'h-missing',  10, 2),
-    (3, 10, 'deleted',  NULL,         NULL, NULL),
+    (1, 1,  'src/main.rs', 'modified', 'h-main-old', 13, 1),
+    (2, 9,  'orphan.txt',  'modified', 'h-missing',  10, 2),
+    (3, 10, NULL,          'deleted',  NULL,         NULL, NULL),
     -- `vcs show`'s diff fixtures. C1 and C2 both touch src/main.rs, so
     -- C2-against-its-parent is a real one-line-to-three-lines diff
     -- rather than a whole-file addition.
-    (11, 1, 'modified', 'h-main-old', 13, 1),
-    (12, 1, 'modified', 'h-main',     26, 3),
+    (11, 1, 'src/main.rs', 'modified', 'h-main-old', 13, 1),
+    (12, 1, 'src/main.rs', 'modified', 'h-main',     26, 3),
     -- A binary file in a commit: `vcs show` names it as binary rather
     -- than diffing two empty sides and calling it "No differences".
-    (20, 7, 'modified', 'h-png',      4,  NULL),
+    (20, 7, 'logo.png',    'modified', 'h-png',      4,  NULL),
     -- The two blobs that distinguish "binary" from "text under an
     -- unexpected content_type" from "the row carries nothing".
-    (20, 11, 'modified', 'h-shell',   17, 2),
-    (20, 12, 'modified', 'h-hollow',  0,  NULL);
+    (20, 11, 'script.sh',  'modified', 'h-shell',    17, 2),
+    (20, 12, 'hollow.txt', 'modified', 'h-hollow',   0,  NULL);
 
 -- Parent edges. C1 is a root commit (absent here), C2's parent is C1,
 -- C4's is C2.

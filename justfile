@@ -280,3 +280,39 @@ write-test:
 # exist to prevent.
 pg-scratch-schema:
     psql "{{PG_SCRATCH}}" -q -f schema/postgres/001_read_subset.sql
+
+# Both databases carry the subset DDL, and it is not static: it has
+# grown a column or an identity every time a write path landed —
+# `edit_intents` with the intent record, `vcs_commits` and
+# `vcs_file_states` with `vcs commit-staged`. `--create-schema` is
+# CREATE-only, so it cannot apply a change to a database that already
+# has the tables, and the symptom is remote from the cause: a `mirror`
+# run fails inside a binary COPY with a column count mismatch.
+#
+# Recreating is the right move rather than writing ALTERs. Neither
+# database is a source of truth — parity is a copy and scratch is
+# disposable — so the DDL file stays the single declaration of the shape
+# and nothing has to keep a migration list in step with it.
+#
+# Destructive, and deliberately not a dependency of anything: `mirror`
+# refilling parity afterwards is a 222,890-row copy, and the write tests
+# rebuild their own fixtures.
+
+# Rebuild both databases' schemas from the DDL. Destructive.
+pg-reschema:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for url in "{{PG_PARITY_RW}}" "{{PG_SCRATCH}}"; do
+        psql "$url" -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+        psql "$url" -q -f schema/postgres/001_read_subset.sql
+        echo "reschema'd $(psql "$url" -tAc 'SELECT current_database()')"
+    done
+    # DROP SCHEMA took the grants with it, so the read-only role loses
+    # its SELECT and every parity read starts failing with "permission
+    # denied for table projects". Re-applying is the whole reason this
+    # recipe exists rather than two psql calls in a shell.
+    psql "{{PG_PARITY_RW}}" -q \
+        -c "GRANT USAGE ON SCHEMA public TO templedb_ro" \
+        -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO templedb_ro" \
+        -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO templedb_ro"
+    echo "now run: just mirror-refresh"

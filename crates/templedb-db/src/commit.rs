@@ -141,11 +141,14 @@ pub struct CommitOutcome {
 }
 
 /// A branch, resolved.
+///
+/// `pub(crate)` for `file set`'s auto-stage, which resolves the branch
+/// through [`active_or_default_branch`] below.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Branch {
-    id: i64,
-    name: String,
-    head_commit_id: Option<i64>,
+pub(crate) struct Branch {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) head_commit_id: Option<i64>,
 }
 
 /// One staged row, joined to what the commit needs to record it.
@@ -277,22 +280,83 @@ fn check_committable(file_path: &str, state: &str, ws_hash: Option<&str>) -> Res
     ))))
 }
 
+/// The project's active branch, then its default — or `None` when it
+/// has neither.
+///
+/// Python's active-branch join does not check that the branch it finds
+/// belongs to the project: it reads `projects.active_branch_id` and
+/// follows it. Reproduced, and then checked — a writer that followed a
+/// cross-project pointer would append a commit to another project's
+/// history, which is the same class of mistake `resolve_project_exact`
+/// refuses fuzzy matching for. Reading that way is harmless; writing
+/// that way is not.
+///
+/// Shared with `file set`'s auto-stage, and the sharing is the point
+/// rather than a tidy-up. A stage written against one branch and a
+/// commit reading another is a loop that reports success at both ends
+/// and moves nothing. Python has **two** copies of this lookup and they
+/// are not the same query: the auto-stage's reads
+/// `projects.active_branch_id` without joining `vcs_branches` at all, so
+/// it will stage against a branch id naming no row — and then
+/// `vcs commit`, which does join, finds nothing staged.
+pub(crate) fn active_or_default_branch(
+    tx: &mut postgres::Transaction<'_>,
+    project_id: i64,
+) -> Result<Option<Branch>> {
+    let active = tx
+        .query_opt(
+            "SELECT vb.id, vb.branch_name, vb.head_commit_id, vb.project_id
+               FROM projects p
+               JOIN vcs_branches vb ON p.active_branch_id = vb.id
+              WHERE p.id = $1",
+            &[&project_id],
+        )
+        .context("looking up the active branch")?;
+    if let Some(row) = &active {
+        let owner: i64 = row.get(3);
+        if owner != project_id {
+            bail!(
+                "project {project_id}'s active_branch_id names branch {} \
+                 of project {owner}.\n\
+                 Python's active-branch join does not check this and would \
+                 write there; touching another project's history is not a \
+                 mistake worth reproducing.\n\
+                 Pass --branch to say which branch you meant.",
+                row.get::<_, i64>(0)
+            );
+        }
+    }
+    let row = match active {
+        Some(row) => Some(row),
+        // Python's fallback, in Python's order.
+        None => tx
+            .query_opt(
+                "SELECT id, branch_name, head_commit_id
+                   FROM vcs_branches
+                  WHERE project_id = $1 AND is_default = 1
+                  LIMIT 1",
+                &[&project_id],
+            )
+            .context("looking up the default branch")?,
+    };
+    Ok(row.map(|row| Branch {
+        id: row.get(0),
+        name: row.get(1),
+        head_commit_id: row.get(2),
+    }))
+}
+
 /// The branch to commit to: an exact name, or the active one.
 ///
 /// Python's `--branch` path lists the project's branches and picks by
-/// name, so it is project-scoped. Its *active* path is not: the join
-/// reads `projects.active_branch_id` and never checks that the branch
-/// found belongs to the project. Reproduced, and then checked — a
-/// writer that followed a cross-project pointer would append a commit to
-/// another project's history, which is the same class of mistake
-/// `resolve_project_exact` refuses fuzzy matching for. Reading that way
-/// is harmless; writing that way is not.
+/// name, so it is project-scoped; the no-name path is
+/// [`active_or_default_branch`].
 fn resolve_branch(
     tx: &mut postgres::Transaction<'_>,
     project_id: i64,
     name: Option<&str>,
 ) -> Result<Branch> {
-    let row = match name {
+    let found = match name {
         Some(name) => tx
             .query_opt(
                 "SELECT id, branch_name, head_commit_id
@@ -300,47 +364,15 @@ fn resolve_branch(
                   WHERE project_id = $1 AND branch_name = $2",
                 &[&project_id, &name],
             )
-            .context("looking up the named branch")?,
-        None => {
-            let active = tx
-                .query_opt(
-                    "SELECT vb.id, vb.branch_name, vb.head_commit_id, vb.project_id
-                       FROM projects p
-                       JOIN vcs_branches vb ON p.active_branch_id = vb.id
-                      WHERE p.id = $1",
-                    &[&project_id],
-                )
-                .context("looking up the active branch")?;
-            if let Some(row) = &active {
-                let owner: i64 = row.get(3);
-                if owner != project_id {
-                    bail!(
-                        "project {project_id}'s active_branch_id names branch {} \
-                         of project {owner}.\n\
-                         Python's active-branch join does not check this and \
-                         would commit there; appending to another project's \
-                         history is not a mistake worth reproducing.\n\
-                         Pass --branch to say which branch you meant.",
-                        row.get::<_, i64>(0)
-                    );
-                }
-            }
-            match active {
-                Some(row) => Some(row),
-                // Python's fallback, in Python's order.
-                None => tx
-                    .query_opt(
-                        "SELECT id, branch_name, head_commit_id
-                           FROM vcs_branches
-                          WHERE project_id = $1 AND is_default = 1
-                          LIMIT 1",
-                        &[&project_id],
-                    )
-                    .context("looking up the default branch")?,
-            }
-        }
+            .context("looking up the named branch")?
+            .map(|row| Branch {
+                id: row.get(0),
+                name: row.get(1),
+                head_commit_id: row.get(2),
+            }),
+        None => active_or_default_branch(tx, project_id)?,
     };
-    let Some(row) = row else {
+    let Some(branch) = found else {
         match name {
             Some(name) => bail!(
                 "no branch {name:?} in this project.\n\
@@ -353,11 +385,7 @@ fn resolve_branch(
             ),
         }
     };
-    Ok(Branch {
-        id: row.get(0),
-        name: row.get(1),
-        head_commit_id: row.get(2),
-    })
+    Ok(branch)
 }
 
 /// The branch's current head, read inside the transaction.

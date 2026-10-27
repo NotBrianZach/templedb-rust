@@ -34,7 +34,7 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
 | `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
-| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [--session]` | **the first write.** Postgres only, opt-in, five of Python’s seven guards — see *The first write* |
+| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [-s] [--session]` | **the first write.** Postgres only, opt-in, six of Python’s seven guards — see *The first write* |
 | `templedb-rs vcs commit-staged <proj> {-m\|-F} [-b] [--author] [--session]` | **the second write.** Postgres only, opt-in; the database half of Python's `vcs commit`, with the tree-dependent half refused and the name saying so — see *The second write* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
@@ -68,7 +68,7 @@ exact slug, because every Python command does. The scoring function is
 reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
 around it are not — see below.
 
-324 unit tests, run by `cargo test`: 292 in `templedb-db` and 32 in
+326 unit tests, run by `cargo test`: 294 in `templedb-db` and 32 in
 `templedb-cli` for the formatting the SQL layer cannot see. Five more
 are `#[ignore]`d because they need `python3`: three drive CPython's
 `difflib` as a reference oracle for *both* renderers, and two drive
@@ -131,6 +131,14 @@ database, and this port has no workspace. What is ported is the half
 that is a database operation, under a different name —
 `vcs commit-staged` — so that the name does not promise a workflow that
 is refused. See *The second write*.
+
+**The write loop closes, as of 2026-10-27.** `file set` stages what it
+writes and `vcs commit-staged` commits what is staged, so the two
+commands are one path rather than two halves — and the staging step is
+the port's own code rather than a SQL fixture standing in for it. That
+is the whole of step 21; see *The auto-stage* and the porting order
+below. What is still missing from the loop as Python drives it is
+`file set --commit`, which runs the commit in-process.
 
 No writes to the live database, either — and that is still true now
 that the binary has two write commands. There are three write paths in
@@ -640,6 +648,21 @@ closed on 2026-10-23 — see *The error statuses* and *Sessions*.
 Reimplementing a query means reading the schema it runs against, which is
 a different kind of attention than using it.
 
+- **`file set`'s un-delete guard fired unconditionally, and not for the
+  reason its comment gives.** Found 2026-10-27 while porting the
+  auto-stage; **fixed upstream the same day** in `templedb`
+  BF4E6BEA6BD93C6E. `_write_content_to_db` tests
+  `file_record.get('status') != 'active'`, and `get_file_by_path` —
+  which produced `file_record` — did not select `status` at all, so the
+  test was `None != 'active'` and the revive `UPDATE` ran on every write
+  to an existing file. The guard worked; the condition did not. The risk
+  was not the wasted `UPDATE` but the next reader: anyone who noticed
+  the check looked redundant and removed it would restore the
+  `set bza flake.nix` bug it was added for. Two more findings came out
+  of the same work and went upstream in the same commit — Python's two
+  branch lookups disagreeing, which staged *nothing* and reported
+  success, and migration 088's provenance link going stale on a second
+  write. Both under *Three findings from porting the auto-stage*.
 - **`vcs session prune` would refuse to delete 9 of the 558 sessions it
   offers to.** Found 2026-10-23 while deciding whether the mirror should
   declare `edit_intents.session_id`'s foreign key. The live column does
@@ -989,14 +1012,16 @@ Differences that are not deliberate and are not yet closed.
   session and does not claim to have. Closing it would mean creating a
   session row, which is the thing the architecture forbids. Pinning the
   variable makes the two byte-identical, which is what the sweep does.
-- ~~**Two session decisions are open.**~~ **Both closed 2026-10-23.**
-  Whether to refuse outright when `TEMPLEDB_SESSION` is set: no, warn —
-  see *Sessions*. And whether an unpinned `file set --stage` should
-  refuse or stage with a NULL owner: neither, because the question had a
-  false premise in both halves. `--stage` is message-only in Python and
-  a NULL owner means *unstaged* rather than *unknown*; the auto-stage
-  waits for `vcs commit`, which is its only reader. Written up under
-  *Why the auto-stage waits for `vcs commit`*.
+- ~~**Two session decisions are open.**~~ **Both closed.** Whether to
+  refuse outright when `TEMPLEDB_SESSION` is set: no, warn — see
+  *Sessions*, 2026-10-23. And whether an unpinned `file set --stage`
+  should refuse or stage with a NULL owner: **refuse**, settled
+  2026-10-27 when the auto-stage landed. The half of the old answer that
+  survives is that a NULL owner means *unstaged* and must never be
+  written; the half that did not is "`--stage` is message-only, so the
+  port should not have it" — once the stage exists there are two
+  outcomes to distinguish and Python has one flag for it, so the flag
+  gets the stricter meaning. Written up under *The auto-stage*.
 - **`edit_intents` is mirrored at twelve of fourteen columns**, and the
   two omitted are the ones a *reader* would want: `cancelled_at` and
   `applied_commit_id`. They belong to `intent cancel` and to the commit
@@ -1004,13 +1029,21 @@ Differences that are not deliberate and are not yet closed.
   here could verify them — but 785 live rows carry an
   `applied_commit_id`, which means the mirror is missing a real column
   of real data rather than a NULL one. It moves when a reader appears.
-- **The intent's own write path is partial in one way worth naming.**
-  Python links the just-staged `vcs_working_state` row to the intent it
-  created (`SET intent_id = ?`, migration 088). That is not reproduced,
-  because staging is not ported and the table is outside the subset.
-  Python calls the link cosmetic — "the commit path doesn't need it, but
-  downstream provenance queries do" — so the gap is in those queries,
-  not in the write.
+- ~~**The intent's own write path is partial in one way worth
+  naming.**~~ **Closed 2026-10-27** with the auto-stage: migration 088's
+  `vcs_working_state.intent_id` link is written now, in the staging
+  upsert rather than in a statement after it. What came with it is a new
+  gap rather than a clean close, below.
+- ~~**The staged row's `intent_id` goes stale on a second write.**~~
+  **Closed 2026-10-27**, the same day it was found, and on both sides.
+  Python's link was guarded by `AND intent_id IS NULL`, so the row kept
+  the first intent that staged it; the port reproduced that with a
+  `COALESCE` for one commit, reported it, and dropped the workaround
+  when `templedb` BF4E6BEA6BD93C6E fixed the original. The link now
+  always names the intent whose hash the row holds. The branch-scoping
+  half of the same statement was never reproduced here and is fixed
+  there too. Written up under *Three findings from porting the
+  auto-stage*.
 - **The Postgres schema covers 21 tables and 1 view.** That is the whole
   set the port reads, out of 163 tables and 45 views. Columns are
   likewise limited to the ones the queries name — four of
@@ -1024,16 +1057,18 @@ Differences that are not deliberate and are not yet closed.
 - **Three of the 21 tables have no reader at all**, which is the one
   place the rule above reads sideways: `edit_intents` (12 of 14 columns),
   `vcs_working_state` (9 of 11) and `vcs_commit_metadata` (3 of 40) are
-  carried for a *writer*. Two of the three are written today —
-  `edit_intents` by `file set` and `vcs_working_state` by
-  `vcs commit-staged`, which reads, unstages and reaps it — so each has
-  a cross-read behind it as well as the digest. `vcs_commit_metadata`
-  does not: measured while porting the commit, **nothing in the port's
-  reach writes it**, because only `templedb commit <slug> <dir>` does.
-  For that one table the cross-backend digest over the copy is still
-  the only thing verifying it, which is a weaker claim than every other
-  table here has and is stated rather than left to be inferred from a
-  passing sweep.
+  carried for a *writer*. Two of the three are now written *and* read
+  inside this port — `edit_intents` by `file set`, and
+  `vcs_working_state` by `file set`'s auto-stage and then by
+  `vcs commit-staged`, which reads, unstages and reaps it. That second
+  one is the strongest-verified table in the subset as of 2026-10-27
+  rather than the weakest: the loop writes it and reads it back through
+  three readers. `vcs_commit_metadata` is the one left out: measured
+  while porting the commit, **nothing in the port's reach writes it**,
+  because only `templedb commit <slug> <dir>` does. For that table the
+  cross-backend digest over the copy is still the only thing verifying
+  it, which is a weaker claim than every other table here has and is
+  stated rather than left to be inferred from a passing sweep.
 - **One column is carried for a writer that no reader in *either*
   implementation names**: `vcs_file_states.file_path`, migration 118's
   denormalised path. `vcs show` resolves paths by joining
@@ -1201,6 +1236,15 @@ of 7 panes, 20 of 20 flag surfaces, 8 of 8 filters, 0 unexpected**, and
 the name is this port's, so there is nothing on the other side to
 compare it against. That is the point of the name; see *The second
 write*.
+
+Re-measured 2026-10-27 with the auto-stage: **54 of 54 invocations, 7 of
+7 panes, 20 of 20 flag surfaces, 8 of 8 filters**, and **all 21 tables
+digest identically over 226,512 rows**. The flag count is the one worth
+reading twice: it was 20 of 20 before this step as well, with `-s` and
+`--stage` excused by the allow-list, and it is 20 of 20 now with those
+two entries deleted. An allow-list only suppresses differences, so a
+flag that becomes present on both sides stops producing one — the count
+does not move and the stale entry has to be found by hand.
 
 Re-measured 2026-10-24 with `vcs_working_state` and
 `vcs_commit_metadata`: **54 of 54 invocations, 7 of 7 panes, 20 of 20
@@ -1432,7 +1476,9 @@ crates/templedb-db/    data layer, one module per command family
                        never the two that write
   writer.rs            PgWriter — the one writable handle, outside the
                        Store trait on purpose. Opt-in, scratch-only
-  fileset.rs           `file set`: the first write, and its five guards
+  fileset.rs           `file set`: the first write, and its six guards —
+                       the sixth being the auto-stage that `commit.rs`
+                       below consumes
   commit.rs            `vcs commit-staged`: the database half of Python's
                        `vcs commit`, with the tree-dependent half refused
                        and the branch head advanced by a compare-and-swap
@@ -1708,14 +1754,16 @@ Writes last, and only once the read layer is trusted.
     settling it: `--stage` is message-only in Python, the auto-stage is
     unconditional, and `staged_by_session_id IS NULL` means *unstaged*
     rather than *unowned* in all five readers. The auto-stage therefore
-    moves to `vcs commit`, which is the only thing that reads what it
-    writes. See *Why the auto-stage waits for `vcs commit`* — the
-    finding is that a table gaining a *writer* with no reader is the one
-    shape this port's boundary rule does not cover, and `edit_intents`
-    got in on being provenance rather than on being written.
+    moved to `vcs commit`, which was the only thing that reads what it
+    writes — and then became step 21 two days after the commit landed.
+    See *The auto-stage* — the finding is that a table gaining a
+    *writer* with no reader is the one shape this port's boundary rule
+    does not cover, and `edit_intents` got in on being provenance rather
+    than on being written.
 
-    What is left of `file set`: `--stage` / `-s` and `--commit` / `-m`,
-    both of which are now `vcs commit`'s business, and binary content.
+    What was left of `file set` after this step: `--stage` / `-s`, which
+    is step 21, `--commit` / `-m`, which is still open, and binary
+    content.
 
     One capability closes permanently as a result: `--session <name>`.
     The name path creates when absent, and a port that creates session
@@ -1781,10 +1829,49 @@ Writes last, and only once the read layer is trusted.
     the only thing in the subset carried for a writer that *no reader in
     either implementation* names.
 
-    Still open: **`file set --stage`**, the report's step 2 and now the
-    only thing between this and a closed loop. The port can consume
-    `vcs_working_state` and cannot produce it, so the fixture stages with
-    SQL and the pair is verified one half at a time.
+    Its step 2 — `file set --stage` — was the only thing left between
+    this and a closed loop, and it is step 21 below.
+
+21. **Done** — the auto-stage, which is `file set` producing the
+    `vcs_working_state` row `vcs commit-staged` consumes. The report's
+    step 2, and the last of the five items the sessions report named.
+    `vcs_working_state` becomes the sixth table with an identity column
+    and the first one that is both written *and* read by this port,
+    which retires the weakest claim in the subset: it had a writer with
+    no reader for two days and a reader with no writer for two more.
+
+    What the work actually was, after the measuring: **one upsert**.
+    Everything expensive about it had already been paid for — the
+    session resolver in step 16, the clock in step 13, the exit codes in
+    step 12, the table in step 19. That is what a precondition being
+    genuinely a precondition looks like from the far side, and it is
+    worth recording because the README spent three revisions treating
+    this as a decision rather than a statement.
+
+    The decision that *was* left is where the flag goes, and it came out
+    stricter than Python: with no session the write stages nothing and
+    says so, and `--stage` turns that into a refusal. See *The
+    auto-stage*.
+
+    It also turned up three bugs in Python's copy of the same path, all
+    three **fixed upstream the same day** in `templedb`
+    BF4E6BEA6BD93C6E: the un-delete guard that fired unconditionally
+    because its query never selected the column it tested, two branch
+    lookups that disagreed and staged *nothing* while reporting success,
+    and migration 088's provenance link naming the wrong intent after a
+    second write. The port reproduced the third for parity and dropped
+    that workaround when the fix landed — one commit of divergence. See
+    *Three findings from porting the auto-stage*.
+
+    Measured: all 21 tables digest identically across both backends over
+    **226,512 rows**; the sweep reports 54 invocations, 0 unexpected
+    differences, and 20 of 20 commands agreeing on flags *after* `-s`
+    and `--stage` were removed from the allow-list rather than left in
+    it. 326 unit tests and 36 write tests.
+
+    Still open from the report: nothing. Still open from Python's
+    `file set`: **`--commit` / `-m`**, which runs the commit in-process,
+    and binary content.
 
 ### The state digest, and why it must not sort
 
@@ -2440,14 +2527,13 @@ reaching it by habit.
 The design document's sharpest finding is that **the guards are the
 deliverable**: "a port that reproduces the SQL and not these is a
 regression even if every byte of output matches." This reproduces the
-SQL and **five of the seven guards**. The rest are absent and named,
+SQL and **six of the seven guards**. The rest are absent and named,
 because an unnamed omission in a write path is how the incidents in
 that document happened:
 
 | absent | what it was for |
 |---|---|
-| `--stage` / `-s` and the auto-stage | writes `vcs_working_state`, whose only consumer is `vcs commit`. See *Why the auto-stage waits for `vcs commit`* |
-| `--commit` / `-m` | needs `vcs commit`, the step after this |
+| `--commit` / `-m` / `--commit-msg` | runs `vcs commit` in-process. Python's reason for in-process rather than a subprocess is the whole of why this is not three lines of `std::process::Command`: a subprocess resolves its own session, so the commit would look for a stage that belongs to someone else |
 | binary content | Python falls back to `content_blob` for undecodable stdin — which is why `.authinfo.gpg` can be stored at all. This takes text only, and refuses rather than mangling |
 
 `--session <ID>` **is** here, as of 2026-10-23, and it is an id and not
@@ -2461,12 +2547,21 @@ exits 1, and a name is refused as a name rather than as a parse error.
 
 Every one of those flags is listed individually in the sweep's
 flag-surface allow-list rather than waved at, so porting one shows up
-as a change. That is not hypothetical, and it has now happened three
+as a change. That is not hypothetical, and it has now happened four
 times: **`--verify` and `--allow-mojibake` were on this list for
-exactly one commit**, and `--skip-intent` left it on 2026-10-23. The
-list is how all three got picked up.
+exactly one commit**, `--skip-intent` left it on 2026-10-23, and
+`--stage` / `-s` on 2026-10-27. The list is how all of them got
+picked up.
 
-The five guards that *are* here:
+It also has to be pruned by hand, which is worth stating because the
+mechanism does not say so. The allow-list suppresses *differences*, so
+a flag that becomes present on both sides stops producing one — the
+entry then suppresses nothing and reads as a divergence that still
+exists. Removing `-s` and `--stage` left the sweep's count unchanged at
+20 of 20 commands agreeing, which is the check that they really do
+match now rather than being excused.
+
+The six guards that *are* here:
 
 - **`--if-match`.** `file set` replaces the whole file, so content read
   earlier is a lock on all of it: anything written in between is
@@ -2500,6 +2595,13 @@ The five guards that *are* here:
   this, when, from which session, and *against what*. See below — it is
   the one guard where the port's structure departs from Python's rather
   than its values.
+- **The auto-stage**, landed 2026-10-27. Writes the
+  `vcs_working_state` row that `vcs commit-staged` reads, carrying the
+  **new** hash. Python's comment above the same INSERT is why this is a
+  guard and not a convenience: "`vcs commit` reads content via
+  `ws.content_hash`, not `file_contents`. Without this, `file set`
+  followed by `vcs commit` silently records the previous content." See
+  *The auto-stage* below for the one divergence it carries.
 
 #### The intent record, and the one place this is not Python's shape
 
@@ -2555,9 +2657,19 @@ line: an unpinned write records NULL, a pinned one records the id, and a
 pin naming an ended session is refused before the write rather than
 stamped into the provenance.
 
-#### Why the auto-stage waits for `vcs commit`
+#### The auto-stage
 
-This was going to be guard six, and reading the code changed the
+Guard six, landed 2026-10-27 as step 21, and the write that closes the
+loop: `vcs commit-staged` has read `vcs_working_state` since 2026-10-25
+and nothing could write it.
+
+The section below is the argument that deferred it, kept because it is
+still the reason the design is the shape it is rather than a record of a
+wrong turn. The part that *was* wrong is the conclusion, and what
+changed is named at the end: the stated blocker was "this table has no
+reader here", and step 20 gave it one.
+
+It was going to be guard six then too, and reading the code changed the
 question. The README carried it as a decision — *does an unpinned
 `file set --stage` refuse, or stage with a NULL `staged_by_session_id`?*
 — and both halves of that turned out to be the wrong thing to be
@@ -2618,6 +2730,172 @@ announced "Files: 2" and committed one on 2026-09-24.
 
 The auto-stage therefore lands *with* `vcs commit`, as part of it, and
 the open decision is closed by having become irrelevant.
+
+##### What landed, and the one thing the argument above got wrong
+
+The reasoning held and the conclusion expired. `vcs commit-staged`
+landed two days later and the table has a reader, so the litter
+objection — the only thing deferring the work — is gone. Nothing else in
+the section changed: the state is still owned by a session, a NULL owner
+still means unstaged, and the checkout mirror still has no equivalent
+here.
+
+So the auto-stage **is** unconditional, as Python's is: every `file set`
+with a session pinned upserts the row, carrying the hash just written.
+What it cannot do is invent the session, and that is where the one
+divergence sits.
+
+| | Python | here |
+|---|---|---|
+| no session named | resolves one, **creating** the row if needed, and stages | stages nothing and says so on stderr |
+| `--stage` / `-s` | changes `✓ Set <path>` to `✓ Set and staged <path>`; nothing else | **refuses the write** before anything is written |
+
+The second row is the port being *stricter* than the original, which
+this README argued against when the question was first asked — "porting
+`--stage` as a flag that requires a session would make it stricter than
+a flag that does nothing over there". That objection loses its force
+once the auto-stage exists, because the port then has two outcomes to
+distinguish and Python has one. A flag whose whole content is "do not
+let this one pass quietly" is the same bargain `--verify` already
+strikes one column over: the write happens either way, and the caller
+who needs the *effect* rather than the attempt says so.
+
+The alternative was to make a session mandatory for `file set`
+outright, which is the strictest honest reading — a `file set` that
+cannot stage is not quite the command Python has — and it was rejected
+for costing a capability the command has had since it landed: writing
+with no session identified at all, which records a NULL-session intent
+and is what every write test and every ad-hoc use has done. Taking that
+away to prevent a mistake nobody has made yet is the wrong direction for
+an opt-in tool.
+
+The unstaged case is therefore **loud rather than silent**, which is
+the choice the `(not ported)` panes in `summary` already made for the
+same reason. stdout stays the hash; stderr gains one clause:
+
+```text
+$ templedb-rs file set cli-demo src/a.rs --content 'fn a() {}'
+509a0a5b5ce4e59f…
+cli-demo/src/a.rs: 10 bytes, 2 lines (created, intent #50, not staged: no
+session (pass --session, or -s to refuse instead))
+```
+
+Silence there would read as success, and the sentence after it is
+`nothing staged for commit` — or, through `publish`, nothing at all.
+That is the `set bza flake.nix` shape for the third time in this
+command's history, which is the whole reason the line exists.
+
+Two details of Python's are reproduced rather than tidied, and one of
+them is a bug this port is now carrying on purpose; both are in *Three
+findings from porting the auto-stage* below.
+
+The `project_files` row existing is what decides `added` against
+`modified` — not whether the content changed, and not whether the row
+was active. So re-writing identical content stages `modified`, and so
+does reviving a soft-deleted file. Both are Python's answers and both
+are the right ones for the commit downstream: a file with history is
+not an addition.
+
+**Verified** by nine tests in `write_parity.rs` and by the loop end to
+end: `file set -s --session N` on a new file, then
+`vcs commit-staged -m … --session N`, read back through `vcs log`,
+`vcs show` and `file cat` — with the committed `vcs_file_states.content_hash`
+asserted equal to the hash `file set` staged, which is the column
+Python's comment warns about, checked from the far end. The staged row is
+`unmodified` and owned by nobody afterwards, and the branch head points
+at the new commit.
+
+#### Three findings from porting the auto-stage
+
+**All three were fixed upstream on 2026-10-27**, the day they were
+found, in `templedb` commit BF4E6BEA6BD93C6E — with five regression
+tests, four of which fail against the pre-fix sources. So this section
+records what porting the statement a second time turned up, and not a
+list of things still wrong; each entry says where it stands now.
+
+That is the method working as intended rather than a coincidence of
+timing. The port reproduced one of the three for parity and has now
+dropped the workaround, which is the shape the README has claimed for
+this project since *The audit*: copy the behaviour, report it, delete
+the copy when the authoritative writer is fixed. Nine of the twelve
+bugs in that section went the same way.
+
+They are here because the only way to find any of them was to write the
+same statement twice.
+
+**The un-delete guard worked by accident.** `_write_content_to_db`
+decides whether to revive a soft-deleted row with
+`file_record.get('status') != 'active'`, and `get_file_by_path` — the
+query that produced `file_record` — **did not select `status`**. So the
+test was `None != 'active'`, true on every write to an existing file,
+and the `UPDATE project_files SET status = 'active'` fired
+unconditionally. The guard did its job, for a reason unrelated to the
+one its comment gives, at the cost of one pointless `UPDATE` per
+`file set`.
+
+The risk was never the wasted statement. It was that the condition could
+not be *tightened* without fixing the query first, so anyone reading the
+comment, deciding the check looked redundant and removing it would have
+silently restored the `set bza flake.nix` bug. Never reproduced here,
+because this port reads `status` and branches on it — which is also what
+lets it report `revived from deleted` rather than guessing. **Fixed
+upstream:** the column is in the projection and the comment now records
+which way it failed.
+
+**Python had two branch lookups and they were not the same query.**
+`vcs commit` resolves the active branch through `get_active_branch`,
+which joins `vcs_branches` and falls back to the default branch; the
+auto-stage read `projects.active_branch_id` on its own, with no join and
+no existence check. For a project whose `active_branch_id` names a
+branch row that is gone, the two steps resolved differently.
+
+Measured while writing the regression test, the failure is worse than
+"stages in the wrong place": the old path staged **nothing**.
+`vcs_working_state.branch_id` declares a foreign key, so the INSERT with
+the dangling id raised `IntegrityError`, and the auto-stage's
+`except Exception: pass` swallowed it to a debug line — `file set`
+printed `✓ Set <path>` and exited 0 with no staged row anywhere, and the
+next `vcs commit` said "nothing to commit". Two successes and the edit
+is gone. (With FK enforcement off, which several bulk paths use
+deliberately, the dangling row lands instead and the commit still cannot
+see it. Same outcome, different mechanism.)
+
+The port prevents this structurally rather than fixing it: `file set`
+and `vcs commit-staged` call one `active_or_default_branch`, so they
+cannot disagree about which branch a write belongs to. **Fixed
+upstream** the same way — the auto-stage now calls `get_active_branch`,
+with a comment saying that if it ever needs its own query again,
+`vcs commit`'s has to change in the same commit. This is the second time
+commit's own measurement turned up a divergence between two copies of
+one piece of logic; the first was the parent edge, written twice from
+two different resolutions.
+
+**The `intent_id` link was sticky, which made it wrong on the second
+write.** Migration 088 added the column so a provenance query can join a
+staged row to the intent that produced it, and Python filled it in a
+separate statement guarded by `AND intent_id IS NULL` — so the row kept
+the **first** intent that ever staged it. After a second `file set` the
+row's `content_hash` was the new write's and its `intent_id` named the
+older intent: the column added to record which edit produced this staged
+content, pointing at an edit that did not.
+
+This is the one of the three the port reproduced, with a `COALESCE` that
+is the same rule in one statement. **Fixed upstream, and the workaround
+is gone** — `intent_id = excluded.intent_id` now, and the write test's
+assertion flipped with it from "keeps the first intent" to "names the
+intent whose hash it holds". One commit of divergence, which is what
+"copy, report, drop the copy" costs when the report is acted on.
+
+Python's statement had a second, smaller problem the single upsert never
+inherited: it was scoped by `project_id` and `file_path` and **not by
+branch**, so on a project with the same file staged on two branches it
+relabelled both. The port's `ON CONFLICT (project_id, branch_id,
+file_id)` touches only the row it staged — a case where reproducing the
+statement *shape* would have taken the bug along with it. **Fixed
+upstream** by having `_write_content_to_db` return the file id and the
+branch it staged against, which also retired a
+`file_id = (SELECT … LIMIT 1)` subquery that was re-deriving a value the
+writer already had.
 
 #### The refusal codes, which are the contract
 
@@ -2680,8 +2958,8 @@ writes Postgres, so there is no shared input. The technique is the one
 the design document calls **cross-read** — the port writes, and the
 already-trusted read layer reads it back.
 
-`crates/templedb-db/tests/write_parity.rs` — fourteen of its 26 tests
-are this command's, `#[ignore]`d and run by `just write-test`. The
+`crates/templedb-db/tests/write_parity.rs` — twenty-three of its 36
+tests are this command's, `#[ignore]`d and run by `just write-test`. The
 read-back goes through
 `templedb_db::read_file` — the actual ported `file cat` query, not SQL
 written for the test — so a write `file cat` cannot see is a failure.
@@ -2696,7 +2974,7 @@ document listed replacing the in-memory SQLite fixture as the one
 question blocking this work; it is a *cutover* question, and step 15b
 says why.
 
-What the fourteen cover: creating a file, replacing one in place
+What the first fourteen cover: creating a file, replacing one in place
 through the `ON CONFLICT (file_id, is_current)` arm, a no-op rewrite,
 the un-delete, empty content, `--if-match` letting a match through *and
 refusing a stale base without writing*, content containing a NUL,
@@ -2716,8 +2994,28 @@ rather than the writer's own connection, which is the cross-read rule
 applied to this table too: the write is only verified if something else
 can see it.
 
-Four of the fourteen are written to be able to fail, which is the only
-kind worth having: the `--verify` test reverts the row with its own
+Nine more are the auto-stage, added 2026-10-27: that a write with a
+session stages the **new** hash on the active branch as `added`, owned
+by that session and linked to that intent; that a second write restages
+`modified` and keeps the first intent, which is the stale link reported
+above; that a no-op rewrite and a revived soft-deleted file both stage
+`modified`; that a write with no session, and a project with no branch,
+each stage nothing and report which; that `--stage` with no session
+refuses *and leaves no `project_files` row at all* — the test is the
+ordering, not the message — that `--stage` with no *branch* does not
+refuse, because the flag asserts ownership and not the existence of a
+branch; and that a second session staging the same file takes the row
+over rather than adding one, since the row is
+`UNIQUE (project_id, branch_id, file_id)`.
+
+These nine are the one group in this file with no cross-read available:
+no ported command reads `vcs_working_state` except the commit, which
+consumes it. So they read the row with SQL, and the loop test in the
+commit section is what verifies it through a reader — the same division
+`vcs_file_states.file_path` gets, and stated for the same reason.
+
+Four of the first fourteen are written to be able to fail, which is the
+only kind worth having: the `--verify` test reverts the row with its own
 `UPDATE` before checking; the mojibake test corrupts a string the way
 the incident did — encode to UTF-8, read the bytes back as Latin-1 —
 rather than hand-writing a sequence that happens to match the pattern;
@@ -3037,7 +3335,7 @@ verified readers can see a commit. `vcs log` lists it, `vcs show` lists
 its changed files and diffs them, and `file cat` reads the content it
 made current. A commit none of them can see did not happen.
 
-`crates/templedb-db/tests/write_parity.rs` is now 26 tests, twelve of
+`crates/templedb-db/tests/write_parity.rs` is now 36 tests, thirteen of
 them this command's, `#[ignore]`d and run by `just write-test`. What
 they cover beyond the happy path:
 
@@ -3078,20 +3376,37 @@ they cover beyond the happy path:
   second, so a write test is the only place that ordering can be
   checked on purpose rather than hoped for.
 
+- **The loop**, added 2026-10-27 with the auto-stage and the thirteenth
+  of these tests. Every other test in this group stages with SQL;
+  this one runs `file set --stage` and then `vcs commit-staged`, with
+  nothing of the test's own in between, and asserts that the hash the
+  commit recorded is the hash `file set` staged. A hand-built row proves
+  the commit reads what the *fixture* wrote; only this proves it reads
+  what the other command wrote.
+
 What cannot be tested here is the half that was refused. There is no
 workspace, so there is nothing to scan and no conflict to detect — which
 is the point of the command's name.
 
-#### What is still missing, and what it unblocks
+#### What the fixture still stages by hand, and why
 
-`file set --stage` is step 2 of the design document's five and is now
-the only thing between this and a closed loop. Until it lands, staging
-is done with SQL in the test fixture: the port can *consume*
-`vcs_working_state` and cannot produce it, so the pair "set, stage,
-commit, read back" is verified one half at a time. The document's own
-sequencing had `--stage` first; it landed second because the commit is
-what gives `vcs_working_state` a reader at all, and a `--stage` with no
-consumer would have been the litter the auto-stage argument warns about.
+`file set --stage` landed 2026-10-27 as step 21, so the loop closes and
+the SQL staging is no longer the only way to build a staged row. It is
+still there, and deliberately: three of this command's refusals are
+about states no writer produces. A `deleted` state comes from a
+workspace scan, a staged hash naming no blob is the corruption guard 3
+exists for, and a `file_id` naming a reaped `project_files` row is what
+guard 2 reaps. `file set` cannot make any of them, which is the point of
+it — so the guards keep their hand-written fixtures and the happy path
+uses the real writer.
+
+The design document's own sequencing had `--stage` first. It landed
+second, and the ordering was right for a reason the document did not
+have: the commit is what gives `vcs_working_state` a reader, and a
+`--stage` with no consumer would have been the litter the auto-stage
+argument warns about. Doing it in this order also meant the stage was
+one upsert when it arrived, because the session resolver, the clock and
+the table had all been built for something else first.
 
 ### The one place the two text types are not the same type
 

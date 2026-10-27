@@ -106,7 +106,7 @@ pub use exit::{code_of, Coded, NOT_FOUND, NO_PATH, USAGE};
 pub use files::{list_files, read_file, EditModeFilter, FileEntry};
 pub use fileset::{
     check_mojibake, content_hash, line_count, mojibake_runs, resolve_project_exact, set_file,
-    verify_current, SetOptions, SetOutcome,
+    verify_current, SetOptions, SetOutcome, Staged,
 };
 pub use fuzzy::{match_file, match_project, simple_score, FileLookup, FileRef, ProjectLookup};
 pub use mirror::{

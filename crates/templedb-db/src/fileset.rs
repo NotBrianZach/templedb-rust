@@ -24,16 +24,41 @@
 //!
 //! | absent | what it protects against |
 //! |---|---|
-//! | auto-staging and `--stage` | needs a staged-by session, and a decision about what an unpinned `--stage` should own |
-//! | `--session` | the pin is resolved; nothing here reads it yet |
-//! | `--commit` / `-m` | needs `vcs commit`, which is the step after this one |
+//! | `--commit` / `-m` | would run `vcs commit-staged` in-process; the stage it needs is here now, so this is the last thing between `file set` and that loop being driveable from one command |
 //! | `deploy_stage_runs` | chain observability; outside the subset |
 //! | binary content | Python falls back to `content_blob` for undecodable stdin. This takes text only |
 //!
-//! Five guards *are* here: `--if-match` optimistic concurrency, the
+//! Six guards *are* here: `--if-match` optimistic concurrency, the
 //! un-delete that revives a soft-deleted row, the mojibake check,
-//! `--verify`, and the `edit_intents` record. Each is below with the
-//! incident that produced it.
+//! `--verify`, the `edit_intents` record, and the auto-stage with
+//! `--stage`. Each is below with the incident that produced it.
+//!
+//! # The auto-stage, and why `--stage` is stricter here
+//!
+//! Python's auto-stage is **unconditional**: every `file set` upserts a
+//! `vcs_working_state` row naming the new hash, owned by the session it
+//! resolved, and `--stage` changes `✓ Set <path>` to
+//! `✓ Set and staged <path>` and nothing else. So the thing that needs a
+//! session over there is a side effect of every write and not the flag.
+//!
+//! This port cannot resolve a session it was not given — two of Python's
+//! seven resolution steps *create* the row — and a NULL
+//! `staged_by_session_id` means **unstaged**, not "staged by nobody":
+//! `publish`'s guard is `COUNT(*) … IS NOT NULL`, so a NULL-owned row
+//! ships nothing while reporting success. See the README's *Why the
+//! auto-stage waits for `vcs commit`* for the five readers that agree on
+//! that reading.
+//!
+//! What follows is the one divergence worth stating up front. With a
+//! session pinned, this stages on every write, as Python does. Without
+//! one it stages nothing and says so, and [`SetOptions::stage`] turns
+//! that silence into a refusal — which makes `--stage` *do* something
+//! here where it is message-only over there. The README argued against
+//! porting the flag for exactly that reason; what changed is that this
+//! port has two outcomes to distinguish and Python has one, so a flag
+//! that asserts the stage happened is the honest shape. It is
+//! [`verify_current`]'s bargain one column over: a caller who needs the
+//! effect rather than the attempt says so.
 //!
 //! # Postgres, not the live SQLite
 //!
@@ -42,12 +67,40 @@
 //! the arrangement every earlier step of the port was built to
 //! preserve. A wrong write here costs a `just mirror-refresh`.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::clock::Clock;
+use crate::commit::active_or_default_branch;
 use crate::pgtext;
 use crate::session::SessionId;
+
+/// What the auto-stage did, which is not always "staged it".
+///
+/// Three outcomes rather than a `bool`, because the two negative ones
+/// have different causes and different remedies, and because the caller
+/// prints them. Python has no equivalent: its auto-stage is wrapped in
+/// `except Exception: pass` and logs "Auto-stage failed (non-fatal)" at
+/// debug level, so over there all three are the same silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Staged {
+    /// A `vcs_working_state` row now names this write, owned by the
+    /// session that made it.
+    Yes {
+        branch: String,
+        /// `added` for a file that had no `project_files` row, else
+        /// `modified` — Python's `"modified" if file_record else
+        /// "added"`, which keys off the row existing and not off the
+        /// content changing.
+        state: &'static str,
+    },
+    /// No session was pinned, so there was no id to own the row.
+    NoSession,
+    /// The project has no active branch and no default branch. Python
+    /// skips its auto-stage here too — `if branch:` — and this is the
+    /// one of the three negatives the two implementations share.
+    NoBranch,
+}
 
 /// What a write did, for the caller to print.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +126,9 @@ pub struct SetOutcome {
     /// scripted callers can inspect / cancel it later", which is the
     /// only reason it is carried out of here.
     pub intent_id: Option<i64>,
+    /// Whether `vcs commit-staged` will see this write, and why not
+    /// when it will not.
+    pub staged: Staged,
 }
 
 /// sha256 of the UTF-8 bytes, lowercase hex — the same digest Python
@@ -363,9 +419,18 @@ pub struct SetOptions<'a> {
     pub allow_mojibake: bool,
     /// Do not record an `edit_intents` row. Python's `--skip-intent`.
     pub skip_intent: bool,
+    /// Require the auto-stage to have happened: refuse the write
+    /// outright when there is no session to own the row.
+    ///
+    /// Python's `--stage` is message-only, because its auto-stage cannot
+    /// fail to find a session — it creates one. See the module header
+    /// for why this one asserts instead.
+    pub stage: bool,
     /// The session this write belongs to, if the caller pinned one.
-    /// Stored on the intent and nothing else — `--stage` is what would
-    /// make it mean more, and that is not ported.
+    ///
+    /// Two columns now: `edit_intents.session_id`, and the
+    /// `vcs_working_state.staged_by_session_id` that decides whether
+    /// `vcs commit-staged` can see the write at all.
     pub session: Option<SessionId>,
     /// `edit_intents.author`: `TEMPLEDB_AUTHOR`, then `USER`, then
     /// NULL. Resolved at the entry point rather than read here, for the
@@ -523,13 +588,158 @@ fn record_intent(
     Ok(row.get(0))
 }
 
+/// What the stage records about the write that just happened.
+///
+/// A struct for [`Wrote`]'s reason: the two `i64`s and the two
+/// `bool`-ish values next to each other are exactly the sort of argument
+/// list a call site cannot be read against.
+struct Staging<'a> {
+    file_id: i64,
+    /// The hash of what was just written, which is the column
+    /// `vcs commit-staged` reads — not the one in `file_contents`.
+    hash: &'a str,
+    /// Whether this write created the `project_files` row, which is the
+    /// only input to `added` vs `modified`.
+    created: bool,
+    /// The `edit_intents` row to link, `None` under `--skip-intent`.
+    intent_id: Option<i64>,
+}
+
+/// Refuse `--stage` when there is no session to own the row.
+///
+/// Exit 1, not 2: no state of the database would satisfy the request, so
+/// this is bad input rather than a conflict — the same split
+/// [`normalise_if_match`] makes between a malformed flag and a
+/// mismatched one.
+///
+/// Called from inside [`set_file`] rather than at the CLI edge, which
+/// looks like the wrong place for pure argument validation and is not.
+/// The session is resolved against the *write target* inside the write
+/// transaction — see [`crate::resolve_session_tx`] for why — so this is
+/// the first point at which both facts are known. Being first *within*
+/// the write is the part that matters: a flag asserting an effect has to
+/// fail before the effects it cannot have.
+fn check_stage(stage: bool, session: Option<SessionId>) -> Result<()> {
+    if !stage || session.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "--stage needs a session: a staged row is owned by one, and a NULL \
+         `staged_by_session_id` means *unstaged* rather than staged by nobody \
+         — `templedb publish` would ship nothing and report success.\n\
+         \x20 Pass --session <ID>, or set {}. Live ids: \
+         `templedb vcs session list --active`.\n\
+         \x20 Without --stage the write still lands; it just stages nothing. \
+         That is where Python differs — its auto-stage creates a session \
+         rather than asking for one, which is the step this port does not \
+         take.",
+        crate::SESSION_ID_ENV
+    )
+}
+
+/// Guard six: stage the file, so `vcs commit-staged` can see the write.
+///
+/// Python's `_write_content_to_db` does this on every write, and the
+/// comment above its INSERT is the reason it is a guard rather than a
+/// convenience:
+///
+/// ```text
+/// # content_hash must be set here — vcs commit reads content via
+/// # ws.content_hash, not file_contents. Without this, `file set`
+/// # followed by `vcs commit` silently records the previous content.
+/// ```
+///
+/// That is the shape of every incident this command's guards exist for:
+/// a write that reports success and a later step that ships something
+/// else. [`crate::commit_staged`] reads exactly this column, so the two
+/// halves are only a loop if this row carries the new hash.
+///
+/// # Not swallowed, where Python's is
+///
+/// Python wraps the whole thing in `except Exception: pass` and logs at
+/// debug level. Not reproduced, and for `reap_orphans`' reason exactly:
+/// the swallow is sound over there because the stage runs in its own
+/// statement outside the write's transaction, and here it is *inside*
+/// one — so an error that is ignored is an error that rolls the write
+/// back anyway, reported as success. The three non-error outcomes are
+/// what [`Staged`] carries instead.
+fn auto_stage(
+    tx: &mut postgres::Transaction<'_>,
+    now: &str,
+    project_id: i64,
+    staging: &Staging<'_>,
+    opts: &SetOptions<'_>,
+) -> Result<Staged> {
+    let Staging {
+        file_id,
+        hash,
+        created,
+        intent_id,
+    } = *staging;
+    let Some(session) = opts.session else {
+        return Ok(Staged::NoSession);
+    };
+    let Some(branch) = active_or_default_branch(tx, project_id)? else {
+        return Ok(Staged::NoBranch);
+    };
+    // Python's `"modified" if file_record else "added"`, and the key is
+    // which question it asks: `get_file_by_path` does not filter on
+    // `status`, so a row that was soft-deleted and has just been revived
+    // is `modified` rather than `added`. It also does not compare
+    // hashes, so re-writing identical content stages `modified`.
+    let state = if created { "added" } else { "modified" };
+    tx.execute(
+        "INSERT INTO vcs_working_state
+             (project_id, branch_id, file_id, content_hash, state,
+              staged_by_session_id, last_modified, intent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (project_id, branch_id, file_id) DO UPDATE SET
+             content_hash         = excluded.content_hash,
+             state                = excluded.state,
+             staged_by_session_id = excluded.staged_by_session_id,
+             last_modified        = excluded.last_modified,
+             -- Migration 088's provenance link. Always this write's
+             -- intent, so the row's hash and its link describe the same
+             -- edit.
+             --
+             -- This was `COALESCE(vcs_working_state.intent_id,
+             -- excluded.intent_id)` for one commit, reproducing Python's
+             -- `AND intent_id IS NULL` — which kept the *first* intent
+             -- forever while the hash above tracked every later write.
+             -- Reported from here on 2026-10-27 and fixed upstream the
+             -- same day (`templedb` BF4E6BEA6BD93C6E), so the
+             -- workaround is gone and the two sides agree again. That
+             -- is the order this port is for: copy, report, drop the
+             -- copy.
+             intent_id            = excluded.intent_id",
+        &[
+            &project_id,
+            &branch.id,
+            &file_id,
+            &hash,
+            &state,
+            &session.get(),
+            &now,
+            &intent_id,
+        ],
+    )
+    .context("staging the write")?;
+    Ok(Staged::Yes {
+        branch: branch.name,
+        state,
+    })
+}
+
 /// Write `content` as the current contents of `project_id`/`file_path`.
 ///
-/// Mirrors Python's `_write_content_to_db` across three tables, in the
+/// Mirrors Python's `_write_content_to_db` across four tables, in the
 /// order Python uses, inside one transaction — plus the `edit_intents`
-/// record, which makes four. The ordering is not incidental: the blob
-/// has to exist before a `file_contents` row references its hash, and
-/// the intent goes last because it asserts that the write happened.
+/// record, which makes five. The ordering is not incidental: the blob
+/// has to exist before a `file_contents` row references its hash, the
+/// intent goes after the write because it asserts that the write
+/// happened, and the stage goes after the intent because it carries the
+/// intent's id. That last pair is the one place the order differs from
+/// Python's, which stages and *then* links in a second statement.
 pub fn set_file(
     tx: &mut postgres::Transaction<'_>,
     clock: &Clock,
@@ -538,6 +748,9 @@ pub fn set_file(
     content: &str,
     opts: &SetOptions<'_>,
 ) -> Result<SetOutcome> {
+    // First, before anything is read or written. See `check_stage` for
+    // why it is here and not at the CLI edge.
+    check_stage(opts.stage, opts.session)?;
     let previous = current_hash(tx, project_id, file_path)?;
     // `--if-match` first, because it is the cheaper refusal and because
     // a caller who got the base wrong should hear about that rather
@@ -642,8 +855,8 @@ pub fn set_file(
         &[&file_id, &hash, &size_bytes, &lines, &now],
     )?;
 
-    // Last, and inside the same transaction. See `record_intent` for
-    // why that differs from Python's ordering and what it buys.
+    // Inside the same transaction. See `record_intent` for why that
+    // differs from Python's ordering and what it buys.
     let intent_id = if opts.skip_intent {
         None
     } else {
@@ -661,6 +874,22 @@ pub fn set_file(
         )?)
     };
 
+    // Last, because it carries `intent_id`. Python stages before
+    // recording the intent and links afterwards with an UPDATE; one
+    // statement in this order produces the same row.
+    let staged = auto_stage(
+        tx,
+        &now,
+        project_id,
+        &Staging {
+            file_id,
+            hash: &hash,
+            created,
+            intent_id,
+        },
+        opts,
+    )?;
+
     Ok(SetOutcome {
         unchanged: previous.as_deref() == Some(hash.as_str()),
         hash,
@@ -670,6 +899,7 @@ pub fn set_file(
         size_bytes,
         line_count: lines,
         intent_id,
+        staged,
     })
 }
 
@@ -872,6 +1102,37 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("no current content"), "{msg}");
         assert!(msg.contains("new file"), "{msg}");
+    }
+
+    /// `--stage` is satisfied by a session and refused without one, and
+    /// a write that did not ask for it is never refused.
+    #[test]
+    fn the_stage_guard_needs_a_session_and_only_when_asked() {
+        let session = SessionId::in_test(1163);
+        assert!(check_stage(true, Some(session)).is_ok());
+        // The default path: no flag, no session, no refusal. This is the
+        // case every `file set` ran before the auto-stage landed, and
+        // breaking it would make the command require an identity it has
+        // never required.
+        assert!(check_stage(false, None).is_ok());
+        assert!(check_stage(false, Some(session)).is_ok());
+        assert!(check_stage(true, None).is_err());
+    }
+
+    /// Exit 1, the bad-input status — and the message names the remedy
+    /// and the reason, because "needs a session" alone does not explain
+    /// why a NULL will not do.
+    #[test]
+    fn the_stage_refusal_exits_one_and_says_what_a_null_owner_means() {
+        let err = check_stage(true, None).unwrap_err();
+        assert_eq!(crate::code_of(&err), crate::USAGE);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--session"), "{msg}");
+        assert!(msg.contains(crate::SESSION_ID_ENV), "{msg}");
+        assert!(msg.contains("unstaged"), "{msg}");
+        // The consequence, not just the rule: a reader who does not know
+        // what `publish` does with a NULL owner cannot judge the risk.
+        assert!(msg.contains("publish"), "{msg}");
     }
 
     /// A short prefix must not match a *different* hash that merely

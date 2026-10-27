@@ -782,16 +782,18 @@ pub fn mirror(src: &SqliteStore, dest_url: &str, create_schema: bool) -> Result<
 ///
 /// Kept beside [`TABLES`] rather than derived from it because being an
 /// identity column is a property of the DDL, not of the copy, and a
-/// table gains one only when a write path needs it. Five today; the
+/// table gains one only when a write path needs it. Six today; the
 /// list grows with the writer — `vcs_commits` and `vcs_file_states`
-/// joined it with `vcs commit-staged`, and missing one here is how a
-/// freshly mirrored database hands out an id that already exists.
+/// joined it with `vcs commit-staged` and `vcs_working_state` with
+/// `file set`'s auto-stage, and missing one here is how a freshly
+/// mirrored database hands out an id that already exists.
 const IDENTITY_TABLES: &[&str] = &[
     "project_files",
     "file_contents",
     "edit_intents",
     "vcs_commits",
     "vcs_file_states",
+    "vcs_working_state",
 ];
 
 /// `setval` each identity sequence to the table's current `MAX(id)`.

@@ -205,11 +205,11 @@ enum FileCmd {
     /// `TEMPLEDB_RS_ALLOW_WRITES=1`.
     ///
     /// **Partial.** Python's `file set` carries seven guards; this
-    /// carries two — `--if-match` and the un-delete. Absent: the
-    /// mojibake check, `edit_intents` provenance, staging, `--commit`,
-    /// `--verify`, and binary content. The opt-in exists because none
-    /// of that is visible from a command line. See the README's
-    /// *The first write*.
+    /// carries six — `--if-match`, the un-delete, the mojibake check,
+    /// `--verify`, the `edit_intents` record and the auto-stage.
+    /// Absent: `--commit` / `-m`, and binary content. The opt-in
+    /// exists because none of that is visible from a command line.
+    /// See the README's *The first write*.
     ///
     /// Takes an exact slug, not a fuzzy name — the one place this port
     /// is deliberately stricter than Python, because a mis-resolved
@@ -256,8 +256,26 @@ enum FileCmd {
         /// without the other says so.
         #[arg(long)]
         skip_intent: bool,
-        /// Record the intent against this session. A numeric id naming
-        /// a live row; outranks `TEMPLEDB_SESSION_ID`.
+        /// Require the stage: refuse the write unless a session owns it.
+        ///
+        /// Every `file set` with a session stages the file, so this
+        /// flag adds no effect — it withdraws the silence. Without it,
+        /// a write with no session stages nothing and says so on
+        /// stderr; with it, that becomes a refusal before anything is
+        /// written.
+        ///
+        /// Stricter than Python's, deliberately. Over there `--stage`
+        /// only changes the success message, because its auto-stage
+        /// *creates* the session it needs and so cannot fail to find
+        /// one. This port will not create a session row, and a staged
+        /// row with no owner means unstaged — `templedb publish` would
+        /// ship nothing and report success. See the README's
+        /// *The auto-stage*.
+        #[arg(short = 's', long)]
+        stage: bool,
+        /// Record the intent against this session, and stage the write
+        /// as it. A numeric id naming a live row; outranks
+        /// `TEMPLEDB_SESSION_ID`.
         ///
         /// An id and not a name. Python accepts `ID|NAME` and its name
         /// path *creates* the session when none matches, which is the
@@ -270,9 +288,10 @@ enum FileCmd {
         /// resolved independently by whichever process writes, so
         /// `templedb reports reindex` shelling out to `file set` lands
         /// its stage in a session the parent is not looking at. That
-        /// bit twice on 2026-10-08, each time blocking a publish. The
-        /// port has no stage to misplace yet, but the intent's
-        /// `session_id` is the same column answering the same question.
+        /// bit twice on 2026-10-08, each time blocking a publish. This
+        /// port now has a stage to misplace the same way, so pin the
+        /// same id for the `file set` and the `vcs commit-staged` that
+        /// follows it or the commit will find nothing.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
@@ -831,6 +850,7 @@ fn run() -> Result<i32> {
                 verify,
                 allow_mojibake,
                 skip_intent,
+                stage,
                 session: pin,
             } => {
                 // Read the content before opening anything, so a
@@ -888,6 +908,7 @@ fn run() -> Result<i32> {
                     if_match: if_match.as_deref(),
                     allow_mojibake,
                     skip_intent,
+                    stage,
                     session,
                     author: author.as_deref(),
                 };
@@ -937,6 +958,27 @@ fn run() -> Result<i32> {
                     Some(id) => notes.push(format!("intent #{id}")),
                     None => notes.push("no intent recorded".to_string()),
                 }
+                // The stage, always stated — including when it did not
+                // happen, which is the case worth a line. Python says
+                // nothing here either way: its auto-stage cannot miss,
+                // and `--stage` only decorates the success message. A
+                // write that staged nothing is a write
+                // `vcs commit-staged` will not see, and the two
+                // sentences that could follow it are "nothing staged
+                // for commit" and, through `publish`, nothing at all.
+                notes.push(match &outcome.staged {
+                    templedb_db::Staged::Yes { branch, state } => {
+                        format!("staged on {branch} as {state}")
+                    }
+                    templedb_db::Staged::NoSession => {
+                        "not staged: no session (pass --session, or -s to refuse \
+                         instead)"
+                            .to_string()
+                    }
+                    templedb_db::Staged::NoBranch => {
+                        "not staged: the project has no active or default branch".to_string()
+                    }
+                });
                 eprintln!(
                     "{project}/{path}: {} bytes, {} lines{}",
                     outcome.size_bytes,

@@ -159,8 +159,10 @@ CREATE TABLE vcs_commit_metadata (
 );
 
 -- Staging. Carried so the mirror and the digest have the same shape on
--- both sides; `file set --stage` and `vcs commit` are its readers and
--- neither is ported yet.
+-- both sides. Nothing in *this* fixture touches it: `file set`'s
+-- auto-stage writes it and `vcs commit-staged` reads it, and both are
+-- Postgres-only, so their tests live in `tests/write_parity.rs` behind
+-- a server.
 CREATE TABLE vcs_working_state (
     id                   INTEGER PRIMARY KEY,
     project_id           INTEGER NOT NULL,

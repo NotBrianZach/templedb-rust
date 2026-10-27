@@ -378,17 +378,19 @@ FLAGS_EXPECTED=(
     # exactly what happened to `--verify` and `--allow-mojibake`, both
     # of which were here for one commit and are now implemented.
     #
-    # `--stage` / `-s` is message-only in Python — the auto-stage is
-    # unconditional — and the auto-stage itself writes
-    # `vcs_working_state`, which nothing ported reads. It goes with
-    # `vcs commit`, which is its only consumer. `--commit` needs that
-    # command too.
+    # `--commit` / `-m` / `--commit-msg` would run the commit in-process
+    # — Python's does, deliberately, because a subprocess would fork a
+    # new session and lose the stage. The port has the commit now, so
+    # what is missing is the in-process call rather than anything
+    # underneath it.
     #
-    # `--skip-intent` and `--session` have both left this list, on
-    # 2026-10-23, after `--verify` and `--allow-mojibake`. Four flags
-    # picked up by a per-flag list rather than a waved-at exception.
-    "file set p f|-s"
-    "file set p f|--stage"
+    # `--skip-intent`, `--session`, `--verify` and `--allow-mojibake`
+    # have all left this list, and `-s` / `--stage` left it on
+    # 2026-10-27 with the auto-stage. Six flags picked up by a per-flag
+    # list rather than a waved-at exception — which is also the reason
+    # the list has to be pruned by hand: a flag that becomes present on
+    # both sides stops producing a difference, so a stale entry here
+    # suppresses nothing and reads as a divergence that still exists.
     "file set p f|--commit"
     "file set p f|--commit-msg"
     "file set p f|-m"

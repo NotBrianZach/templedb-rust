@@ -17,6 +17,8 @@ use std::io::Write;
 use templedb_db::{Direction, ProjectLookup, SnapshotBody};
 
 mod summary_view;
+mod table;
+mod where_view;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +65,59 @@ enum Command {
     Vcs {
         #[command(subcommand)]
         command: VcsCmd,
+    },
+    /// Invariant-check results. **`history` only — see below.**
+    ///
+    /// Python's `doctor` has two subcommands and this carries one.
+    /// `doctor entities` is not ported **yet**: it is 44 checks, and
+    /// re-derived from their bodies on 2026-11-05 they are 17 reachable
+    /// from the mirrored subset, 10 needing tables outside it, 8 asking
+    /// SQLite about itself (`sqlite_master`, `pragma_function_list`,
+    /// the `-wal` sidecar), 8 reading a filesystem and 1 reading the
+    /// Python CLI's own argparse tree. Its exit status is computed over
+    /// the whole set, so a partial run cannot reproduce even that.
+    ///
+    /// "Yet" since 2026-10-31, with one exception found on 2026-11-05:
+    /// `cli_help_is_populated` has the *Python implementation* as its
+    /// subject, so there is no Rust statement of it and the whole-set
+    /// exit status is unreachable at 43 of 44 as well as at 17. That is
+    /// a reason to decide what `doctor entities` means here, not a
+    /// refusal to port it.
+    ///
+    /// Only **4** of the 8 filesystem checks read a checkout tree, so
+    /// the tree-pinning harness (step 26) unblocks four and not
+    /// fifteen; the 8 engine checks are blocked on the verification
+    /// backend instead, which is a different and harder thing. See
+    /// `templedb-db/src/doctor.rs` for the table and the README's
+    /// *Deferred, not refused*.
+    ///
+    /// Clap refuses a bare `doctor` and prints the subcommands, which
+    /// is Python's `required=True` behaviour.
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCmd,
+    },
+    /// Proposed source edits. **All five of Python's, as of
+    /// 2026-11-18.**
+    ///
+    /// `list` and `show` are reads and landed first on purpose, which
+    /// is what makes the three writes verifiable: a write here is
+    /// checked by reading its row back through the two commands the
+    /// byte-diff sweep already compares against Python.
+    ///
+    /// The reads were taken before `cancel`, which is what the README
+    /// had queued, because they are what `cancelled_at` and
+    /// `applied_commit_id` were actually waiting for: `intent show`
+    /// prints both, so a read is what moved the mirror's boundary, not
+    /// a write. See `templedb-db/src/intent.rs`.
+    ///
+    /// `apply` carries the family's one behavioural divergence: a base
+    /// the file has moved past is refused rather than merged onto, and
+    /// the reason is measured rather than scoped — see *The rebase
+    /// this port refuses to do*.
+    Intent {
+        #[command(subcommand)]
+        command: IntentCmd,
     },
     /// Copy the read subset from SQLite into a Postgres database.
     ///
@@ -165,15 +220,37 @@ enum SearchCmd {
         #[arg(short, long, default_value_t = 100)]
         limit: i64,
     },
+    /// Search file names.
+    ///
+    /// Matches the pattern as a literal substring of the path. Python
+    /// treats it as a LIKE pattern, so `_` is a wildcard there; see
+    /// `search.rs` for the measurement and the README for why this one
+    /// diverges.
+    ///
+    /// No `--limit`: Python's hundred is hardcoded and reproduced, and
+    /// a flag only this side has would be a surface divergence bought
+    /// for nothing. When the hundred cuts the list short, this says so
+    /// on stderr — stdout is Python's table, byte for byte.
+    ///
+    /// `--project` is an exact slug here and fuzzy nowhere else in this
+    /// command family, because Python's `search` module is the one that
+    /// never calls the fuzzy matcher. A name that matches nothing
+    /// selects nothing and exits 0, as Python does.
+    Files {
+        pattern: String,
+        /// Limit to one project (exact slug)
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum ProjectCmd {
     /// List all projects.
     ///
-    /// The two filters are Python's and select rows only — the counts a
-    /// project shows are the same whether you filtered or not. Python
-    /// runs a separate query under either flag, with a different file
+    /// The three filters are Python's and select rows only — the counts
+    /// a project shows are the same whether you filtered or not. Python
+    /// runs a separate query under any of them, with a different file
     /// count, a different line source and a different order, and then
     /// prints two tables. See `projects.rs`.
     #[command(alias = "ls")]
@@ -184,6 +261,16 @@ enum ProjectCmd {
         /// Only projects in one category
         #[arg(long, value_enum)]
         category: Option<Category>,
+        /// Only projects of one type.
+        ///
+        /// A different column from `--category`, despite the names:
+        /// `--type service` and `--category service` are two questions
+        /// that happen to share a word for an answer, and the live data
+        /// varies them independently. Python's own note says the flag
+        /// replaced `nixos list-configs`, which was this query with the
+        /// type hardcoded to `nixos-config`.
+        #[arg(long = "type", value_enum, value_name = "TYPE")]
+        project_type: Option<ProjectType>,
     },
     /// Show one project's details.
     ///
@@ -197,7 +284,8 @@ enum ProjectCmd {
 enum FileCmd {
     /// Print a tracked file's current contents
     Cat { project: String, path: String },
-    /// Write a file's contents. **The port's only command that writes.**
+    /// Write a file's contents. **The port's first write, and the only
+    /// one that changes source.**
     ///
     /// Writes the port's own Postgres — the one named by
     /// `TEMPLEDB_WRITE_URL` — and never the live SQLite database, which
@@ -207,9 +295,9 @@ enum FileCmd {
     /// **Partial.** Python's `file set` carries seven guards; this
     /// carries six — `--if-match`, the un-delete, the mojibake check,
     /// `--verify`, the `edit_intents` record and the auto-stage.
-    /// Absent: `--commit` / `-m`, and binary content. The opt-in
-    /// exists because none of that is visible from a command line.
-    /// See the README's *The first write*.
+    /// Absent: the `--if-match` three-way rebase and its `--no-rebase`
+    /// switch. The opt-in exists because none of that is visible from
+    /// a command line. See the README's *The first write*.
     ///
     /// Takes an exact slug, not a fuzzy name — the one place this port
     /// is deliberately stricter than Python, because a mis-resolved
@@ -294,6 +382,82 @@ enum FileCmd {
         /// follows it or the commit will find nothing.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// After writing, commit this session's staged files. Implies
+        /// `--stage`.
+        ///
+        /// Runs `vcs commit-staged` in **the write's own transaction**,
+        /// so either the content is committed or nothing happened.
+        /// Python runs the two as separate transactions and keeps the
+        /// write when the commit fails; that partial state is still
+        /// reachable here, by passing `-s` instead of this.
+        ///
+        /// **Not scoped to this file.** It commits every row this
+        /// session has staged on the branch, which is what Python's
+        /// `--commit` does too — the commit selects by session, not by
+        /// path. Anything staged by an earlier `file set` in the same
+        /// session goes with it.
+        #[arg(long)]
+        commit: bool,
+        /// Commit message when `--commit` is passed. Defaults to
+        /// `file set: <path>`, which is Python's default.
+        #[arg(short = 'm', long = "commit-msg", value_name = "MSG")]
+        commit_msg: Option<String>,
+    },
+    /// Stage a file for deletion (hard-delete on commit; history preserved)
+    ///
+    /// **The sixth write.** Writes the port's own Postgres and requires
+    /// `TEMPLEDB_RS_ALLOW_WRITES=1`, like every other write here.
+    ///
+    /// Nothing is deleted by this command. It flips one
+    /// `vcs_working_state` row to `state = 'deleted'` and names the
+    /// session that owns it; `vcs commit-staged` is what hard-deletes
+    /// the `project_files` row, and until then `file cat` still answers
+    /// and `file ls` still lists the file.
+    ///
+    /// **No flags, on purpose**, which is a decision rather than an
+    /// omission: Python's `file rm` has none either, so the surfaces
+    /// agree exactly and the sweep's flag stage needs no allow-list
+    /// entry for this command. The session therefore comes from
+    /// `TEMPLEDB_SESSION_ID` only — there is no `--session` here, where
+    /// `file set` has one because *Python* has one. Inventing the flag
+    /// would widen a surface for this port's convenience, which is the
+    /// thing `file where` was given no `--no-color` to avoid.
+    ///
+    /// Takes an exact slug, not a fuzzy name, for `file set`'s reason.
+    Rm { project: String, path: String },
+    /// Set the edit_mode of a file (immutable | hot-reload | live-symlink)
+    ///
+    /// **The seventh write**, and the smallest: one column on one row.
+    /// Writes the port's own Postgres and requires
+    /// `TEMPLEDB_RS_ALLOW_WRITES=1`, like every other write here.
+    ///
+    /// `project_files.edit_mode` was mirrored for `file ls` and is read
+    /// by it two ways — `-l` prints it and `--edit-mode` filters on it —
+    /// so this is the rare write whose effect shows up in output the
+    /// sweep already byte-diffs against Python.
+    ///
+    /// **No session and no clock**, neither of them omitted: Python
+    /// resolves no session here, and the `updated_at` its `UPDATE` moves
+    /// is moved by a trigger this port does not have, on a column it
+    /// does not mirror. That divergence is in `filemark.rs` and in the
+    /// README's *Known gaps*, and it predates this command — `file set`
+    /// has fired the same trigger since step 15.
+    ///
+    /// Takes an exact slug, not a fuzzy name, for `file set`'s reason —
+    /// and here fuzzy matching is also what makes Python's success line
+    /// able to name a project that does not exist. See
+    /// *The mode that is spelled by a NULL*.
+    Mark {
+        project: String,
+        path: String,
+        /// The mode to set. Python's three `choices=` verbatim.
+        ///
+        /// Required, as Python's is. Three values and not `file ls`'s
+        /// four: `non-immutable` is a predicate over the column rather
+        /// than a value it can take, and upstream's two `choices=` lists
+        /// differ for exactly that reason.
+        #[arg(long, value_enum, value_name = "MODE")]
+        edit_mode: MarkMode,
     },
     /// List tracked files, optionally under a path prefix
     Ls {
@@ -312,6 +476,65 @@ enum FileCmd {
         #[arg(long, value_enum, value_name = "MODE")]
         edit_mode: Option<EditMode>,
     },
+    /// Re-run the classifier over recorded files and report the
+    /// `file_type_id`s it disagrees with
+    ///
+    /// **A read, and the dry half of a command whose other half writes.**
+    /// `project_files.file_type_id` is stamped once, when a file is
+    /// first recorded, so it is a snapshot of whatever classifier was in
+    /// play then rather than a derived value. This re-runs
+    /// `importer.scanner`'s current one over every active row and
+    /// reports the disagreements, grouped by the move they would make.
+    ///
+    /// Python's is dry by default too, which is what makes this the one
+    /// command in the `file` family whose interesting behaviour has a
+    /// diffable stdout — so it is in the parity sweep and byte-diffed
+    /// against Python on live data, where every other `file` write had
+    /// to be verified by cross-read.
+    ///
+    /// **`--apply` is deliberately absent, not accepted and ignored.**
+    /// Python's writes; this port mirrors `file_types` at two of five
+    /// columns and `category` is `TEXT NOT NULL`, so the resolve-or-
+    /// create arm cannot be written faithfully until the subset grows.
+    /// A flag that promises a write and silently writes nothing is the
+    /// one outcome this project treats as a defect, so it is refused at
+    /// the parser and exits 2. See `retype.rs` and the README's
+    /// *Known gaps*.
+    ///
+    /// The project is a fuzzy pattern, as Python's is — unlike every
+    /// *write* in this port, which takes an exact slug. Nothing here
+    /// writes, so a mis-resolution costs a wrong report rather than a
+    /// wrong file.
+    Retype {
+        /// Project name or pattern (default: all projects)
+        project: Option<String>,
+        /// Only consider rows currently recorded as this type, e.g.
+        /// `--from-type api_route`
+        ///
+        /// A filter on the joined `file_types.type_name`, which is
+        /// Python's — and note that it therefore drops every row whose
+        /// `file_type_id` is NULL or dangling, which are the rows most
+        /// likely to need re-typing.
+        #[arg(long = "from-type", value_name = "TYPE")]
+        from_type: Option<String>,
+    },
+    /// Show every mirror location for a file with content-hash drift status
+    ///
+    /// **The port's first command that reads a filesystem.** It hashes
+    /// the checkout, the edit workspace and any `/nix/store` overlay
+    /// copy, and compares each against the hash the database holds. It
+    /// writes nothing and resolves nothing, so it competes with the
+    /// Python implementation for authority over nothing — which is why
+    /// it lands before the tree *layer* rather than after it.
+    ///
+    /// What it waited on was the sweep's tree fence, not the write
+    /// path: the two binaries run sequentially, so a tree edited
+    /// between them is a difference neither produced. See
+    /// `scripts/parity-sweep.sh` for why that is a fence and not a pin,
+    /// and `where_view.rs` for the three places this reproduces
+    /// something upstream has wrong — including an `edit-work` probe
+    /// that can never fire.
+    Where { project: String, path: String },
 }
 
 #[derive(Subcommand)]
@@ -465,11 +688,27 @@ enum VcsCmd {
     /// `vcs status --refresh`. Same boundary as `vcs log`'s default.
     Diff {
         project: String,
-        file: String,
+        /// File path or pattern (fuzzy). Not required with `--staged`,
+        /// and omitting it diffs the whole working set.
+        ///
+        /// `Option` since 2026-10-31. It was a required positional,
+        /// which is a divergence the sweep cannot see: the flag-surface
+        /// stage parses the `options:` block and never compares
+        /// positional arity. Python has had `nargs='?'` here for as
+        /// long as `_diff_working` has existed.
+        file: Option<String>,
         /// Commit hash or prefix
         commit1: Option<String>,
         /// Commit hash or prefix
         commit2: Option<String>,
+        /// Diff the staged changes instead of a file's revisions.
+        ///
+        /// Shows every staged row on the active branch, from **any**
+        /// session — not just this one. `vcs commit-staged` scopes to
+        /// one session, so this can show work a commit would not take.
+        /// Python's behaviour; see `staged_files`.
+        #[arg(long)]
+        staged: bool,
         /// Render as a context diff rather than a unified one.
         ///
         /// The name is Python's and it is wrong: this prints each hunk's
@@ -557,6 +796,152 @@ enum VcsCmd {
 }
 
 #[derive(Subcommand)]
+enum DoctorCmd {
+    /// Show recent invariant check history (drift over time)
+    History {
+        /// Filter to one invariant name
+        #[arg(long, value_name = "NAME")]
+        check: Option<String>,
+        /// Only show violations / errors
+        #[arg(long)]
+        violated_only: bool,
+        /// Max rows (default 30)
+        ///
+        /// `i64` where Python takes the argument as a *string* and
+        /// calls `int()` on it at the end of the function — so a
+        /// non-numeric value gets as far as building the query there
+        /// and raises, while clap refuses it during parsing. Both
+        /// refuse; the statuses differ (clap's 2, Python's 1) and the
+        /// flag surfaces do not, which is what the sweep compares.
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum IntentCmd {
+    /// Propose an edit (does not apply). **Writes.**
+    ///
+    /// Postgres only and opt-in, like the other three writes. It writes
+    /// `edit_intents` and `content_blobs` and **nothing else** — no
+    /// `file_contents`, no `project_files`, no stage. That is the
+    /// command's point on both sides: a proposal is a row, and
+    /// `intent apply` is what turns it into source.
+    ///
+    /// Takes an exact slug, not a fuzzy name, where Python fuzzy-matches
+    /// — `file set`'s divergence and for `file set`'s reason, plus one
+    /// that is forced: the id is resolved inside the write transaction,
+    /// because the reader and the writer point at different databases.
+    ///
+    /// Its restraint — two tables and no source change — is what made
+    /// it safe to land while `apply` was unported. `apply` arrived on
+    /// 2026-11-18, so a proposal made here is now one this binary can
+    /// turn into source.
+    Create {
+        /// Project slug (exact, not fuzzy)
+        project: String,
+        /// File path within project
+        file_path: String,
+        /// New content as string
+        ///
+        /// Wins over `--from-file` when both are passed, which is
+        /// Python's order — and `-c ''` counts as content, because it
+        /// tests `is not None`. An empty proposal is therefore
+        /// accepted here where `file set` refuses an empty pipe; see
+        /// the README's *Known gaps*.
+        #[arg(short, long)]
+        content: Option<String>,
+        /// Read new content from a file
+        #[arg(short = 'f', long = "from-file", value_name = "PATH")]
+        from_file: Option<String>,
+        /// Base revision (default: current)
+        #[arg(long = "base-rev", value_name = "REV")]
+        base_rev: Option<String>,
+        /// Description / commit note
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// List intents (default: outstanding)
+    List {
+        /// Filter by project slug
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Filter by session id
+        #[arg(short, long, value_name = "ID")]
+        session: Option<i64>,
+        /// Include applied + cancelled
+        #[arg(long)]
+        all_statuses: bool,
+        /// Max rows (default 50)
+        ///
+        /// `i64` where Python's `--limit` has no `type=`, so it is a
+        /// string that `int()` is called on inside the query build —
+        /// `doctor history`'s note exactly, including that clap
+        /// refuses a non-numeric value at parse time with status 2
+        /// where Python raises inside the function with status 1.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Show one intent in full
+    Show {
+        /// Intent id (integer)
+        id: i64,
+    },
+    /// Apply a proposed intent. **Writes.**
+    ///
+    /// Postgres only and opt-in, like the other four writes. The fifth
+    /// one, and the third at zero schema cost: it points
+    /// `file_contents` at the proposed hash and marks the row
+    /// `'applied'`, both in tables this port already mirrors, reads and
+    /// writes.
+    ///
+    /// It does **not** make a commit, which is Python's own emphasis —
+    /// apply changes source, `vcs commit-staged` makes history, and
+    /// keeping them apart is what lets several intents land in one
+    /// commit.
+    ///
+    /// **One deliberate divergence, and it is the whole of
+    /// `--no-rebase`.** A base the file has moved past is refused here
+    /// with exit 4 — always, not only when the flag is given. Python
+    /// three-way merges instead, and the engine it merges with is not a
+    /// three-way merge: measured 2026-11-18 against `git merge-file
+    /// --diff3` over eleven triples, it agrees on 3, and four of its
+    /// "clean" results write content neither side ever held. One of
+    /// them was reproduced end to end upstream — `templedb intent apply
+    /// 1645` exited 0 and dropped a line nobody deleted. See the
+    /// README's *The rebase this port refuses to do*.
+    Apply {
+        /// Intent id (integer)
+        id: i64,
+        /// Refuse (exit 4) if the file has moved since the intent was
+        /// written, instead of three-way merging the proposal onto what
+        /// landed.
+        ///
+        /// Accepted, and what it selects is what happens either way.
+        /// That is not the `--no-fts` shape this port rejected as
+        /// "accepted and ignored": `--no-fts` promises matching the
+        /// port cannot deliver, where this promises a refusal the port
+        /// *does* deliver. Omitting it would make the stricter
+        /// implementation the one that errors on the flag a caller
+        /// passes to ask for strictness — and it is the reason the
+        /// surface agrees with Python's exactly, with no allow-list
+        /// entry.
+        #[arg(long = "no-rebase")]
+        no_rebase: bool,
+    },
+    /// Cancel a proposed intent. **Writes.**
+    ///
+    /// Postgres only and opt-in, like the other four writes. The
+    /// smallest one in the port: it sets `status` and `cancelled_at` on
+    /// a table already mirrored and already read, so it adds no table
+    /// and no column.
+    Cancel {
+        /// Intent id (integer)
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum SourceCmd {
     /// Print a file's content at a revision (default: current)
     Snapshot {
@@ -606,6 +991,30 @@ impl Category {
     }
 }
 
+/// `project list --type`, Python's three values.
+///
+/// A separate enum from [`Category`] rather than a shared one, for the
+/// same reason the two columns are separate: they overlap on `service`
+/// and on nothing else, so one enum covering both would accept
+/// `--type package` and `--category nixos-config` — spellings Python
+/// refuses — and a refusal is half of what the flag surface compares.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum ProjectType {
+    Regular,
+    NixosConfig,
+    Service,
+}
+
+impl ProjectType {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProjectType::Regular => "regular",
+            ProjectType::NixosConfig => "nixos-config",
+            ProjectType::Service => "service",
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Dir {
     Out,
@@ -645,6 +1054,34 @@ impl From<EditMode> for templedb_db::EditModeFilter {
             EditMode::HotReload => F::Exactly("hot-reload"),
             EditMode::LiveSymlink => F::Exactly("live-symlink"),
             EditMode::NonImmutable => F::NonImmutable,
+        }
+    }
+}
+
+/// `file mark --edit-mode`'s three accepted values, which are a
+/// *different* `choices=` list from [`EditMode`] above — Python's `ls`
+/// takes four and its `mark` takes three.
+///
+/// A second enum rather than a reuse with a runtime rejection, so the
+/// flag surface clap prints is the surface Python's prints and
+/// `file mark --edit-mode non-immutable` fails at parse time on both
+/// sides rather than in this port's own code.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum MarkMode {
+    Immutable,
+    #[value(name = "hot-reload")]
+    HotReload,
+    #[value(name = "live-symlink")]
+    LiveSymlink,
+}
+
+impl From<MarkMode> for templedb_db::EditMode {
+    fn from(m: MarkMode) -> Self {
+        use templedb_db::EditMode as E;
+        match m {
+            MarkMode::Immutable => E::Immutable,
+            MarkMode::HotReload => E::HotReload,
+            MarkMode::LiveSymlink => E::LiveSymlink,
         }
     }
 }
@@ -781,10 +1218,15 @@ fn run() -> Result<i32> {
 
     match cli.command {
         Command::Project { command } => match command {
-            ProjectCmd::List { nix_only, category } => {
+            ProjectCmd::List {
+                nix_only,
+                category,
+                project_type,
+            } => {
                 let filter = templedb_db::ProjectFilter {
                     nix_only,
                     category: category.map(|c| c.as_str().to_string()),
+                    project_type: project_type.map(|t| t.as_str().to_string()),
                 };
                 let projects = templedb_db::list_projects_filtered(&store, &filter)?;
                 println!("{:<28} {:>7} {:>10}", "SLUG", "FILES", "LINES");
@@ -852,30 +1294,42 @@ fn run() -> Result<i32> {
                 skip_intent,
                 stage,
                 session: pin,
+                commit,
+                commit_msg,
             } => {
                 // Read the content before opening anything, so a
                 // refusal on stdin does not leave a connection or a
                 // transaction waiting on it.
-                let content = match content {
-                    Some(c) => c,
+                //
+                // stdin is read as BYTES and decoded only if it is
+                // valid UTF-8, which is Python's order and Python's
+                // reason: reading it as text made `file set` fail
+                // outright on any binary file — "'utf-8' codec can't
+                // decode byte 0x84 in position 0" — with nothing
+                // written. That is why `system_config`'s
+                // `.authinfo.gpg` could not be put into the database at
+                // all, which let `materialize` delete it from the
+                // checkout as an untracked stray and broke a Nix build.
+                //
+                // `--content` is argv, so it is a `String` already and
+                // takes the text path unconditionally. Python's is the
+                // same: only the stdin branch can produce bytes.
+                let input: Result<String, Vec<u8>> = match content {
+                    Some(c) => Ok(c),
                     None => {
                         use std::io::Read;
-                        let mut buf = String::new();
-                        // Text only. Python falls back to
-                        // `content_blob` for undecodable stdin,
-                        // deliberately — it is why `.authinfo.gpg`
-                        // could be stored at all — and this port does
-                        // not have that branch yet, so it refuses
-                        // rather than writing mojibake.
-                        std::io::stdin().read_to_string(&mut buf).map_err(|e| {
-                            anyhow::anyhow!(
-                                "stdin is not UTF-8 text ({e}). This port's \
-                                     `file set` writes text only; Python's falls \
-                                     back to a binary blob."
-                            )
-                        })?;
-                        buf
+                        let mut buf = Vec::new();
+                        std::io::stdin()
+                            .read_to_end(&mut buf)
+                            .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                        // The error carries the bytes back, so an
+                        // undecodable pipe costs no second read.
+                        String::from_utf8(buf).map_err(|e| e.into_bytes())
                     }
+                };
+                let content = match &input {
+                    Ok(text) => templedb_db::Content::Text(text),
+                    Err(bytes) => templedb_db::Content::Binary(bytes),
                 };
                 if content.is_empty() && if_match.is_none() {
                     // Python refuses empty input outright, on the
@@ -904,17 +1358,40 @@ fn run() -> Result<i32> {
                 // databases, and validating a session against one while
                 // stamping it into the other would be a nasty bug.
                 let session = templedb_db::resolve_session_tx(&mut tx, pin.as_deref())?;
+                // `--commit` needs a session for a reason `--stage`'s
+                // refusal does not cover, so it gets its own check and
+                // names the flag the caller actually typed: the commit
+                // selects staged rows *by session*, so with none there
+                // is nothing for it to find and the refusal underneath
+                // would be `vcs commit-staged`'s, about a command the
+                // caller did not run.
+                if commit && session.is_none() {
+                    anyhow::bail!(
+                        "--commit needs a session: the commit selects staged rows by \
+                         session, so without one it would find nothing to commit.\n\
+                         \x20 Pass --session <ID>, or set {}. Live ids: \
+                         `templedb vcs session list --active`.\n\
+                         \x20 Nothing has been written.",
+                        templedb_db::SESSION_ID_ENV
+                    );
+                }
                 let opts = templedb_db::SetOptions {
                     if_match: if_match.as_deref(),
                     allow_mojibake,
                     skip_intent,
-                    stage,
+                    // Python's `want_stage = args.stage or want_commit`.
+                    // Here the implication is load-bearing rather than
+                    // cosmetic: over there `--stage` only picks a
+                    // success message, and here it asserts the stage
+                    // happened — which is exactly what `--commit`
+                    // depends on.
+                    stage: stage || commit,
                     session,
                     author: author.as_deref(),
                 };
                 let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
                 let outcome =
-                    templedb_db::set_file(&mut tx, &clock, project_id, &path, &content, &opts);
+                    templedb_db::set_file(&mut tx, &clock, project_id, &path, content, &opts);
                 // `?` before the commit, deliberately: on the error path
                 // `tx` is dropped without `commit`, and `postgres`
                 // rolls an un-committed transaction back on drop. A
@@ -922,6 +1399,53 @@ fn run() -> Result<i32> {
                 // exists to *prevent* a write, not to report one — and
                 // the ordering here is what makes that true.
                 let outcome = outcome?;
+
+                // `--commit`, in the write's own transaction.
+                //
+                // Python runs the two separately: its write commits,
+                // then `VCSCommands().commit()` opens its own
+                // transaction, and a failure there returns the commit's
+                // status with the write already landed and staged. That
+                // outcome is honest over there and it is reachable here
+                // too — it is what `-s` without `--commit` produces —
+                // so making `--commit` atomic costs no capability and
+                // buys the thing the flag's name claims: either the
+                // content is committed or nothing happened.
+                //
+                // It also removes the one genuinely awkward interleave.
+                // Two transactions means a HEAD_RACE can land the write,
+                // stage it, and exit non-zero, leaving a caller who
+                // asked for `file set --commit` to know that the
+                // remedy is a *different* command.
+                //
+                // The author chain is the commit's and not the write's,
+                // which is Python's: its `Namespace(author=None)` sends
+                // `vcs commit` to resolve its own, so one invocation can
+                // stamp `TEMPLEDB_AUTHOR` on the intent and
+                // `git config user.name` on the commit. Reproduced
+                // rather than unified — they are two columns in two
+                // tables answering two questions.
+                let committed = if commit {
+                    let message = commit_msg
+                        .clone()
+                        .unwrap_or_else(|| format!("file set: {path}"));
+                    let session = session.expect("checked above");
+                    let out = templedb_db::commit_staged(
+                        &mut tx,
+                        &clock,
+                        project_id,
+                        &project,
+                        &templedb_db::CommitOptions {
+                            message: &message,
+                            author: &commit_author(None),
+                            branch: None,
+                            session,
+                        },
+                    )?;
+                    Some(out)
+                } else {
+                    None
+                };
                 tx.commit()?;
 
                 // After the commit, on its own transaction. Inside the
@@ -989,6 +1513,167 @@ fn run() -> Result<i32> {
                         format!(" ({})", notes.join(", "))
                     }
                 );
+                // The commit goes to stderr, and **stdout stays one
+                // line holding the content hash**.
+                //
+                // That is the part worth arguing. `vcs commit-staged`
+                // prints its commit id on stdout because that is what
+                // a caller chains on; here the caller chained on the
+                // content hash before `--commit` existed, and a flag
+                // that changes stdout's shape is how a script breaks
+                // without saying so. The cost is real and is not
+                // hidden: a `--commit` run cannot pipe its commit id,
+                // and a caller who needs it reads stderr or runs
+                // `vcs log -n 1`.
+                if let Some(c) = &committed {
+                    eprintln!(
+                        "  committed {} [{}] #{}: {} file(s){}",
+                        c.hash,
+                        c.branch_name,
+                        c.commit_id,
+                        c.files,
+                        match c.previous_head {
+                            Some(h) => format!(", parent #{h}"),
+                            None => ", root commit".to_string(),
+                        }
+                    );
+                    // Named when it happened, because `--commit` reads
+                    // as "commit this file" and commits the session.
+                    // Python has the same behaviour and says nothing.
+                    if c.files > 1 {
+                        eprintln!(
+                            "  note: --commit commits the session, not the path — \
+                             {} other staged file(s) went with it",
+                            c.files - 1
+                        );
+                    }
+                    if c.other_sessions_staged > 0 {
+                        eprintln!(
+                            "  note: {} file(s) staged in other sessions were not included",
+                            c.other_sessions_staged
+                        );
+                    }
+                }
+            }
+            FileCmd::Rm { project, path } => {
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                let mut tx = writer.transaction()?;
+                // No pin, because there is no flag to carry one: the
+                // resolver reads `TEMPLEDB_SESSION_ID` and checks
+                // liveness. Resolved against the write target inside
+                // the write transaction, for the reason `file set`'s
+                // is — the reader and the writer are different
+                // databases.
+                let session = templedb_db::resolve_session_tx(&mut tx, None)?;
+                let Some(session) = session else {
+                    // The documented cost of *resolve never, accept
+                    // always*, and here it is the whole command rather
+                    // than a side effect of one: `file set` without a
+                    // session still writes the content and stages
+                    // nothing, and this has nothing left to do.
+                    //
+                    // The `TEMPLEDB_SESSION` note is included, unlike
+                    // `intent create`'s, and that is the measured call
+                    // rather than a copy: Python's `file rm` goes
+                    // through `get_current_session`, whose step 3 reads
+                    // the *name* variable and creates the session when
+                    // none matches. Measured on a copy of the live
+                    // database 2026-11-18 — `TEMPLEDB_SESSION=zz-no-
+                    // such-name templedb file rm …` exited 0 and minted
+                    // session 1333. So ignoring the name genuinely
+                    // changes the answer here, which is the condition
+                    // `ignored_name`'s doc comment sets for warning
+                    // about it.
+                    let scattered = match templedb_db::ignored_name(None) {
+                        Some(name) => format!(
+                            "\n{} is set to {name:?}, which this port does not resolve — \
+                             the name path creates the session when none matches, and \
+                             Python's `file rm` takes it. Pass the id instead.",
+                            templedb_db::SESSION_NAME_ENV
+                        ),
+                        None => String::new(),
+                    };
+                    anyhow::bail!(
+                        "`file rm` needs a session: set {}.\n\
+                         A staged row is owned by one, and a NULL \
+                         `staged_by_session_id` means *unstaged* rather than staged \
+                         by nobody — `vcs commit-staged` would find nothing and \
+                         `templedb publish` would ship nothing and report success.\n\
+                         There is no --session flag here because Python has none on \
+                         this command; this port will not guess either, where Python \
+                         resolves through the process tree and creates a row when \
+                         that fails.\n\
+                         Pick a live id from `templedb vcs session list --active`.{scattered}",
+                        templedb_db::SESSION_ID_ENV
+                    );
+                };
+                let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
+                let outcome = templedb_db::remove_file(&mut tx, &clock, project_id, &path, session);
+                // `?` before the commit, for `file set`'s reason: a
+                // refusal has to leave nothing behind, and dropping an
+                // un-committed `postgres::Transaction` rolls it back.
+                let outcome = outcome?;
+                tx.commit()?;
+
+                // Python's line, byte for byte, and the only thing on
+                // stdout.
+                println!("{}", templedb_db::rm_line(&path));
+                // The branch and the state that was replaced go to
+                // stderr, where this port already puts everything
+                // Python does not print. Both are worth saying: the
+                // branch because `vcs commit-staged` has to be run
+                // against the same one, and the previous state because
+                // `Some("deleted")` means this run changed nothing but
+                // the owner and the timestamp.
+                eprintln!(
+                    "{project}/{path}: staged for deletion on {} (was {}, session {session})",
+                    outcome.branch,
+                    outcome
+                        .previous_state
+                        .as_deref()
+                        .unwrap_or("not staged at all"),
+                );
+            }
+            FileCmd::Mark {
+                project,
+                path,
+                edit_mode,
+            } => {
+                let mode: templedb_db::EditMode = edit_mode.into();
+                let mut writer = templedb_db::PgWriter::open()?;
+                let mut tx = writer.transaction()?;
+                // No `Clock::from_env()`, and it is the only write here
+                // without one. Python's statement names one column and
+                // the `updated_at` it moves is moved by a trigger — see
+                // `filemark.rs`, which argues why this port does not
+                // reproduce the bump and why fixing it for this command
+                // alone would be worse than recording it.
+                let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
+                let outcome = templedb_db::mark_file(&mut tx, project_id, &path, mode);
+                // `?` before the commit, for `file set`'s reason: a
+                // refusal has to leave nothing behind, and dropping an
+                // un-committed `postgres::Transaction` rolls it back.
+                let outcome = outcome?;
+                tx.commit()?;
+
+                // Python's line, byte for byte, and the only thing on
+                // stdout. The project it names is the string the caller
+                // typed, which is Python's `args.project` — identical to
+                // the slug written here only because
+                // `resolve_project_exact` accepts nothing else. Over
+                // there the two can differ and the line can name a
+                // project that does not exist; see `filemark.rs`.
+                println!(
+                    "{}",
+                    templedb_db::mark_line(&project, &path, outcome.previous.as_deref(), mode)
+                );
+                // The id goes to stderr, where this port already puts
+                // everything Python does not print. Worth saying for
+                // the one success no reader can observe: a
+                // `status = 'deleted'` row takes the column and
+                // `file ls` lists neither the file nor its new mode.
+                eprintln!("  project_files.id {}", outcome.file_id);
             }
             FileCmd::Ls {
                 project,
@@ -1020,6 +1705,139 @@ fn run() -> Result<i32> {
                     }
                 }
                 eprintln!("\n{} file(s)", files.len());
+            }
+            FileCmd::Retype { project, from_type } => {
+                // Fuzzy, because Python's is and because this writes
+                // nothing. `resolve_project_row` reports ambiguity the
+                // way the Python matcher does and bails otherwise,
+                // which lands on exit 1 — Python's
+                // `Project '{x}' not found` is a bare `return 1` too.
+                let project_id = match &project {
+                    Some(pattern) => Some(resolve_project_row(&store, pattern)?.id),
+                    None => None,
+                };
+                let filter = templedb_db::RetypeFilter {
+                    project_id,
+                    from_type: from_type.as_deref(),
+                };
+                let proposal = templedb_db::propose_retype(&store, &filter)?;
+                for line in templedb_db::render_retype(&proposal) {
+                    println!("{line}");
+                }
+                // Python prints this only when there were changes: the
+                // `not changes` branch returns before reaching it. Not
+                // folded into the renderer, because `--apply` replaces
+                // this line rather than following it.
+                if !proposal.changes.is_empty() {
+                    println!();
+                    println!("{}", templedb_db::DRY_RUN_NOTICE);
+                }
+            }
+            FileCmd::Where { project, path } => {
+                // Python resolves the project first and exits **2** if
+                // it does not match — not 1. That is the one place in
+                // the port where a fuzzy-resolution failure is not
+                // `USAGE`, so it cannot go through `resolve_project`,
+                // whose error carries 1. `where`'s docstring says "2 if
+                // the DB has no current row for the path" and its code
+                // returns 2 for the unresolved project as well, which
+                // is a conflation rather than a documented choice —
+                // reproduced, because a script branching on 2 sees both.
+                //
+                // Ambiguity collapses into the same 2, because
+                // `fuzzy_match_project` returns `None` for it and
+                // `where` cannot tell the two apart. Python prints its
+                // candidate list on *stdout* before that and this port
+                // writes its own on stderr, which is the stderr gap the
+                // README already records for every other command — it
+                // only becomes visible here for a pattern matching more
+                // than one project, which no sweep row uses.
+                // The whole row rather than the slug: resolution needs
+                // the project id, and Python's `SyncManager(slug)`
+                // re-reads `id` and `repo_url` for the same reason.
+                let found = match templedb_db::match_project(&store, &project)? {
+                    ProjectLookup::Found(p) => p,
+                    ProjectLookup::NotFound => {
+                        eprintln!("Project '{project}' not found");
+                        return Ok(templedb_db::NOT_FOUND);
+                    }
+                    ProjectLookup::Ambiguous(_) => {
+                        // Delegated so the ● / ○ listing stays in one
+                        // place; only the status differs here.
+                        let e = resolve_project(&store, &project).unwrap_err();
+                        eprintln!("Error: {e:#}");
+                        return Ok(templedb_db::NOT_FOUND);
+                    }
+                };
+                let slug = found.slug.clone();
+
+                // `HOME` rather than a home-directory crate: Python
+                // builds every probe from `Path.home()`, and the two
+                // must agree about what home is or they probe different
+                // trees and report drift that is not there.
+                let home = std::env::var("HOME").context("HOME is not set")?;
+                let home = std::path::Path::new(&home);
+
+                let db_hash = templedb_db::current_hash(&store, &slug, &path)?;
+
+                // Resolve both mirror roots from the `checkouts` table,
+                // which is what Python does and what the hardcoded
+                // paths this replaces got wrong in both directions —
+                // see `where_view`'s decision 1.
+                //
+                // Resolved ONCE per purpose and with the row list read
+                // once, which is also Python's instruction to its own
+                // callers ("Resolve ONCE per command through this").
+                // Here the reason is weaker but real: `active` is a
+                // query and `is_dir` is a `stat` per row, and the two
+                // purposes share both.
+                let rows = templedb_db::active_checkouts(&store, found.id)?;
+                let session =
+                    templedb_db::current_checkout_session(&store, &|k| std::env::var(k).ok())?;
+                let owners: Vec<i64> = rows.iter().filter_map(|c| c.session_id).collect();
+                let live = templedb_db::live_sessions(&store, &owners)?;
+                let repo_url = templedb_db::repo_url(&store, found.id)?;
+                let is_dir = |p: &str| std::path::Path::new(p).is_dir();
+                let is_live = |s: i64| live.contains(&s);
+                let root = |purpose| {
+                    templedb_db::checkout_root(
+                        &rows,
+                        repo_url.as_deref(),
+                        purpose,
+                        session,
+                        &is_dir,
+                        &is_live,
+                    )
+                };
+                let build_root = root(templedb_db::Purpose::Build);
+                let edit_root = root(templedb_db::Purpose::Edit);
+
+                let mut mirrors = where_view::templedb_mirrors(
+                    home,
+                    &slug,
+                    &path,
+                    build_root.as_deref(),
+                    edit_root.as_deref(),
+                );
+                mirrors.extend(where_view::overlay_mirrors(home, &path));
+
+                // Probed only when there is something to compare
+                // against: Python returns before the probe loop when
+                // the DB has no current row, so an absent file never
+                // gets its mirrors hashed.
+                let probed: Vec<_> = match db_hash.as_deref() {
+                    None => Vec::new(),
+                    Some(h) => mirrors
+                        .iter()
+                        .filter_map(|m| where_view::probe(m, h).map(|f| (m.label.clone(), f)))
+                        .collect(),
+                };
+
+                let (lines, code) = where_view::render(&slug, &path, db_hash.as_deref(), &probed);
+                for l in &lines {
+                    println!("{l}");
+                }
+                return Ok(code);
             }
         },
         Command::Entity { command } => match command {
@@ -1305,6 +2123,69 @@ fn run() -> Result<i32> {
                     );
                 }
             }
+            SearchCmd::Files { pattern, project } => {
+                // Not `resolve_project`. Python's `search` module is the
+                // one command family that never calls the fuzzy matcher
+                // — measured, not assumed: `search files README -p
+                // templed` prints "No files found matching 'README'" and
+                // exits 0 where every `file`/`vcs`/`intent` command
+                // would have resolved it. Resolving here would turn a
+                // zero-row answer into an error, which the sweep sees as
+                // a difference in both stdout and exit status.
+                let (hits, truncated) =
+                    templedb_db::search_files(&store, &pattern, project.as_deref())?;
+                if hits.is_empty() {
+                    println!("No files found matching '{pattern}'");
+                    return Ok(0);
+                }
+                // Python runs two queries with two column lists; the
+                // difference is only which columns are printed, so this
+                // is one query and two projections. `lines_of_code` is
+                // selected and discarded in the unfiltered form — the
+                // fifth select-and-discard in this port, and the first
+                // where the discarded column is printed by the *other*
+                // form of the same command.
+                let (columns, rows): (&[&str], Vec<Vec<String>>) = if project.is_some() {
+                    (
+                        &["file_path", "type_name", "lines_of_code"],
+                        hits.iter()
+                            .map(|h| {
+                                vec![
+                                    h.path.clone(),
+                                    h.type_name.clone(),
+                                    table::py_str_opt_i64(h.lines_of_code),
+                                ]
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (
+                        &["project_slug", "file_path", "type_name"],
+                        hits.iter()
+                            .map(|h| vec![h.project.clone(), h.path.clone(), h.type_name.clone()])
+                            .collect(),
+                    )
+                };
+                println!(
+                    "{}",
+                    table::format_table(
+                        &rows,
+                        columns,
+                        &format!("Files matching '{pattern}' ({} results)", hits.len()),
+                    )
+                );
+                // Python prints `(100 results)` and nothing else when
+                // the cap bites, which reads as "there are a hundred".
+                // Saying so on stderr keeps stdout identical and is the
+                // same call `search content` makes about its own
+                // candidate cap.
+                if truncated {
+                    eprintln!(
+                        "warning: more files match; the list is capped at {} as Python's is",
+                        hits.len()
+                    );
+                }
+            }
         },
         Command::Source { command } => match command {
             SourceCmd::Snapshot {
@@ -1578,8 +2459,28 @@ fn run() -> Result<i32> {
                 commit2,
                 side_by_side,
                 no_color,
+                staged,
             } => {
                 let p = resolve_project_row(&store, &project)?;
+
+                // The two working-set forms come first, because both
+                // short-circuit before the file is resolved — Python
+                // checks `--staged` before touching `args.file`, and
+                // then treats a missing file as "the whole working
+                // set" rather than as an error.
+                if staged || file.is_none() {
+                    let Some(branch_id) = templedb_db::active_branch(store.as_ref(), p.id)? else {
+                        eprintln!("No active branch found");
+                        return Ok(1);
+                    };
+                    return if staged {
+                        diff_staged(store.as_ref(), &p, branch_id, side_by_side, no_color)
+                    } else {
+                        diff_working(store.as_ref(), &p, branch_id, side_by_side, no_color)
+                    };
+                }
+                let file = file.expect("the None case returned above");
+
                 let f = match templedb_db::match_file(&store, p.id, &file)? {
                     templedb_db::FileLookup::Found(f) => f,
                     templedb_db::FileLookup::NotFound => {
@@ -1803,6 +2704,309 @@ fn run() -> Result<i32> {
                         for line in &diff {
                             println!("{}", colorize_diff_line(line, color));
                         }
+                    }
+                }
+            }
+        },
+        Command::Doctor { command } => match command {
+            DoctorCmd::History {
+                check,
+                violated_only,
+                limit,
+            } => {
+                let runs = templedb_db::check_history(
+                    store.as_ref(),
+                    &templedb_db::HistoryFilter {
+                        check: check.as_deref(),
+                        violated_only,
+                    },
+                    limit,
+                )?;
+                // Python prints this and returns 0 — an empty table is
+                // not an error, it is a database nobody has run
+                // `doctor entities` against. Reproduced including the
+                // status, because a script distinguishing "no history"
+                // from "the query failed" would read the wrong thing
+                // from a non-zero exit.
+                if runs.is_empty() {
+                    println!("{}", templedb_db::NO_HISTORY);
+                } else {
+                    for r in &runs {
+                        println!("{}", templedb_db::render_check_run(r));
+                    }
+                }
+            }
+        },
+        Command::Intent { command } => match command {
+            IntentCmd::Create {
+                project,
+                file_path,
+                content,
+                from_file,
+                base_rev,
+                message,
+            } => {
+                // The content first, before anything is opened — the
+                // order `file set` takes and for its reason: a refusal
+                // on stdin must not leave a connection waiting on it.
+                //
+                // Python's three sources in Python's order:
+                // `--content` if it is not None (so `-c ''` counts),
+                // then `--from-file`, then stdin when stdin is not a
+                // tty. All three are text; there is no binary branch
+                // over there and so none here. See `create_intent`.
+                let content: String = match (content, from_file) {
+                    (Some(c), _) => c,
+                    (None, Some(path)) => {
+                        // Python's message, which names the path and
+                        // the OS error, and exits 1.
+                        std::fs::read_to_string(&path)
+                            .with_context(|| format!("Could not read {path}"))?
+                    }
+                    (None, None) => {
+                        use std::io::{IsTerminal, Read};
+                        if std::io::stdin().is_terminal() {
+                            // Python's `if not sys.stdin.isatty()`
+                            // guard, which is what keeps an
+                            // interactive invocation from hanging on a
+                            // read nobody is feeding.
+                            anyhow::bail!("Need content via --content, --from-file, or stdin");
+                        }
+                        let mut buf = Vec::new();
+                        std::io::stdin()
+                            .read_to_end(&mut buf)
+                            .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                        // Python's `sys.stdin.read()` raises on
+                        // undecodable bytes and the CLI turns that into
+                        // exit 1 — measured on a copy: "Error: 'utf-8'
+                        // codec can't decode byte 0x84 in position 0".
+                        // So this refuses too, rather than taking
+                        // `file set`'s binary branch: `intent create`
+                        // has no `binary_asset` path upstream, and
+                        // inventing one would store a blob Python
+                        // cannot produce under a hash an unported
+                        // `apply` is supposed to read.
+                        String::from_utf8(buf).map_err(|e| {
+                            anyhow::anyhow!(
+                                "stdin is not valid UTF-8: {e}.\n\
+                                 `intent create` is text-only in both \
+                                 implementations — Python's reads stdin through \
+                                 a text decode and exits 1 here too. \
+                                 `file set` takes binary content."
+                            )
+                        })?
+                    }
+                };
+                // Empty content is *accepted*, which is Python's and is
+                // the opposite of `file set`'s refusal one command
+                // over. Not tidied: an empty proposal is a proposal to
+                // truncate, `intent create` records rather than
+                // applies, and the two commands disagreeing about an
+                // empty pipe is upstream's inconsistency to own. In the
+                // README's *Known gaps*.
+
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                // `TEMPLEDB_AUTHOR`, then `USER`, then NULL — the same
+                // chain `file set`'s intent reads, because it is the
+                // same column and Python fills it from the same two
+                // variables in both paths.
+                let author = edit_author();
+                let mut tx = writer.transaction()?;
+                // No `--session` flag, because Python has none here:
+                // the only input is `TEMPLEDB_SESSION_ID`, so the pin
+                // is `None` and the resolver reads the variable. It
+                // also checks liveness, where Python's `int()` does
+                // not — the divergence `record_intent` documents.
+                // No `ignored_name` warning, unlike `vcs log`'s, and
+                // that is the measured call rather than an omission:
+                // `TEMPLEDB_SESSION` changes nothing *on either side*
+                // here, because Python's `_current_session_id` reads
+                // `TEMPLEDB_SESSION_ID` and stops. The warning exists
+                // for the case where ignoring the name makes this port
+                // answer differently from Python, and this is not one.
+                let session = templedb_db::resolve_session_tx(&mut tx, None)?;
+                let project_id = templedb_db::resolve_project_exact(&mut tx, &project)?;
+                let created = templedb_db::create_intent(
+                    &mut tx,
+                    &clock,
+                    project_id,
+                    &file_path,
+                    &content,
+                    &templedb_db::CreateOptions {
+                        base_rev: base_rev.as_deref(),
+                        message: message.as_deref(),
+                        author: author.as_deref(),
+                        session,
+                    },
+                )?;
+                tx.commit()?;
+                // The slug printed is the one the caller typed, where
+                // Python prints the one it resolved. Equal by
+                // construction: the match is exact, so there is one
+                // string.
+                for line in templedb_db::created_lines(&created, &project) {
+                    println!("{line}");
+                }
+            }
+            IntentCmd::List {
+                project,
+                session,
+                all_statuses,
+                limit,
+            } => {
+                // Python fuzzy-matches `--project` and exits 1 when it
+                // does not resolve, so the resolution is the edge's job
+                // and the filter takes an id. `resolve_project_row`
+                // rather than `resolve_project` because the query
+                // filters on `project_id`, not on the slug — the join
+                // supplies the slug for printing.
+                let project_id = match project {
+                    Some(p) => Some(resolve_project_row(store.as_ref(), &p)?.id),
+                    None => None,
+                };
+                let rows = templedb_db::list_intents(
+                    store.as_ref(),
+                    &templedb_db::IntentFilter {
+                        project_id,
+                        session_id: session,
+                        all_statuses,
+                    },
+                    limit,
+                )?;
+                // Python prints this and returns 0. An empty result is
+                // the answer to "what is outstanding" on a database
+                // where nothing is, which is the healthy state — so a
+                // non-zero status here would make the good case look
+                // like a failure.
+                if rows.is_empty() {
+                    println!("{}", templedb_db::NO_INTENTS);
+                } else {
+                    for r in &rows {
+                        println!("{}", templedb_db::render_intent(r));
+                    }
+                }
+            }
+            IntentCmd::Show { id } => {
+                match templedb_db::show_intent(store.as_ref(), id)? {
+                    Some(i) => {
+                        for line in templedb_db::render_intent_full(&i) {
+                            println!("{line}");
+                        }
+                    }
+                    // Exit 1, not `Coded::not_found`'s 2 — and that is
+                    // Python's, measured rather than assumed. The read
+                    // commands that return 2 for a missing thing
+                    // (`source snapshot`, `entity explore`) all route
+                    // through a helper that does; `intent show` is a
+                    // bare `logger.error(...); return 1`. Reproducing
+                    // the inconsistency is the point of step 12: the
+                    // contract is Python's status, not a tidy one.
+                    None => anyhow::bail!("Intent #{id} not found"),
+                }
+            }
+            IntentCmd::Apply { id, no_rebase } => {
+                // Read and discarded. The refusal it selects is this
+                // port's behaviour with or without it, so there is
+                // nothing to branch on — and the binding is named
+                // rather than `_` because the flag is not inert in
+                // Python and a future rebase would branch here.
+                let _ = no_rebase;
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                let mut tx = writer.transaction()?;
+                match templedb_db::apply_intent(&mut tx, &clock, id)? {
+                    Ok(applied) => {
+                        tx.commit()?;
+                        for line in templedb_db::applied_lines(&applied) {
+                            println!("{line}");
+                        }
+                    }
+                    // Every refusal below drops `tx` without
+                    // committing, which rolls back the status claim
+                    // `apply_intent` made in its first statement. That
+                    // is the point of claiming first: the intent is
+                    // still `'proposed'` afterwards without a second
+                    // statement to put it back.
+                    Err(templedb_db::ApplyRefusal::NotFound) => {
+                        // Exit 1, which is `intent show`'s and
+                        // `intent cancel`'s status for the same miss.
+                        anyhow::bail!("Intent #{id} not found");
+                    }
+                    Err(templedb_db::ApplyRefusal::NotProposed(status)) => {
+                        // Exit 2, and the message names the status —
+                        // the part that tells "already applied" from
+                        // "cancelled".
+                        return Err(anyhow::Error::new(templedb_db::Coded::conflict(format!(
+                            "Intent #{id} has status '{status}' (only 'proposed' can be applied)"
+                        ))));
+                    }
+                    Err(templedb_db::ApplyRefusal::PathNotRegistered(path)) => {
+                        // Exit 3. Python's message points at `file set`
+                        // and so does this: `intent create` accepts a
+                        // path that is not registered, deliberately on
+                        // both sides, so this is where that choice is
+                        // paid for.
+                        return Err(anyhow::Error::new(templedb_db::Coded::refused(format!(
+                            "file_path '{path}' not registered in project — create the file \
+                             first via `templedb file set`"
+                        ))));
+                    }
+                    Err(templedb_db::ApplyRefusal::StaleBase {
+                        file_path,
+                        base,
+                        current,
+                    }) => {
+                        // Exit 4. Python's status and Python's facts;
+                        // the wording and the last two lines are this
+                        // port's, because the reason differs — over
+                        // there this is what `--no-rebase` asked for,
+                        // here it is what the command does.
+                        return Err(anyhow::Error::new(templedb_db::Coded::stale_base(format!(
+                            "Intent #{id} was written against {} but {file_path} now holds \
+                             {}; this port refuses a moved base rather than merging onto \
+                             it.\n\
+                             \x20 Python would three-way merge here, and the engine it uses \
+                             is not a three-way merge — measured, it agrees with `git \
+                             merge-file --diff3` on 3 of 11 cases and four of its clean \
+                             results write content neither side held.\n\
+                             \x20 Re-propose against what landed: `templedb-rs file cat \
+                             <slug> {file_path}`, then `templedb-rs intent create`.",
+                            // Twelve, like Python's `base[:12]` — and
+                            // `min` because `base_revision` is
+                            // whatever `--base-rev` was given and
+                            // nothing validates its length.
+                            &base[..12.min(base.len())],
+                            &current[..12.min(current.len())],
+                        ))));
+                    }
+                }
+            }
+            IntentCmd::Cancel { id } => {
+                let mut writer = templedb_db::PgWriter::open()?;
+                let clock = templedb_db::Clock::from_env()?;
+                let mut tx = writer.transaction()?;
+                match templedb_db::cancel_intent(&mut tx, &clock, id)? {
+                    Ok(()) => {
+                        tx.commit()?;
+                        println!("{}", templedb_db::cancelled_line(id));
+                    }
+                    // Both refusals leave the transaction unused rather
+                    // than rolled back after a partial write: the CAS
+                    // matched nothing, so there is nothing to undo.
+                    Err(templedb_db::CancelRefusal::NotFound) => {
+                        // Exit 1, which is `intent show`'s status for
+                        // the same miss and Python's here too.
+                        anyhow::bail!("Intent #{id} not found");
+                    }
+                    Err(templedb_db::CancelRefusal::NotProposed(status)) => {
+                        // Exit 2. Python's, and the message names the
+                        // status it found — which is the part a caller
+                        // reads to tell "already cancelled" from
+                        // "already applied".
+                        return Err(anyhow::Error::new(templedb_db::Coded::conflict(format!(
+                            "Intent #{id} is '{status}', only 'proposed' intents can be cancelled"
+                        ))));
                     }
                 }
             }
@@ -2092,6 +3296,211 @@ fn parse_via(via: Option<&str>) -> Vec<String> {
 /// only needs the slug. Sharing [`resolve_project`]'s ambiguity
 /// formatting matters more than the two extra lines: the ●/○ listing is
 /// on stdout and has to read the same whichever command produced it.
+/// The per-file header both working-set diff forms print, which is
+/// Python's four `print`s with a `\n` on the last one.
+fn print_working_header(f: &templedb_db::WorkingFile) {
+    let rule = "=".repeat(70);
+    println!("{rule}");
+    println!("File: {}", f.file_path);
+    println!("State: {}", f.state);
+    println!("{rule}");
+    println!();
+}
+
+/// Python's `_display_diff`, which the single-file form inlines and the
+/// two working-set forms call.
+fn print_diff(old: &str, new: &str, old_label: &str, new_label: &str, sbs: bool, color: bool) {
+    let (old_lines, new_lines) = (templedb_db::splitlines(old), templedb_db::splitlines(new));
+    let render = if sbs {
+        templedb_db::context_diff
+    } else {
+        templedb_db::unified_diff
+    };
+    let diff = render(&old_lines, &new_lines, old_label, new_label, 3);
+    if diff.is_empty() {
+        println!("No differences");
+        return;
+    }
+    for line in &diff {
+        println!("{}", colorize_diff_line(line, color));
+    }
+}
+
+/// Python's truthiness for a `TEXT` column: NULL *and* the empty string
+/// are both falsy, and several branches here turn on that rather than
+/// on NULL-ness alone.
+fn truthy(s: Option<&str>) -> Option<&str> {
+    s.filter(|v| !v.is_empty())
+}
+
+/// `vcs diff <proj> --staged`.
+fn diff_staged(
+    store: &dyn templedb_db::Store,
+    p: &templedb_db::Project,
+    branch_id: i64,
+    sbs: bool,
+    no_color: bool,
+) -> Result<i32> {
+    let files = templedb_db::staged_files(store, p.id, branch_id)?;
+    if files.is_empty() {
+        println!("No staged changes");
+        return Ok(0);
+    }
+    println!("Staged changes for {}:", p.slug);
+    println!();
+
+    for f in &files {
+        print_working_header(f);
+        match f.state.as_str() {
+            "added" => {
+                // `staged_hash or current_hash` — Python's `or`, so an
+                // empty staged hash falls through to the current one.
+                let hash = truthy(f.content_hash.as_deref())
+                    .or(truthy(f.current_hash.as_deref()))
+                    .map(str::to_string);
+                let content = match &hash {
+                    Some(h) => templedb_db::content_by_hash(store, h)?,
+                    // Python passes None into the query, which matches
+                    // no row. Skipping the round trip is the same answer.
+                    None => None,
+                };
+                if let Some(c) = truthy(content.as_deref()) {
+                    println!("+++ New file");
+                    for line in templedb_db::splitlines(c) {
+                        println!("+{line}");
+                    }
+                }
+                // Outside the `if`, which is Python's indentation.
+                println!();
+            }
+            "deleted" => {
+                let old = templedb_db::last_committed_content(store, f.file_id)?;
+                match truthy(old.as_deref()) {
+                    Some(o) => {
+                        for line in templedb_db::splitlines(o) {
+                            println!("-{line}");
+                        }
+                    }
+                    // An *empty* committed file reaches this too, not
+                    // only a missing one: Python's test is truthiness.
+                    None => println!("--- File deleted (no committed content to show)"),
+                }
+                println!();
+            }
+            "modified" => {
+                let old = templedb_db::last_committed_content(store, f.file_id)?;
+                // The new side is `current_hash` and the label says
+                // `(staged)`. That mismatch is Python's and is argued
+                // on `staged_files` — the staged hash is right there in
+                // the row and unused.
+                let new = match truthy(f.current_hash.as_deref()) {
+                    Some(h) => templedb_db::content_by_hash(store, h)?,
+                    None => None,
+                };
+                if let Some(n) = truthy(new.as_deref()) {
+                    print_diff(
+                        old.as_deref().unwrap_or(""),
+                        n,
+                        &format!("{} (committed)", f.file_path),
+                        &format!("{} (staged)", f.file_path),
+                        sbs,
+                        !no_color,
+                    );
+                }
+                println!();
+            }
+            // Any other state prints the header and nothing else — not
+            // even the trailing blank line, because Python's `print()`
+            // calls are inside the three branches. `'unmodified'` is
+            // the reachable one: a commit sets the state and clears the
+            // staging owner together, so a staged-and-unmodified row
+            // should not exist, and nothing enforces that.
+            _ => {}
+        }
+    }
+    Ok(0)
+}
+
+/// A bare `vcs diff <proj>` — every changed row, staged or not.
+///
+/// Structurally close to [`diff_staged`] and deliberately not merged
+/// with it. Three things differ and each one is a behaviour: the new
+/// side comes from `ws.content_hash` rather than `file_contents`, the
+/// unreadable-content check is an explicit `is None` rather than a
+/// truthiness test, and the final branch catches every state instead of
+/// only `'modified'`. A shared renderer taking three flags would hide
+/// exactly the differences worth seeing.
+fn diff_working(
+    store: &dyn templedb_db::Store,
+    p: &templedb_db::Project,
+    branch_id: i64,
+    sbs: bool,
+    no_color: bool,
+) -> Result<i32> {
+    let files = templedb_db::changed_files(store, p.id, branch_id)?;
+    if files.is_empty() {
+        println!("No changes");
+        println!(
+            "  (run `templedb vcs status {} --refresh` if you expected some \
+             — working state is only as current as the last scan)",
+            p.slug
+        );
+        return Ok(0);
+    }
+
+    for f in &files {
+        print_working_header(f);
+        if f.state == "deleted" {
+            let old = templedb_db::last_committed_content(store, f.file_id)?;
+            match truthy(old.as_deref()) {
+                Some(o) => {
+                    for line in templedb_db::splitlines(o) {
+                        println!("-{line}");
+                    }
+                }
+                None => println!("--- File deleted (no committed content to show)"),
+            }
+            println!();
+            continue;
+        }
+
+        let new = match f.content_hash.as_deref() {
+            Some(h) => templedb_db::content_by_hash(store, h)?,
+            None => None,
+        };
+        // `is None`, not truthiness — so an *empty* staged file falls
+        // through to the diff below and renders as an empty-vs-old
+        // comparison, where `--staged` would have skipped it. The two
+        // forms genuinely disagree here.
+        let Some(new) = new else {
+            println!("(binary or unreadable content — no textual diff)");
+            println!();
+            continue;
+        };
+
+        if f.state == "added" {
+            println!("+++ New file");
+            for line in templedb_db::splitlines(&new) {
+                println!("+{line}");
+            }
+            println!();
+            continue;
+        }
+
+        let old = templedb_db::last_committed_content(store, f.file_id)?;
+        print_diff(
+            old.as_deref().unwrap_or(""),
+            &new,
+            &format!("{} (committed)", f.file_path),
+            &format!("{} (working)", f.file_path),
+            sbs,
+            !no_color,
+        );
+        println!();
+    }
+    Ok(0)
+}
+
 fn resolve_project_row(
     store: &dyn templedb_db::Store,
     pattern: &str,

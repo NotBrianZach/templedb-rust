@@ -47,7 +47,23 @@
           # this is a `nativeCheckInput` and not a build input.
           nativeCheckInputs = [ pkgs.python3 ];
 
-          # Three invocations, because the oracle tests are
+          # Formatting first, because it is the cheapest check in the
+          # project and needs no build at all — and because nothing ran
+          # it until 2026-11-17, which is how two hunks in `files.rs`
+          # stayed unformatted for twelve days while four README step
+          # entries claimed otherwise. `rustfmt` comes from the same
+          # `rustToolchain` as cargo, so this checks the tree against
+          # the formatter the dev shell would apply rather than a
+          # second one.
+          #
+          # `cargo clippy` is deliberately NOT here and IS in
+          # `just check`: it recompiles the workspace and its
+          # dependencies under a second driver, and this sandbox shares
+          # no `target/` with anything, so it would roughly double the
+          # cost of the cheap half of the gate for coverage the other
+          # half already has. See the README's *Checks*.
+          #
+          # Then three test invocations, because the oracle tests are
           # `#[ignore]`d — `cargo test` must pass on a machine with no
           # interpreter, so they do not run by default and a check that
           # only ran the default set would skip the five tests that pin
@@ -59,7 +75,21 @@
           # and friends by relative path, and asserts it found some.
           checkPhase = ''
             runHook preCheck
+            cargo fmt --all --check
             cargo test --workspace
+            # Two of the three CPython oracles, named one at a time
+            # rather than as a bare `--ignored` over every target. The
+            # third, `classify_parity`, is deliberately NOT here and
+            # cannot be: it imports `importer.scanner` out of the
+            # installed `templedb` package, through the PYTHONPATH that
+            # package's own launcher exports, and no sandbox has either.
+            # These two need only the standard library.
+            #
+            # That is also why the list is explicit. A `cargo test
+            # --workspace -- --ignored` would pick the third one up as
+            # soon as it existed and fail the flake, and the failure
+            # would read as a broken check rather than as a missing
+            # dependency. `just oracle` runs all three.
             ( cd crates/templedb-db \
                 && cargo test --test difflib_parity -- --ignored \
                 && cargo test --test clock_parity -- --ignored )
@@ -76,8 +106,10 @@
         packages.default = templedb-rs;
         packages.templedb-rs = templedb-rs;
 
-        # `nix flake check` runs everything that can run hermetically:
-        # the unit tests and the CPython difflib oracle, via the
+        # `nix flake check` runs everything that can run hermetically
+        # and cheaply: the formatting check, the unit tests — which
+        # include the two self-checks, one reading the sweep script and
+        # one reading README.md — and the CPython oracles, via the
         # `checkPhase` above.
         #
         # It deliberately does NOT run `scripts/parity-sweep.sh`. The

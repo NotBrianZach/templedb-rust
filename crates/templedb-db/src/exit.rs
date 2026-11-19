@@ -9,6 +9,10 @@
 //! | 2 | the thing you named does not exist | `entity explore` / `trace` / `paths`, `source snapshot` / `revisions` |
 //! | 3 | a valid negative answer | `entity paths`: no path within depth N |
 //!
+//! The writes add a fourth, and only one of them: `intent apply`
+//! returns 4 when the file has moved under the proposal. See
+//! [`STALE_BASE`].
+//!
 //! Until this module existed every error in the port left through one
 //! `anyhow` path and exited 1, so a script could not tell `entity
 //! explore Machin/zMothership2` — a typo in the *kind*, which is bad
@@ -53,6 +57,18 @@ pub const NOT_FOUND: i32 = 2;
 /// `entity paths` found no path within `--max-depth`. Not an error:
 /// returned through `Ok` from the command arm, never through [`Coded`].
 pub const NO_PATH: i32 = 3;
+
+/// The base a write was authored against is no longer what the file
+/// holds. Python's `intent apply` exit 4, and the first status in this
+/// port above 3 that travels out of an error.
+///
+/// It already existed as a literal `Ok(4)` in `mirror --check`'s arm,
+/// which is a different claim with the same number — "this mirror is
+/// stale" against "this proposal is". They are not unified and the
+/// number is not shared by accident: both mean *the state you were
+/// told about has moved*, which is the only reading under which one
+/// script could sensibly branch on 4 from either.
+pub const STALE_BASE: i32 = 4;
 
 /// An error that remembers which exit status it should produce.
 ///
@@ -102,6 +118,20 @@ impl Coded {
     pub fn refused(message: impl Into<String>) -> Self {
         Coded {
             code: NO_PATH,
+            message: message.into(),
+        }
+    }
+
+    /// The proposal was written against a base the file no longer
+    /// holds: exit [`STALE_BASE`].
+    ///
+    /// Python reaches this status only under `intent apply
+    /// --no-rebase`; this port reaches it whenever the base has moved,
+    /// which is the one deliberate divergence in that command and is
+    /// argued in [`crate::intent::apply_intent`].
+    pub fn stale_base(message: impl Into<String>) -> Self {
+        Coded {
+            code: STALE_BASE,
             message: message.into(),
         }
     }

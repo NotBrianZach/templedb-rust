@@ -3,7 +3,7 @@
 A Rust port of TempleDB, the project configuration and version control
 system. Binary name is `templedb-rs`. Reads SQLite or PostgreSQL.
 
-## Status: the read-only subset, plus two opt-in writes
+## Status: the read-only subset, plus seven opt-in writes
 
 Restarted 2026-10-04. The previous contents of this repo described a port
 that did not exist — it claimed "Basic CLI structure with clap" and
@@ -15,12 +15,14 @@ Rust at all, zero commits, and a single `src/main.py` holding
 
 | Command | Status |
 |---|---|
-| `templedb-rs project list [--nix-only] [--category]` | same 30 projects and counts; both filters select the same projects Python does; **output format differs** — see below |
+| `templedb-rs project list [--nix-only] [--category] [--type]` | same 30 projects and counts; all three filters select the same projects Python does; **output format differs** — see below |
 | `templedb-rs project show <slug>` | byte-identical |
 | `templedb-rs file cat <proj> <path>` | byte-identical output |
 | `templedb-rs file ls <proj> [prefix] [-l] [--edit-mode]` | byte-identical |
+| `templedb-rs file where <proj> <path>` | **the first command that reads a filesystem.** Byte-identical across its 8 sweep rows — 6 that read a tree and 2 that exit 2 before the probe loop — including the colour escapes, all three exit statuses and the `os.walk` ordering of overlay hits. Both mirror roots are resolved from the `checkouts` table since 2026-11-15, replacing two hardcoded paths that were wrong in opposite directions — see *The resolver the hardcoded paths were standing in for* |
 | `templedb-rs entity stats` | byte-identical, both sections |
 | `templedb-rs search content <pat> [-p] [--limit]` | **deliberately different** — substring, not stemmed, and a different layout; Python's `-i` and `--no-fts` not ported; see below |
+| `templedb-rs search files <pat> [-p]` | byte-identical across 8 sweep rows, both column layouts, the literal word `None` and the trailing padding included. **One deliberate divergence:** `_` and `%` are literals here and LIKE wildcards in Python — `search files get_` returns ten rows upstream of which none contains `get_`. See *`search files`, and the order Python does not have* |
 | `templedb-rs entity explore <kind>/<ref>` | same edge set; **ordering differs on purpose** — see below |
 | `templedb-rs entity trace <kind>/<ref> [--depth] [--direction] [--via] [--limit]` | byte-identical, truncation advisory included |
 | `templedb-rs source snapshot <proj> <path> [--rev] [--meta]` | byte-identical |
@@ -32,10 +34,19 @@ Rust at all, zero commits, and a single `src/main.py` holding
 | `templedb-rs vcs log <proj> [-n] [--branch] [--session] [--all-sessions] [--published]` | byte-identical, **all three views**, with the session-scoped default closed 2026-10-23 — see *Sessions* |
 | `templedb-rs vcs show <proj> <commit> [--no-diff] [--no-color]` | byte-identical across 39 commits in 6 projects, per-file diffs included |
 | `templedb-rs vcs branch <proj>` | byte-identical across 7 projects |
-| `templedb-rs vcs diff <proj> <file> [c1] [c2] [-s] [--no-color]` | byte-identical across 300 runs; `--staged` and the working-set form not ported |
+| `templedb-rs vcs diff <proj> [file] [c1] [c2] [--staged] [-s] [--no-color]` | byte-identical across 300 runs, and **`--staged` plus the working-set form landed 2026-10-31** — all five forms now, at no schema cost. See *The two forms that were never blocked* |
 | `templedb-rs summary [--no-color]` | **seven of Python's nine panes**; six of the seven byte-identical on live data, the seventh a deliberate tie-break — see below |
-| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [-s] [--session]` | **the first write.** Postgres only, opt-in, six of Python’s seven guards — see *The first write* |
-| `templedb-rs vcs commit-staged <proj> {-m\|-F} [-b] [--author] [--session]` | **the second write.** Postgres only, opt-in; the database half of Python's `vcs commit`, with the tree-dependent half refused and the name saying so — see *The second write* |
+| `templedb-rs doctor history [--check] [--violated-only] [--limit]` | byte-identical across 9 variants, exit codes and the empty-table message included. `doctor entities` is **not** ported — see *Why `doctor entities` is not a command this port can have* |
+| `templedb-rs intent list [-p] [-s] [--all-statuses] [--limit]` | byte-identical across 8 variants; **one deliberate ordering divergence** — this has a tie-break and Python does not. See *The tie-break Python does not have* |
+| `templedb-rs intent show <id>` | byte-identical across 3 variants, exit 1 on a missing id included |
+| `templedb-rs intent apply <id> [--no-rebase]` | **the fifth write**, 2026-11-18, and the last of the family — `intent` is now complete at 5 of 5. No new table and no new column. Its success path is byte-identical to Python's, measured on a copy; all four of Python's exit statuses reproduced. **One deliberate divergence:** a base the file has moved past exits 4 *always*, where Python three-way merges — because the engine it merges with is not a three-way merge and four of its "clean" results write content neither side held. See *The rebase this port refuses to do* |
+| `templedb-rs intent cancel <id>` | **the third write**, and the smallest — no new table, no new column. Postgres only, opt-in. A compare-and-swap where Python checks and then acts; both exit statuses reproduced. Its success line was measured byte-identical against Python on 2026-11-17, by step 31's copy technique — it had been written from Python's source and never compared |
+| `templedb-rs intent create <proj> <path> [-c] [-f] [--base-rev] [-m]` | **the fourth write**, 2026-11-17, and the first whose stdout was measured against Python rather than read off its source: byte-identical to Python's, id for id, by running Python against a *copy* of the live database. No new table and no new column. Writes `edit_intents` and `content_blobs` and nothing else — no source change, which is what makes it safe while `apply` is unported. Exact slug, not fuzzy. See *`intent create`, and the write whose stdout could be measured* |
+| `templedb-rs file set <proj> <path> [-c] [--if-match] [--verify] [--allow-mojibake] [--skip-intent] [-s] [--session] [--commit] [-m]` | **the first write.** Postgres only, opt-in, six of Python’s seven guards, text **and binary** content — see *The first write* |
+| `templedb-rs vcs commit-staged <proj> {-m\|-F} [-b] [--author] [--session]` | **the second write.** Postgres only, opt-in; the database half of Python's `vcs commit`, with the tree-dependent half deferred and the name saying so — see *The second write* |
+| `templedb-rs file rm <proj> <path>` | **the sixth write**, 2026-11-18. No new table and no new column. Stages a deletion and removes nothing: `file cat` still answers until `vcs commit-staged` hard-deletes the row. Its one line of stdout is byte-identical to Python's, measured on a copy *and then reproduced through the shipping binary*; all four of Python's exit statuses reproduced. **One deliberate divergence:** no session is a refusal, where Python creates one. No flags on either side. See *The deletion that deletes nothing* |
+| `templedb-rs file retype [proj] [--from-type]` | **the dry half, and a read** — byte-identical across 9 sweep rows and 110 of 110 cross-backend, exit 1 on an unresolved project included. The classifier it is a function of is `importer.scanner`'s 179-entry pattern table, ported as `classify.rs` and pinned against CPython over 24,757 generated paths with **0 mismatches on either function**. Zero schema cost. **One deliberate ordering divergence:** Python's query has no `ORDER BY` and `most_common` breaks ties by row order, and the 25-kind cut falls *inside* a tie group on live data — so this adds `ORDER BY pf.id`. **`--apply` is not ported**, and the flag is absent rather than inert: it is the only behaviour that writes, and `file_types.category` is `NOT NULL` on a table this port mirrors at two of five columns. See *The classifier, and the write that needs two more columns* |
+| `templedb-rs file mark <proj> <path> --edit-mode` | **the seventh write**, 2026-11-18, and the smallest — one column on one row, no new table and no new column. **All four of its stdout lines are byte-identical to Python's**, measured on a copy and then diffed against Python's captured bytes through the shipping binary with nothing substituted; all four of Python's exit statuses reproduced, and the flag surfaces agree exactly with no allow-list entry. **No deliberate divergence in its own behaviour** — the first write here with none — but two things it inherits: Python's success line names the project the *caller typed*, which fuzzy matching lets name a project that does not exist, and no `project_files` write in this port moves the `updated_at` that a trigger moves upstream. Both in *Known gaps*. See *The mode that is spelled by a NULL* |
 
 Verification is byte-level, not eyeball. Same sha256 as the Python
 implementation for `file cat` of `templedb src/cli/commands/entity.py`
@@ -63,17 +74,61 @@ the other side converging on it. `entity explore`, which has no
 The `label` / `source_authority` / `observed_at` header that
 `entity explore` used to omit is now printed; that gap is closed.
 
-Every command that takes a project now accepts a fuzzy name, not just an
-exact slug, because every Python command does. The scoring function is
-reproduced value-for-value from `fuzzy_matcher.py`; the two bugs wrapped
-around it are not — see below.
+Every command that takes a project accepts a fuzzy name, not just an
+exact slug, because the Python command does — *except* `search`, which
+is the one family that never calls `fuzzy_match_project`. This paragraph
+said "every Python command does" until 2026-11-17, and porting
+`search files` is what measured it: `templedb search files README -p
+templed` prints `No files found matching 'README'` and exits 0, where
+every `file` / `vcs` / `intent` / `source` command would have resolved
+the name. So `search files -p` is an exact slug here too, and a miss
+selects nothing rather than erroring.
 
-326 unit tests, run by `cargo test`: 294 in `templedb-db` and 32 in
-`templedb-cli` for the formatting the SQL layer cannot see. Five more
-are `#[ignore]`d because they need `python3`: three drive CPython's
-`difflib` as a reference oracle for *both* renderers, and two drive
-CPython's `sqlite3` to pin the clock's arithmetic against
-`julianday`. Both are described under *Porting order* below. The 95 added
+`search content -p` is the one place this port has **not** followed
+that, and it is a pre-existing divergence this step found rather than
+introduced — it calls the resolver, so an unmatched `-p` exits non-zero
+where Python exits 0 with an empty result. It is left alone deliberately
+(changing an already-shipped command's behaviour is not this step) and
+is in *Known gaps*. The scoring function itself is reproduced
+value-for-value from `fuzzy_matcher.py`; the two bugs wrapped around it
+are not — see below.
+
+481 tests run by `cargo test`, and since 2026-11-17 every number in
+this paragraph is **checked by the gate** rather than recounted by
+hand: 417 in `templedb-db`'s library, 51 in `templedb-cli`'s, for the
+formatting the SQL layer cannot see, 6 in `tests/sweep_coverage.rs`,
+which checks the parity sweep still covers every command this binary
+has — see *Checking the checker* — and 7 in `tests/gate_counts.rs`,
+which checks these counts, its own included. Those six are the only
+tests here whose subject is a shell script; the seven beside them are
+the only ones whose subject is this README. Between them, neither the
+sweep nor this paragraph is a claim that nothing can contradict.
+7 more are `#[ignore]`d because they need
+`python3`: 3 drive CPython's `difflib` as a reference oracle for *both*
+renderers, 2 drive CPython's `sqlite3` to pin the clock's
+arithmetic against `julianday`, and 2 drive CPython's
+`importer.scanner` over a generated corpus of 24,757 paths to pin the
+179-entry path classifier `file retype` is a function of; all three are
+described under *Porting order* below. The third oracle is the first
+that needs more than the standard library — it imports the
+`templedb` package itself, through the `PYTHONPATH` its own launcher
+exports, so that it diffs against the same `scanner.py` the sweep's
+`templedb` runs. 90 more are `#[ignore]`d because they need a Postgres
+scratch database — the write path's only verification, run by
+`just write-test`.
+
+**Four of this README's test counts in a row were wrong**, which is why
+the gate counts them now rather than the prose claiming them. This
+paragraph said 393 (347 / 40 / 6) and step 29's entry said 411 when the
+figure was **409**; step 30 said 429, which was right when it was
+written; step 31 corrected the total to 502 and left the breakdown it
+was a breakdown of at 372. None had drifted far, and that is the point
+rather than a mitigation — a reader cannot tell a current number from a
+stale one, and nothing here could either. See
+*Counting what the gate claims*, and step 32 for the measurement that
+the two counting methods were one apart and why.
+
+The 95 added
 since the backend split cover the parts that have no database behind
 them and would otherwise only be exercised by running against a server —
 placeholder rewriting (including a `?` inside a string literal, a
@@ -122,32 +177,113 @@ tree.
 
 **Not implemented.** Everything else — which is most of it. No session
 *management* (sessions are accepted when named and never created — see
-*Sessions*), no checkouts, no ingest, no doctor, no publish, no Nix
-integration, no GUI. See *Porting order* below.
+*Sessions*), no checkout *management*, no ingest, no `doctor entities`,
+no publish, no Nix integration, no GUI. See *Porting order* below.
 
-`vcs commit` itself is **not** ported and is not going to be in this
-shape: five of its nine guards reconcile a workspace against the
-database, and this port has no workspace. What is ported is the half
-that is a database operation, under a different name —
-`vcs commit-staged` — so that the name does not promise a workflow that
-is refused. See *The second write*.
+Measured 2026-11-05 by walking both argument parsers: Python exposes
+**42 top-level groups, 272 second-level nodes and 428 leaf
+subcommands**; this binary exposes **11 groups and 33 leaves**, of
+which 30 share a Python name. That is about 8% of the surface, and the
+figure is here because the per-command table above reads like more.
+Three of the 33 are the port's own — `mirror`, `state` and
+`vcs commit-staged`. Two families are complete: `source` at 2 of 2 and,
+since 2026-11-18, `intent` at 5 of 5; `file` is at 6 of 10.
 
-**The write loop closes, as of 2026-10-27.** `file set` stages what it
-writes and `vcs commit-staged` commits what is staged, so the two
-commands are one path rather than two halves — and the staging step is
-the port's own code rather than a SQL fixture standing in for it. That
-is the whole of step 21; see *The auto-stage* and the porting order
-below. What is still missing from the loop as Python drives it is
-`file set --commit`, which runs the commit in-process.
+The port's half of that count is recounted here on 2026-11-18 and
+**does not reconcile with either figure it replaces**: the paragraph
+said 25 and `parity-sweep.sh` said 29, where this run of the same walk
+finds 31 — and 30 before `intent apply` landed, so neither of the
+earlier two was simply stale by one command. The method is the one both
+of them named: count the lines under `Commands:` in each group's
+`--help`, drop `help`, and count `mirror`, `state` and `summary` as
+their own leaves. Stated rather than silently corrected, because this
+is precisely the class *Known gaps* names as decaying — nothing in the
+gate counts commands, and three honest walks have produced three
+numbers.
+
+**A fourth walk, 2026-11-18 evening, makes four numbers**, and this one
+is worth more than the tally because it isolates the error. Step 35 ran
+the method above verbatim and got **32 leaves for the tree the
+paragraph described as 31** — the enumeration is `project` 2, `file` 5,
+`entity` 7, `search` 2, `source` 2, `vcs` 5, `intent` 5, `doctor` 1,
+plus the three standalones, and it is printed here because a number
+with its addends beside it is checkable and a number alone is not. So
+the third walk was one low rather than the first two being stale, which
+is the opposite of what the paragraph above inferred from them. 33 with
+`file mark`, and the breakdown is in the enumeration rather than in
+prose for that reason.
+
+That makes it the **seventh** count here to decay. The sixth is further
+down this section — the write-command count, which was wrong twice in
+two weeks. Both were found by the same step, both are counts of
+*commands*, and the gate can catch neither.
+
+`vcs commit` itself is **not yet** ported: five of its nine guards
+reconcile a workspace against the database, and this port has no
+workspace. What is ported is the half that is a database operation,
+under a different name — `vcs commit-staged` — so that the name does
+not promise a workflow it cannot perform. The other half is **deferred
+rather than refused**, which is a 2026-10-31 decision and not what this
+paragraph said before: the goal is eventual replacement, so the tree
+work is last, not out of scope. See *Deferred, not refused* and
+*The second write*.
+
+**The write loop closes, as of 2026-10-27, and becomes one command on
+2026-10-29.** `file set` stages what it writes and `vcs commit-staged`
+commits what is staged, so the two are one path rather than two halves
+— and `file set --commit` now drives both from a single invocation, in
+a single transaction. That is steps 21 and 22; see *The auto-stage* and
+*`--commit`, and why it is one transaction*.
+
+Nothing of Python's `file set` is missing any more. `--commit` and
+binary content were the last two entries on that list, and both landed
+2026-10-29. What *is* missing is newer than the list: Python grew a
+three-way rebase behind `--if-match` since the audit, and this port
+**refuses** it rather than lacking it — a 2026-11-18 decision with a
+measurement behind it, where the reason had been scope. See *The rebase
+this port refuses to do*.
 
 No writes to the live database, either — and that is still true now
-that the binary has two write commands. There are three write paths in
-it, `mirror`, `file set` and `vcs commit-staged`, and all three write
-only a Postgres database this port owns; none can reach the SQLite file
-the Python implementation has authority over. The two commands
-additionally require `TEMPLEDB_RS_ALLOW_WRITES=1` and a
-`TEMPLEDB_WRITE_URL` that is deliberately *not* the variable the readers
-use. See *Two backends*, *The first write* and *The second write*.
+that the binary has seven write commands. There are eight write paths
+in it: `mirror`, `file set`, `file rm`, `file mark`,
+`vcs commit-staged`, `intent cancel`, `intent create` and
+`intent apply`. All eight write only a Postgres
+database this port owns, and none can reach the SQLite file the Python
+implementation has authority over. The seven commands additionally
+require `TEMPLEDB_RS_ALLOW_WRITES=1` and a `TEMPLEDB_WRITE_URL` that is
+deliberately *not* the variable the readers use. See *Two backends*,
+*The first write*, *The second write* and *`intent create`*.
+
+This paragraph said "two write commands" and "three write paths" until
+2026-11-17, having been written when that was true and not re-checked
+when `intent cancel` landed on 2026-11-03. It is a small instance of
+the *Known gaps* entry about counts nothing checks, and it is recorded
+rather than quietly edited because the port's own rule is that a
+divergence from the live state should be visible. `intent apply` moved
+both numbers again on 2026-11-18, and that one *was* re-checked here —
+which is what the entry asks for and not what it predicts.
+
+**And then `file rm` did not, on the same day.** It said five commands
+and six paths when there were six and seven, and the list two sentences
+up omitted `file rm` outright — written the morning of 2026-11-18,
+corrected the evening of 2026-11-18 by step 35, which needed the same
+sentence. That is the **sixth** count in this README to decay — after
+the four test counts `gate_counts.rs` now catches and the "four opt-in
+writes" heading step 34 corrected — and the
+second inside this paragraph, which is now the single densest instance
+of the thing *Known gaps* says nothing in the gate can catch: step 34's
+own entry records correcting the *heading* three screens above from
+"four opt-in writes" to six, and did not look down here. A count being
+wrong once is drift; the same paragraph being wrong twice in two weeks,
+including once by the step that fixed its neighbour, is the shape of the
+gap. Nothing counts commands.
+
+`intent apply` is also the first write in this port that changes
+**source** rather than only metadata or history. `file set` does too,
+but it is the writer of the content it stores; this one points a file
+at content a different invocation proposed, possibly days earlier. That
+is the whole reason its stale-base refusal is argued at the length it
+is below.
 
 ### Measured, 3-run average on a 776 MB database
 
@@ -228,7 +364,7 @@ not a chain of pairwise comparisons that could have drifted together.
 `search content` is deliberately excluded from the regression axis,
 because changing its answer was the point.
 
-Both axes are now run over **one sweep of 54 invocations covering every
+Both axes are now run over **one sweep of 92 invocations covering every
 implemented command**, and it is committed as
 `scripts/parity-sweep.sh` rather than retyped each time:
 
@@ -544,11 +680,17 @@ Python implementation's exclusive authority over the live file is
 untouched. The mirror is downstream of that authority, never a second
 claimant on it.
 
-Making Postgres primary means translating the rest of the schema — 163
-tables, 45 views, 61 triggers, 361 indexes, against the 8 tables and 1
-view the port reads today — and porting the write paths, which is the
-design document this port has been deferring. The mirror does not
-quietly accomplish either.
+Making Postgres primary means translating the rest of the schema —
+recounted 2026-11-17, 171 `sqlite_master` tables (160 discounting FTS5's
+ten shadow tables), 45 views, 61 triggers and 381 indexes, against the
+23 tables and 2 views the port reads today — and porting the write
+paths, which is the design document this port has been deferring. The
+mirror does not quietly accomplish either. (The port's side of that
+comparison said **8** until 2026-11-16, which is what it was when this
+paragraph was written; the live side said 163 tables and 361 indexes
+until 2026-11-17, which is what *it* was. The boundary has moved with
+every reader and the schema has moved on its own, and a count in prose
+is the one kind of measurement nothing re-checks.)
 
 ## Reads only, deliberately
 
@@ -560,15 +702,85 @@ newer blob. A reader cannot violate any of them. Porting reads first lets
 both implementations run against one live database instead of competing
 for authority over it.
 
-Two of those invariants are now the reason a command is *not* ported
+Two of those invariants are now the reason a command is *not yet* ported
 rather than the reason none is. Checkout role resolution and the
 blob-age guards are what `vcs commit`'s five filesystem guards are made
-of, and the port has no filesystem to resolve — so the half of commit
+of — so the half of commit
 that is a database operation is ported under a name of its own and the
-half that reconciles a tree is refused. The decision above is what
+half that reconciles a tree is **deferred**. The decision above is what
 makes that the right answer instead of a compromise: a port that grew a
-workspace scanner to finish the command would be competing for
-authority again. See *The second write*.
+workspace scanner *while Python is still authoritative* would be
+competing for authority again. See *The second write*.
+
+**Half of "checkout role resolution" stopped being an invariant this
+port lacks on 2026-11-15**, and the split is worth stating precisely
+because this paragraph read as though the whole of it were out of
+reach. Resolution is a `SELECT` over `checkouts` plus a `stat`, and
+`file where` needs it to say which directory it is hashing — so
+`checkouts.rs` ports the two purposes a *reader* can have,
+`PURPOSE_BUILD` and `PURPOSE_EDIT`. What is still absent is the two
+that exist to *refuse*: `PURPOSE_WRITE`, which declines to hand a
+writer the published tree, and `PURPOSE_SCAN`, which declines to adopt
+a stale one. Those are the ones `vcs commit`'s guards are made of, they
+have no reader here to verify them against, and `Purpose` has two
+variants rather than four so that a future writer has to add the branch
+rather than inherit a guard that was never exercised. See
+*The resolver the hardcoded paths were standing in for*.
+
+### Deferred, not refused — decided 2026-10-31
+
+That paragraph said "refused" until 2026-10-31, and three sections of
+this README argued the tree-dependent half of the system was out of
+scope rather than late. **The goal is eventual replacement**, so it is
+late.
+
+The distinction matters because the authority argument is about
+*coexistence, not capability*. It holds for exactly as long as two
+implementations run against one live database. At cutover there is one
+implementation, nothing to compete with, and the argument dissolves
+entirely — so it settles the **sequencing** of the checkout work and
+says nothing about whether it happens.
+
+Reading it as scope produced a contradiction this document carried
+without noticing: the closing paragraph says "rename when it can answer
+everything the original can", and *everything* includes `materialize`,
+`templedb commit <slug> <dir>`, the `project checkout-*` family and
+`file where` — the workflow every agent in this system actually uses.
+"Never support checkouts" and "rename when complete" cannot both be
+true. The rename sentence is the one that stands.
+
+So the order is the one step 15 already used for writes, one layer out:
+
+1. Everything that is not a tree — reads and database-only writes. This
+   is where the port is now, and it is most of what is left.
+2. **The tree-pinning harness**, which is the real precondition and is
+   not a command. The byte-diff method compares two sequential
+   invocations, so a tree being edited between them produces a false
+   difference; a clock could be injected as one scalar and a checkout
+   cannot. Needs a fixture tree or a snapshot mechanism before any
+   tree-reading command is verifiable.
+3. **A design document for the tree layer** — the workspace scanner, the
+   checkout-role resolver, the mirror-to-disk step. The 2026-10-24
+   report called this "a different project, not a harder version of
+   this one", which is accurate about its size and was being read as a
+   refusal. Same shape as *The write path* report, which is also what
+   made step 15 tractable. The resolver's **read** half came out of this
+   bucket on 2026-11-15 without the document and should not have been
+   in it: it resolves and writes nothing, and `file where` was already
+   answering with two paths it had built by hand. The document is for
+   the half that decides where a *write* lands.
+4. The tree-touching commands, and then cutover.
+
+Two things in that list are *not* blocked and are worth separating out.
+`file where` only **reads** a tree — it hashes the checkout and prints
+`✓ match`, mutating nothing — so it never competes for authority and is
+blocked on (2) alone. And `doctor entities`' 15 non-database checks are
+the same shape. Neither is waiting on the cutover.
+
+What does not change: Python stays authoritative until cutover, the
+mirror stays a read replica, and the 2026-10-16 decision — the port
+stays a separate project and owns a Postgres populated by copy — still
+holds. Deferred means last, not soon.
 
 Two bugs from the Python side are already designed out here:
 
@@ -626,22 +838,24 @@ Python when the audit ran, which is the real finding:
 | `file ls -l` | no `edit_mode` column (migration 106), and the line-count field was one space too wide on every row |
 | `source revisions` / `snapshot --meta` | NULL rendered as `?` and `(none)` where Python renders `-` and `None` |
 
-Plus the blob-classification regression written up under *The one place
-this port fell behind Python*. All four are fixed here now, and all four
+Plus the blob-classification regression written up under *The first
+place this port fell behind Python*. All four are fixed here now, and all four
 were invisible to the verification this port had been doing, for the
 same reason: **the harnesses only covered the command being worked on.**
 The blob bug surfaced from a `--side-by-side` sweep that happened to
 also run the unified renderer; the other three surfaced only once every
 implemented command was diffed in one pass.
 
-So that is now the method: a single sweep over all 54 invocations
+So that is now the method: a single sweep over all 92 invocations
 (`scripts/parity-sweep.sh`), run against Python and across both
 backends, rather than a per-command harness retired when the command is
-declared done. Four differences remain and every one is deliberate and
-documented — `project list`'s layout, `entity explore`'s ordering, and
-two `search content` invocations. The fifth was `entity paths`'s exit
-code, closed on 2026-10-17; the sixth was `vcs log`'s session default,
-closed on 2026-10-23 — see *The error statuses* and *Sessions*.
+declared done. Five differences remain and every one is deliberate and
+documented — `project list`'s layout, `entity explore`'s ordering, two
+`search content` invocations, and one `intent list -s` row where this
+port has a tie-break and Python does not. Two more were gaps rather
+than decisions and both closed: `entity paths`'s exit code on
+2026-10-17 and `vcs log`'s session default on 2026-10-23 — see *The
+error statuses* and *Sessions*.
 
 ## Bugs found while porting
 
@@ -908,10 +1122,464 @@ below rather than here.
 
 Differences that are not deliberate and are not yet closed.
 
-- **The sweep is a shell script, not a test.** `cargo test` does not run
-  it, so nothing fails if it is never invoked. It needs a live database
-  and the Python binary, which is why it is not a `#[test]` — but a CI
-  entry point or a `nix flake check` would close the rest of the gap.
+- ~~**The sweep is a shell script, not a test.**~~ **Closed
+  2026-10-29**, from the only angle it can be. The sweep still needs a
+  live database and the Python binary and still cannot be a `#[test]`
+  — but its *coverage* can be, and that was the half silently rotting:
+  `crates/templedb-cli/tests/sweep_coverage.rs` runs in `cargo test`
+  and fails if a command exists in the binary and in no sweep row, or
+  if an exemption outlives the command it exempts. The CI entry point
+  is `just check-all`, which is also the first thing in this repository
+  to run the write tests and the cross-backend sweep as part of a gate
+  rather than by hand. See *Checking the checker*.
+
+  What is **not** closed, and is a weaker claim than the above: a row's
+  arguments are not checked for reaching anything interesting. Coverage
+  means a row exists, not that it is a good row.
+- **The tree fence detects churn and does not prevent it.** Six rows
+  read a directory and run between two digests of it; a row whose tree
+  moved through all three attempts is reported as `churned` and counted
+  in neither `pass` nor `unexpected`. So a tree under continuous
+  rewriting would stop being checked, loudly rather than silently.
+  Measured bursty — 432 files a day in bursts of a few hundred, zero
+  churned on the first run — which is what makes detect the right
+  trade. Argued at length in `scripts/parity-sweep.sh`; the alternative
+  needed fixture rows in a database this port must not write.
+- ~~**`just check` does not run `cargo fmt --check`, and two hunks have
+  been unformatted since 2026-11-05.**~~ ~~**Nothing in the gate counts
+  tests either.**~~ **Both closed 2026-11-17** by step 32, which is the
+  step this entry argued for by name: "the *gate* is the actual gap …
+  which is the argument for fixing the gate rather than the hunks".
+  `just check` and `just check-all` now begin with
+  `cargo fmt --all --check` and `cargo clippy --all-targets -D
+  warnings`; `nix flake check` runs the first of the two; and
+  `crates/templedb-cli/tests/gate_counts.rs` reads this README and
+  fails when a number in it stops describing the tree. The two hunks —
+  over-long `assert_eq!` lines in `files.rs`'s `current_hash` test —
+  are formatted, by the step that made them fail a check rather than
+  by the next person to edit the file. **Three** consecutive steps had
+  deferred them on the rule that a step should not reformat a file it
+  did not otherwise change, and that rule was right every time; what it
+  could not do was end.
+
+  The evidence for the second half was four wrong numbers in a row:
+  393 against 409, step 29's 411 against 409, step 30's 429 against the
+  438 it became a day later, and step 31's 502 beside a breakdown still
+  summing to 372 + 51 + 6. See *Counting what the gate claims*.
+
+  What is **not** closed, and is a weaker claim than the above: **the
+  gate counts only what this source tree determines.** Ten numbers are
+  checked — the test total, its four-part breakdown, the `#[ignore]`d
+  groups and a second statement of the total 1,800 lines away. Three
+  kinds of number are deliberately left unchecked and will go on
+  decaying: the sweep's invocation count, because three of its rows are
+  discovered at run time from the live database and no figure written
+  in this tree can be right about it — and its *deliberate* count for a
+  sharper version of the same reason, since step 32 decomposed that one
+  into a static allow-list of 9 plus however many rows the live data
+  makes differ today; every count describing a database
+  (mirrored tables, digested rows, the 1,346 live `created_at` values),
+  because a hermetic test cannot read a 483 MB SQLite file; and every
+  claim about what a test *covers*, which is the same limit
+  `sweep_coverage.rs` states about a sweep row. Where the gate cannot
+  count, the fix applied here is to stop claiming — the two justfile
+  recipe descriptions that said "all 54 invocations" when the sweep had
+  101 now say neither number.
+- **One file per mirror label is inside the fence's blind spot, and
+  since 2026-11-15 it has to be.** The fence digests the roots a row
+  reads, and `file where`'s two TempleDB roots are now chosen at run
+  time by checkout resolution, so the row cannot name them in advance.
+  Naming the enclosing directory instead was measured and rejected:
+  `edit-workspaces/templedb-rust` is 70,806 entries and
+  `edit-workspaces/templedb` is 57,046 — an edit workspace holds
+  `target/`, which this sweep is writing into while it runs — so
+  fencing them would make every row `churned`, which is to say
+  unchecked. What stays unfenced is a `stat` plus one hash of
+  `<resolved root>/<path>`, not a walk; the three overlay roots, which
+  *are* walked, remain fenced. Strictly smaller than the exposure the
+  fence already covers, and stated rather than left to be inferred from
+  a passing row.
+- **`file where`'s unreadable-mirror line is not byte-comparable.**
+  Python prints its `Exception` text in parentheses and this prints its
+  own wording. Same class as the error-message gap below, and reachable
+  only for a file that exists and cannot be read — which no live
+  slug/path pair is.
+- **`file where` resolves two of Python's four checkout purposes**, and
+  the other two are deliberately absent rather than stubbed.
+  `PURPOSE_WRITE` exists upstream to *refuse* — it declines to hand a
+  writer the published tree — and `PURPOSE_SCAN` declines to adopt a
+  stale tree, because a whole-tree scan records an absent file as a
+  deletion. Both belong to the tree layer of step 27, both write, and
+  neither has a reader here to verify it against, so `Purpose` has two
+  variants: a future caller has to add the branch rather than discover
+  that a guard it assumed was there is not. Python's three resolution
+  warnings are not reproduced either — they are stderr, where this
+  README already records the wording as the port's own, and one of them
+  hashes up to 200 files to decide whether to print.
+
+  This entry said **"`file where` reproduces a probe that can never
+  fire"** until 2026-11-15, and that reproduction was of a bug upstream
+  had already repaired. See *The resolver the hardcoded paths were
+  standing in for* — it is the gap list's own instance of a
+  blocked-reason outliving the blockage.
+- **`search files` treats the pattern as a literal and Python treats it
+  as a LIKE pattern.** Deliberate, and the largest instance of this bug
+  class the port has found. Python interpolates `f"%{pattern}%"` raw, so
+  `_` means "any character": measured 2026-11-17, `search files get_`
+  returns ten rows and **none of them contains `get_`** — the hits are
+  `docs/GETTING_STARTED.md`, `get-booking-availability/index.ts`,
+  `getDialpadOpts.mjs` and five more. `set_` returns 321 against a
+  ground truth of 5 and `api_` 128 against 4. 1,112 of the 2,780 live
+  paths hold a literal underscore, so this is the normal case for
+  anyone searching a Python identifier or a Nix store path. Same bug
+  `entity search` and the `file ls` prefix had — both fixed upstream —
+  and this is the copy still live. The `search files get_` sweep row is
+  in the EXPECTED list so that it converging shows up as a surprise.
+- **`search files` lists deleted files and nothing says so.** Reproduced
+  rather than fixed, because it is the view's behaviour on both sides:
+  `files_with_types_view` has no `status` filter where `file ls` and
+  `search content` both do, so all 373 of the live `status = 'deleted'`
+  rows are findable and are printed identically to a present file. It is
+  the only file-listing surface in either implementation that does this.
+  Pinned by the `search files src/main.py -p templedb-rust` sweep row —
+  a file `file ls templedb-rust` does not list.
+- **`search files` says on stderr that its hundred cut the list, and
+  Python does not.** Python's `(100 results)` reads as "there are a
+  hundred" for the 536 files matching `.py`. stdout is byte-identical;
+  the extra line is stderr, where this README already records the
+  wording as the port's own, and it is the same call `search content`
+  makes about its candidate cap. The `search files .py` sweep row is
+  counted as stderr-only.
+- **`search content -p` resolves fuzzily and Python's does not.** Found
+  2026-11-17 while porting `search files`, and pre-existing rather than
+  introduced: `search.py` is the one command family that never calls
+  `fuzzy_match_project`, so `search content checkout -p templed` exits 0
+  with no results upstream and exits non-zero here. Not closed in step
+  30 on scope grounds — changing a shipped command's behaviour is a
+  different step — and invisible to the sweep today, because its only
+  `-p` row passes an exact slug. `search files` was given the faithful
+  behaviour and has a sweep row (`-p no-such-project-ever`) pinning it,
+  which is why the two now differ from each other inside one command
+  family. That is stated rather than smoothed over: the inconsistency is
+  real and it is Python's.
+- **`intent create` accepts empty content and `file set` refuses it.**
+  Reproduced on both counts, and the inconsistency is upstream's:
+  `file set` tests `if not content` and refuses, on the grounds that an
+  empty pipe is "almost always a pipe that produced nothing", while
+  `intent create` tests `if content is None`, so both `-c ''` and an
+  empty pipe count as content. Measured on a copy of the live database
+  2026-11-17: `printf '' | templedb intent create` created intent
+  #1627, recorded `patch_summary: 1 lines, 0 bytes` and exited 0.
+  Pinned by `empty_content_is_proposable_where_file_set_refuses_it`,
+  which asserts the sha256 of zero bytes Python recorded for that row.
+
+  Two defensible readings and the port picks neither: a proposal to
+  truncate a file is a legitimate thing to record and nothing is
+  applied until `intent apply` runs, so accepting it is not obviously
+  wrong — and `file set`'s refusal is not obviously wrong either. What
+  is wrong is that one command family answers the same question two
+  ways, and that is a decision for upstream rather than for a port.
+- **`intent create`'s `patch_summary` uses Python's *other* line
+  count.** `_short_summary` is `decode().count('\n') + 1` with no empty
+  case, where `file set`'s is the same expression behind an explicit
+  `0 if not content`. So an empty proposal reads `1 lines, 0 bytes` and
+  the same content through `file set` records 0 lines. Both reproduced,
+  in two functions — `intent::patch_summary` and `line_count` — with a
+  test asserting they disagree on the one input they disagree on.
+  Listed here rather than silently absorbed because a port that reused
+  one function for both would be right on every input but one.
+- **`intent create` matches the project slug exactly and Python
+  fuzzy-matches it.** `file set`'s divergence, for `file set`'s reason
+  plus one more that is forced: the id is resolved inside the write
+  transaction, because the reader and the writer point at different
+  databases, so a fuzzy read-side resolution would score a name against
+  the parity copy and stamp the result into the scratch one. Invisible
+  to the sweep in both commands, because it is a positional rather than
+  a flag — the flag-surface stage's third blind spot.
+- **`intent create` refuses a bad `TEMPLEDB_SESSION_ID` and Python does
+  three different things with one.** The same divergence `file set`'s
+  intent already carries, with the measurement that was missing:
+  Python's `_current_session_id` runs `int()` and swallows the failure
+  and never checks `ended_at`, so a non-numeric value creates the
+  intent with a NULL session and exits 0, an *ended* session's id goes
+  into the column as written and exits 0, and an id naming no row at
+  all hits the live FK and exits 1 with `Error: FOREIGN KEY constraint
+  failed`. Measured on a copy 2026-11-17 and tabulated in step 31.
+  This port exits 1 on all three with a message naming the variable.
+  The middle case is the one that matters in practice: an agent wrapper
+  holding a pruned session's id writes a dangling reference upstream
+  and gets told nothing. The port's refusal is also what keeps a
+  dangling id out of its own Postgres, because the subset deliberately
+  declares no FK on that column.
+- ~~**`intent apply` is not ported and is the last of the family.**~~
+  **Closed 2026-11-18** by step 33, and the entry's stated reason was
+  wrong in the way this list keeps being wrong. It said the command
+  "three-way merges a stale proposal onto what landed, which is the
+  merge engine `file set --if-match` also lacks" — true about the
+  effort, never checked against the engine. The engine is not a
+  three-way merge: measured against `git merge-file --diff3` over 11
+  triples it agrees on 3, and 4 of its clean results write content
+  neither side held. So `apply` is ported with the strict behaviour and
+  the merge is refused on purpose. `intent` is complete at 5 of 5.
+- **`intent apply` refuses a moved base where Python merges onto it.**
+  The replacement for the entry above, and the *one* behavioural
+  divergence in the command: exit 4 on any stale base, which is what
+  Python's `--no-rebase` selects. Deliberate, argued and measured under
+  *The rebase this port refuses to do* — the decisive number is that
+  upstream's failures are not conservative, 4 of them reaching
+  `file_contents` with content neither the author nor the database ever
+  held, one of which was reproduced end to end through the shipping
+  command at exit 0.
+
+  Invisible to the sweep, and that is a **fourth** blind spot in the
+  flag stage rather than an instance of the first three: the surfaces
+  agree exactly — `--no-rebase` on both sides — while the flag means
+  different things. Named in `parity-sweep.sh` beside the others.
+- **`intent apply` accepts `--no-rebase` and `file set` does not, and
+  the two decisions used different rules.** Python has the flag on both
+  commands with one meaning. `file set`'s is absent and allow-listed
+  under the `--no-fts` rule: a flag switching off behaviour the port
+  does not have would be accepted and ignored. `intent apply`'s is
+  accepted under the opposite reading: it promises a refusal this port
+  delivers on every input, and the stricter implementation erroring on
+  the flag that asks for strictness is worse.
+
+  Both are defensible and they are not the same argument, so one of the
+  two commands is wrong — and by the sharper reading it is `file set`,
+  which should accept the flag and leave the allow-list. Not done in
+  step 33, on the grounds step 30 used for `search content -p`:
+  changing a shipped command's flag surface is a step of its own.
+- **`file rm` refuses without a session and Python creates one.** The
+  divergence `file set --stage` and `vcs commit-staged` already carry,
+  with no softer half available: `file set` without a session still
+  writes the content and stages nothing, and this command's entire
+  effect *is* the stage. Measured on a copy of the live database
+  2026-11-18 — with neither variable set Python printed
+  `✓ Staged .gitignore for deletion`, exited 0, and minted
+  `vcs_sessions` id 1331 to own the row; with `TEMPLEDB_SESSION` set to
+  a name matching nothing it minted id 1333 from the name. Deliberate,
+  and the refusal names the second variable for that reason — unlike
+  `intent create`'s, where ignoring the name changes nothing on either
+  side. Invisible to the sweep, because a write has no diffable stdout.
+- **`file rm` has no `--session` where `file set` does, so the
+  environment variable is the only way to supply what it requires.** A
+  decision, not a gap in the usual sense: Python's `file rm` has no
+  flags at all, so inventing one would be the port widening a surface
+  for its own convenience and would cost a permanent `FLAGS_EXPECTED`
+  entry. `file where`'s absent `--no-color` is the same call. The cost
+  is real and falls on exactly one caller — a subprocess that cannot
+  see the parent's environment, which is the problem `file set
+  --session` exists to solve. Stated rather than left to be discovered
+  from a refusal.
+- **`file rm` leaves `content_hash` and `intent_id` on the row it
+  flips, and nothing says so.** Python's `DO UPDATE SET` names three
+  columns; the other two keep whatever the last `file set` put there.
+  Verified on a copy 2026-11-18 — `templedb-rust/.gitignore`'s row held
+  `c20683…` before and after. Reproduced, and the consequence is worth
+  more than the fidelity: `vcs commit-staged` writes that column to
+  `vcs_file_states.content_hash`, so a committed deletion names the
+  bytes that were removed when the file had been staged first and names
+  the `DELETED` sentinel when it had not. **Which of the two a reader of
+  `vcs show` gets depends on the caller's sequence, and no comment in
+  either implementation mentions it.** Both branches are pinned by
+  tests. Not a bug on either side; an asymmetry that was undocumented
+  until this step went looking.
+- **`file rm` records no `edit_intents` row where every `file set`
+  does.** Confirmed on the copy: 1,647 intents before and after.
+  Reproduced rather than improved, for the reason the port declines to
+  invent column values generally — a `'deleted'` status would be a value
+  nothing else in either implementation writes, and the live CHECK is
+  not mirrored, so this port would be the only thing able to read it
+  back. The consequence is that a deletion has no provenance: nothing
+  records who staged it or from which session, where every content
+  write does.
+- **`file retype --apply` is not ported, and the blocker is two
+  columns rather than the write.** The read half landed 2026-11-19
+  (step 36) and is byte-diffed against Python in the sweep; the write
+  half is `UPDATE project_files SET file_type_id = ?, updated_at =
+  datetime('now') WHERE id = ?` per change, which is ordinary, preceded
+  by a resolve-or-create of a `file_types` row per target name, which
+  is not. `file_types.category` is `TEXT NOT NULL` with no default and
+  this port mirrors that table at **two of five columns** — `id` and
+  `type_name` — because the boundary follows the readers and
+  `search files` reaches it only through a view's join. Python inserts
+  `(type_name, 'uncategorized', 'Auto-registered by file retype')`.
+
+  Closing it is the same two-part shape as the entry below: `category`
+  and `description` into `mirror.rs` and the DDL, a `pg-reschema` and
+  a full re-mirror, and then the command. Not done in step 36 on the
+  rule step 30 used for `search content -p`: a step about a classifier
+  should not also be a step that moves the mirror, and the two halves
+  turned out to be separable — the classifier is all of the read and
+  the insert is all of the write.
+
+  **The flag is absent from the parser rather than accepted and
+  ignored**, which is the part that is a decision rather than a gap.
+  `search content --no-fts` is absent because accepting it would
+  promise matching this port cannot do; `intent apply --no-rebase` is
+  accepted because it promises a refusal this port always delivers.
+  `--apply` switches **on** the only behaviour that writes, so
+  accepting it would mean exiting 0 having written nothing. It exits 2
+  and holds one `FLAGS_EXPECTED` entry, which should leave the list
+  when the subset grows.
+
+  One thing that will make the growth worth more than this command:
+  Python's `retype` is the only `project_files` writer whose own
+  statement names `updated_at`, so the subset growing for it lets that
+  writer set the column from the clock rather than needing a trigger
+  reproduced. See the entry below, which has wanted a reason to move
+  since 2026-11-18.
+- **`pm2_config` is dead code upstream and this port reproduces it.**
+  Found 2026-11-19 by `classify_parity.rs`'s coverage check, which
+  asserts the generated corpus reaches every `type_name`
+  `FILE_TYPE_PATTERNS` can produce and reported exactly one it could
+  not. `ecosystem\.config\.js$` → `pm2_config` is entry 135; `\.js$` →
+  `javascript` is entry 29, carries no guard, and matches every string
+  the later pattern can match, because a path ending
+  `ecosystem.config.js` ends in `.js` by construction. So no path can
+  receive that type on either side.
+
+  Measured on the live database: `file_types` holds `pm2_config` as id
+  131 in category `infrastructure`, **0 of the 2,786 `project_files`
+  rows carry it**, and the one live `ecosystem.config.js` is typed
+  `javascript` — which `file retype` agrees with, correctly as far as
+  the table is concerned. Reported upstream and not fixed here: the
+  repair is a reorder of `FILE_TYPE_PATTERNS`, which changes what every
+  command that classifies anything answers.
+
+  A second entry is shadowed the same way and costs nothing:
+  `templedb-deploy\.sh$` (138) is covered by `deploy\.sh$` (136), which
+  is unanchored at the start and yields the same `deployment_script`.
+  One dead rule changes an answer and the other does not, and the
+  difference is only whether the shadowing entry carries the same name.
+  So the oracle's exclusion list holds one name, not two, and it is
+  asserted in both directions — upstream reordering the table makes
+  this entry fail rather than quietly stop being true.
+- **Python's `file retype` docstring names the wrong `file_types`
+  row.** Upstream, reported rather than fixed, and the mechanism it
+  describes is right. The docstring explains that `_get_file_type_id`
+  used to fall back to `SELECT id FROM file_types LIMIT 1` and that
+  "that row is `api_route`, which is how 495 rows across 10 projects …
+  came to be recorded as API routes". Measured 2026-11-19: the first
+  row of `file_types` is **`ansible_inventory` (id 126)**, not
+  `api_route` (id 18) — migration 138 reseeded the table and moved
+  which row `LIMIT 1` returns. The live symptom matches the new row:
+  44 of the 88 changes the command proposes today are
+  `ansible_inventory -> …`, including the four `.rs` files in this
+  project. A docstring about a stale snapshot going stale itself is the
+  same shape as this README's own prose counts, one repository over.
+- **No `project_files` write in this port moves `updated_at`, and
+  Python's every one does — by a trigger.** Found 2026-11-18 by step
+  35, and **not new**: it has been true since the first write in step
+  15. The live database carries
+  `update_project_files_updated_at`, one of the three triggers on that
+  table that are not cr-sqlite's, and it is
+  `AFTER UPDATE ON project_files FOR EACH ROW` setting
+  `updated_at = datetime('now')`. Python's `file mark` names one column
+  and Python's `file set` un-delete names one column, and the trigger
+  bumps a second one behind both. Measured on a copy:
+  `templedb-rust/.gitignore` held `2026-10-16 15:27:09` before
+  `templedb file mark … --edit-mode hot-reload` and
+  `2026-11-19 03:33:59` after.
+
+  This port has none of the live database's 61 triggers, so it cannot
+  reproduce the bump as a trigger; and it cannot reproduce it in the
+  statement either, because `project_files` is mirrored at **seven
+  columns and `updated_at` is not one of them**. Closing it is two
+  changes rather than one — the column into `mirror.rs` and the DDL,
+  and then *both* writers setting it from the clock, the way
+  `file_contents.updated_at` already is in `file set`, `intent apply`
+  and the commit. Not done in step 35, on the rule step 30 used for
+  `search content -p` and step 33 for `file set --no-rebase`: fixing
+  it for the new command and leaving the month-old one wrong is a worse
+  state than two writers diverging identically and in writing.
+
+  It is the most latent divergence on this list, which is why it went
+  a month unnoticed and why it is recorded rather than rushed:
+  **no query in either implementation reads the column.** The only two
+  `SELECT`s naming `pf.updated_at` are in `services/
+  component_service.py`, which nothing imports and which also selects
+  two columns `project_files` does not have. The state digest cannot
+  see it either, since it digests the mirrored projection. So nothing
+  in the gate will catch this entry going stale — the same shape as the
+  prose counts, one layer down.
+- **Python's `file mark` success line names the project the caller
+  *typed*, which can be a project that does not exist.** Upstream, and
+  reported rather than fixed here. The line is
+  `f"✓ {args.project}/{args.file_path}: …"` and the row is resolved by
+  `fuzzy_match_project`, so the two are different strings whenever the
+  name was fuzzy. Measured on a copy 2026-11-18:
+  `templedb file mark templedb-RUST .gitignore --edit-mode hot-reload`
+  printed `✓ templedb-RUST/.gitignore: edit_mode immutable →
+  hot-reload`, exited 0, and wrote the `templedb-rust` row. There is no
+  `templedb-RUST`. The same interpolation is in the command's
+  `File not found:` message.
+
+  This port is byte-identical anyway and that is construction rather
+  than luck — `resolve_project_exact` accepts only the slug, so the
+  typed string and the written row's slug are the same string. The
+  divergence is confined to inputs this port refuses outright. It is
+  the mirror image of `file rm`, whose line carries **no** project
+  prefix at all: neither is a rule, and the two commands are forty
+  lines apart in one file.
+- **`file mark` succeeds on a soft-deleted row and no reader can see
+  it.** Reproduced: Python's lookup has no `status` filter and its
+  `get_file_by_path` doc comment says rows of any status come back.
+  Measured — `templedb file mark templedb-rust src/main.py --edit-mode
+  live-symlink` printed its success line, exited 0 and wrote the
+  column, while `file ls -l --edit-mode live-symlink` listed nothing,
+  because `file ls` filters on `status`. It is the only success among
+  the seven writes with no cross-read available, and
+  `a_soft_deleted_row_is_markable_and_no_reader_can_see_it` asserts it
+  *as* that rather than skipping the case. Not meaningless — `file
+  set`'s un-delete leaves `edit_mode` alone, so the mode is waiting if
+  the file comes back.
+- **`file mark --edit-mode immutable` writes a NULL that
+  `file ls --edit-mode immutable` does not match.** Both halves are
+  Python's, in two commands, and each reads like a bug from the other's
+  side: the write is
+  `None if args.edit_mode == 'immutable' else args.edit_mode`, and the
+  filter compares the raw column, where NULL is not the string. So the
+  default mode is unaddressable by the filter named after it — on all
+  2,785 live rows, every one of which holds NULL. Reproduced in both
+  places, with `immutable_is_stored_as_a_null_and_the_filter_of_that_
+  name_misses_it` pinning the pair; a port that stored the word would
+  pass a round-trip test and diverge from Python's listing on every row
+  it had written.
+- **`file set --if-match` is a strict compare-and-swap and Python's is
+  not any more.** Python three-way merges a stale base onto what landed
+  and only a genuine overlap exits 2; its `--no-rebase` selects the
+  behaviour this port has unconditionally. Deliberate, argued under
+  *The rebase this port refuses to do*, and in the sweep's flag
+  allow-list as one pair.
+
+  This said "needs a merge engine this port does not carry" until
+  2026-11-18, which read as a gap waiting on effort. It is a decision:
+  the engine was measured when `intent apply` forced the question, and
+  reproducing it would mean writing content neither side authored into
+  the table that holds the user's files.
+- **`intent apply` clears `line_count` and resets `version`.**
+  Python's `INSERT` names four columns, and the current row is deleted
+  and re-inserted rather than updated, so a file `file set` left on
+  version 7 with a line count is on version 1 with a NULL afterwards.
+  Both reproduced rather than improved — verified on a copy of the live
+  database, `file_contents` row 49986 — and both differ from
+  `file set`, which writes the count and leaves the version alone. The
+  consequence a reader would notice is `file ls -l` and
+  `source revisions`, which print the column.
+- **`intent apply` is not transactional upstream, and this one is.**
+  The one place the port is more correct rather than merely stricter,
+  and it is not a divergence the port chose: Python's four statements
+  go through a helper that commits each one, and the `DELETE FROM
+  file_contents` runs before the `INSERT` that replaces it. Measured on
+  a copy 2026-11-18 — an intent whose `new_content_hash` has no blob
+  fails the insert with `NOT NULL constraint failed:
+  file_contents.file_size_bytes`, exits 1, and leaves the file with no
+  current content row at all: `templedb file cat` then answers "Could
+  not read file content from database" for a file that was intact a
+  moment earlier. Reported, not fixed here. The port's apply is one
+  transaction, so the same input changes nothing, and the statuses
+  agree at 1 for different reasons.
 - **`search content`'s layout differs too**, not only its hit set.
   Python prints a padded `project_slug / file_path / snippet` table with
   `<b>`-delimited terms; this prints a two-line form per hit with
@@ -1022,13 +1690,23 @@ Differences that are not deliberate and are not yet closed.
   port should not have it" — once the stage exists there are two
   outcomes to distinguish and Python has one flag for it, so the flag
   gets the stricter meaning. Written up under *The auto-stage*.
-- **`edit_intents` is mirrored at twelve of fourteen columns**, and the
-  two omitted are the ones a *reader* would want: `cancelled_at` and
-  `applied_commit_id`. They belong to `intent cancel` and to the commit
-  link `vcs commit` would make, neither of which is ported, so nothing
-  here could verify them — but 785 live rows carry an
-  `applied_commit_id`, which means the mirror is missing a real column
-  of real data rather than a NULL one. It moves when a reader appears.
+- ~~**`edit_intents` is mirrored at twelve of fourteen columns**, and the
+  two omitted are the ones a *reader* would want.~~ **Closed
+  2026-10-30**, and the entry had named the wrong unblocker for eleven
+  days. It said `cancelled_at` and `applied_commit_id` "belong to
+  `intent cancel` and to the commit link `vcs commit` would make,
+  neither of which is ported" — two **writes**. `intent show` is
+  `SELECT i.*` and prints both, so a pure *read* is what moved them,
+  which is the boundary rule exactly as written rather than an exception
+  to it. `mirror.rs` carried the same sentence and has been corrected
+  too.
+
+  What produced the error is worth keeping: `edit_intents` arrived for
+  `file set`'s provenance, so for two weeks it genuinely had a writer
+  and no reader, and the reasoning about its missing columns inherited
+  that frame and stopped being re-checked. The count was also stale —
+  785 rows carried an `applied_commit_id` when the entry was written and
+  882 of 1,346 do now. See *The intent reads*.
 - ~~**The intent's own write path is partial in one way worth
   naming.**~~ **Closed 2026-10-27** with the auto-stage: migration 088's
   `vcs_working_state.intent_id` link is written now, in the staging
@@ -1044,26 +1722,67 @@ Differences that are not deliberate and are not yet closed.
   half of the same statement was never reproduced here and is fixed
   there too. Written up under *Three findings from porting the
   auto-stage*.
-- **The Postgres schema covers 21 tables and 1 view.** That is the whole
-  set the port reads, out of 163 tables and 45 views. Columns are
+- **The Postgres schema covers 23 tables and 2 views.** That is the whole
+  set the port reads. Recounted 2026-11-17, the live database has 171
+  rows of type `table` in `sqlite_master` — 160 once FTS5's ten shadow
+  tables are set aside — plus 45 views; the figures here and in the DDL
+  header had said 163 tables and 361 indexes since the schema was first
+  translated, and the real numbers are 171 and 381. Columns are
   likewise limited to the ones the queries name — four of
   `ingestion_runs`'s fourteen, three of `fleet_machines`'s
-  twenty-seven, two of `vcs_sessions`'s ten, eight of `projects`'s.
+  twenty-seven, four of `vcs_sessions`'s ten, seven of `checkouts`'s
+  nine, two of `file_types`'s five, eight of `projects`'s.
   Anything not yet ported has nothing to mirror and no way to verify a
   mirror, so the boundary follows the readers, and it moves when one
-  does: `project list`'s two filters added `is_nix_project` and
-  `project_category` on 2026-10-21, and `vcs log`'s default view added
-  `vcs_sessions` on 2026-10-23.
-- **Three of the 21 tables have no reader at all**, which is the one
-  place the rule above reads sideways: `edit_intents` (12 of 14 columns),
-  `vcs_working_state` (9 of 11) and `vcs_commit_metadata` (3 of 40) are
-  carried for a *writer*. Two of the three are now written *and* read
-  inside this port — `edit_intents` by `file set`, and
-  `vcs_working_state` by `file set`'s auto-stage and then by
-  `vcs commit-staged`, which reads, unstages and reaps it. That second
-  one is the strongest-verified table in the subset as of 2026-10-27
-  rather than the weakest: the loop writes it and reads it back through
-  three readers. `vcs_commit_metadata` is the one left out: measured
+  does: `project list`'s filters added `is_nix_project` and
+  `project_category` on 2026-10-21 and `project_type` on 2026-10-29,
+  `vcs log`'s default view added `vcs_sessions` on 2026-10-23, the
+  intent reads completed `edit_intents` on 2026-10-30, `file
+  where`'s mirror resolution added `checkouts` as the 22nd table plus
+  `vcs_sessions.name` / `.started_at` on 2026-11-15, and `search files`
+  added `file_types` as the 23rd on 2026-11-17. `intent create`, the
+  same day, moved it by **nothing** — the fourth write and the second
+  step running at zero schema cost, because every column it fills was
+  mirrored for `file set`'s provenance and then completed for
+  `intent show`. Worth naming in a list of boundary moves precisely
+  because it is not one: a write that needs no new column is what a
+  precondition looks like from the far side. `intent apply` on
+  2026-11-18 and `file rm` the same day moved it by nothing either, so
+  the boundary has now stood still across **four** consecutive steps —
+  which is a claim about the *subset* rather than about the steps: a
+  write that needs no new column means the table it writes was already
+  being read, and that is the only arrangement in which the write can
+  be verified at all. The
+  `project_type` column and the `checkouts` table are the two additions
+  here made because *Python* moved rather than because this port grew a
+  reader: the flag-surface stage reported `--type`, and the sweep
+  reported three of `file where`'s four tree-reading rows differing.
+
+  `file_types` is the first table here reached **only through a view**:
+  no query in either implementation selects from it, and the DDL header
+  had named it, by name, as an example of a table the boundary should
+  *not* be dragged toward. That it moved anyway is the rule working
+  rather than an exception to it — a reader appeared. The header is
+  corrected.
+- **Two of the 23 tables have no reader at all**, which is the one
+  place the rule above reads sideways: `vcs_working_state` (9 of 11) and
+  `vcs_commit_metadata` (3 of 40) are carried for a *writer*.
+  `vcs_working_state` is now written *and* read inside this port — by
+  `file set`'s auto-stage and then by `vcs commit-staged`, which reads,
+  unstages and reaps it — which makes it the strongest-verified table in
+  the subset as of 2026-10-27 rather than the weakest: the loop writes
+  it and reads it back through three readers.
+
+  It was three tables until 2026-10-30. **`edit_intents` left this list
+  by gaining readers**, `intent list` and `intent show`, and is now at
+  all fourteen columns on the ordinary rule. That is worth separating
+  from "the exception shrank": the table did not change, the reasoning
+  about it did. Its two missing columns had been explained by naming two
+  *writes* as their unblocker, and a read was what they needed — an
+  exception stated often enough starts getting used as a reason. See
+  *The intent reads*.
+
+  `vcs_commit_metadata` is the one left out: measured
   while porting the commit, **nothing in the port's reach writes it**,
   because only `templedb commit <slug> <dir>` does. For that table the
   cross-backend digest over the copy is still the only thing verifying
@@ -1138,7 +1857,7 @@ No Postgres server is needed to build or to run `cargo test`.
 ```bash
 just pg-up          # initdb if absent, start, create both databases + the ro role
 just mirror         # copy the read subset from live SQLite into templedb_parity
-just sweep-pg       # the 54 invocations, SQLite vs Postgres
+just sweep-pg       # the 92 invocations, SQLite vs Postgres
 just pg-verify-ro   # prove the read-only role is enforced, not assumed
 just pg-down        # stop; pg-nuke throws the cluster away
 ```
@@ -1218,6 +1937,73 @@ that matters for what comes next: it is the same comparison the write
 path's verification rests on, and it now holds over a column the two
 engines cannot represent the same way.
 
+Re-measured 2026-11-16 with `checkouts` as the 22nd table and
+`vcs_sessions` at four columns, after a `just pg-reschema` for the new
+table and a full re-mirror: **92 of 92 invocations stdout-identical
+across the two backends, 0 unexpected, 0 differing even on stderr**, 7
+of 7 panes, 25 of 25 flag surfaces, 13 of 13 filters, and **all 22
+tables digest identically over 274,270 rows**. The six fenced tree rows
+churned out zero times on either axis.
+
+Re-measured 2026-11-17 with `file_types` as the 23rd table and
+`files_with_types_view` as the second view, after another
+`just pg-reschema` and re-mirror: **101 of 101 invocations
+stdout-identical across the two backends, 0 unexpected, 0 differing
+even on stderr**, 7 of 7 panes, 26 of 26 flag surfaces, 13 of 13
+filters, and **all 23 tables digest identically over 277,295 rows**,
+`file_types` at 188 of them. The six fenced rows churned out zero times.
+
+Re-measured 2026-11-17 after step 31, with no schema change and so no
+`pg-reschema` — only a `mirror-refresh`, because `intent create`
+added no table and no column: **101 of 101 invocations
+stdout-identical across the two backends, 0 unexpected, 0 differing
+even on stderr**, 7 of 7 panes, **27 of 27 flag surfaces**, 13 of 13
+filters, and **all 23 tables digest identically over 279,009 rows** —
+2,714 more than the morning's run, which is ordinary drift from the
+day's `templedb commit`s rather than anything this step wrote. The six
+fenced rows churned out zero times.
+
+That run is also the one place in this README where this axis found a
+defect the Python axis could not: `search files` was 100 of 101 before
+the fix, because SQLite's `LIKE` folds ASCII case and Postgres's does
+not. See step 30.
+
+The new table is why this axis was re-run rather than taken on
+yesterday's numbers: `checkouts` is read by the one command here that
+turns a database row into a filesystem path, so a disagreement between
+the engines about that column would be a disagreement about which file
+gets hashed. `checkout_path` is `text COLLATE "C"` for the reason every
+other path column here is, and the digest is order-independent so a
+collation difference cannot show up as a false match either.
+
+Re-measured 2026-10-29 with `projects.project_type`, `doctor history`
+and the last of `file set`: **60 of 60 invocations against Python, 7 of
+7 panes, 21 of 21 flag surfaces, 13 of 13 filters, 0 unexpected**;
+cross-backend **57 of 57**; and **all 21 tables digest identically over
+242,515 rows**.
+
+The cross-backend axis took four attempts and none of the failures was
+this port. Something writes the live database continuously — it grew
+from 242,470 to 242,515 rows over the hour — so `mirror --check`
+reported 7 stale tables within minutes of a refresh, and twice the
+sweep reported one difference on `search content checkout -p templedb`,
+which is the row most exposed to churn because it reads the contents of
+the project being committed to. Diffing that one invocation by hand
+immediately afterwards gave byte-identical output on both backends. It
+is the condition the staleness guard exists for, seen from the inside:
+the guard catches a mirror that was stale *before* the run and cannot
+catch one that goes stale *during* it.
+
+Two of those numbers moved for a reason worth separating. The filter
+count went 8 → 13 because `--type` is a *third* filter on
+`project list` and the five new rows include `--type service` and
+`--category service`, which select different projects — the one
+spelling that makes confusing the two columns invisible. And the flag
+count went 20 → 21 because `doctor history` joined the stage: it is
+the first command added to this port since the stage was built, so it
+is the first one the coverage test could have caught being left out of
+it, and that test now exists.
+
 Re-measured 2026-10-23 with `vcs_sessions` added and `vcs log`'s three
 views ported: **54 of 54 invocations, 7 of 7 `summary` panes, 20 of 20
 flag surfaces and 8 of 8 `project list` filters identical**, and **all
@@ -1278,7 +2064,7 @@ interrupted run must not leave counts vouching for a copy that rolled
 back.
 
 ```bash
-just pg-check         # fresh: all 21 tables match the source
+just pg-check         # fresh: all 23 tables match the source
 just mirror-refresh   # when it isn't
 just sweep-pg-fresh   # refresh, then sweep -- the form to actually use
 ```
@@ -1325,49 +2111,124 @@ materialise could write over a running server's state.
 ### Checks
 
 ```bash
-just check             # the full gate: tests, CPython oracles, parity sweep
+just check-all         # the whole gate, Postgres included. Point CI here.
+just check             # the SQLite+Python half: tests, oracles, parity sweep
 nix flake check        # the hermetic half only
 ```
 
-`just check` is what to run before publishing. It is three things in
-order: `cargo test --workspace`, the two CPython oracles (`difflib` and
-the clock), and `scripts/parity-sweep.sh python` — every implemented
-invocation diffed against the Python `templedb`, then three stages for what a
-whole-stdout diff cannot reach: `summary` one pane at a time, the flag
-surfaces of 20 commands, and `project list`'s filters by which projects
-they select. The sweep exits with the number of *unexpected*
-differences, so the deliberate divergences do not fail it and a new one
-does.
+`just check-all` is what to run before publishing, and it exists
+because `just check` was being read as the whole gate and never was.
+`check` is five things in order — `cargo fmt --all --check`,
+`cargo clippy --all-targets -D warnings`, `cargo test --workspace`, the
+three CPython oracles (`difflib`, the clock and the path classifier), and
+`scripts/parity-sweep.sh python` — and it skips the cross-backend
+sweep, the mirror freshness check and the write tests, which are the
+*only* verification the write path has. `check-all` adds those three,
+cheapest-first so a failure arrives early. It needs a running cluster
+(`just pg-up`).
 
-A current clean run reads:
+**The first two of those five arrived 2026-11-17 and are step 32.**
+Both had been true of this project and false of its gate: the README
+claimed `clippy` clean and `fmt` clean in four step entries, and
+nothing ran either, which is how two formatting hunks survived twelve
+days in `files.rs`. They go first because they are the cheapest and
+because `fmt` needs no build at all.
+
+The sweep is every implemented invocation diffed against the Python
+`templedb`, then three stages for what a whole-stdout diff cannot
+reach: `summary` one pane at a time, the flag surfaces of 29 commands,
+and `project list`'s filters by which projects they select — plus the
+tree fence, which runs the rows that read a directory between two
+digests of it. It exits with the number of *unexpected* differences, so
+the deliberate divergences do not fail it and a new one does.
+
+Four of those 29 flag surfaces belong to *writes* — `intent cancel`,
+`intent create`, `intent apply` and `file rm` — which is the one half
+of the write path this stage can see. It can, because all four share
+Python's command name, where `file set`'s shape differs and
+`vcs commit-staged` has a name only this port has.
+
+**Those two numbers were 27 and "two" until 2026-11-18**, written when
+they were right after step 32 and not revisited by step 33, which took
+the surfaces to 28. Corrected here with the error named rather than
+quietly edited, because this is the same decay the heading of the
+*Status* section had and the same reason: `gate_counts.rs` checks ten
+numbers and all ten are test counts. **Nothing in the gate counts
+commands or flag surfaces** — the sweep prints the figure it actually
+compared, which is the only one that cannot be stale, and a number
+written here is a claim about a list in a shell script that no test
+reads.
+
+A current clean run reads (2026-11-18, after step 34):
 
 ```
-pinned    TEMPLEDB_SESSION_ID=1178, which owns no unpublished commits in any of: ...
-pinned    so the session view is diffed on its published half only
+pinned    TEMPLEDB_SESSION_ID=1330, which owns unpublished commits in bza
 summary   7 of 7 claimed panes identical, 2 not ported
-flags     20 of 20 commands agree (deliberate divergences allowed)
-filters   8 of 8 project-list filters select the same projects
+flags     29 of 29 commands agree (deliberate divergences allowed)
+filters   13 of 13 project-list filters select the same projects
 
-templedb-rs vs python, 51 invocations: 47 stdout-identical
-(15 differing on stderr only), 18 deliberate, 0 unexpected
+templedb-rs vs python, 101 invocations: 93 stdout-identical
+(24 differing on stderr only), 17 deliberate, 0 unexpected
+fence     6 of 101 rows read a tree and ran between two digests of it; 0 churned out
 ```
 
 The `pinned` line is the sweep reporting which session it put both
 implementations in, and whether that session owns anything — see
-*Sessions*. Three of the 54 rows are appended by that search rather than
+*Sessions*. Three of the 101 rows are appended by that search rather than
 written down, so the count moves with the data; the line says what was
-covered.
+covered. The `fence` line is the tree rows, and it reports what was
+*not* checked as well as what was: a row whose tree moved through all
+three attempts is `churned` and is counted in neither column.
+
+**What the sweep cannot see is now checked by `cargo test`.** Its
+coverage — whether every command in the binary appears in it at all —
+is asserted hermetically by `crates/templedb-cli/tests/sweep_coverage.rs`,
+which also catches an exemption that has outlived its command. See
+*Checking the checker* for why that is the answer to the *known gap*
+this section used to carry and the whole-sweep-as-a-test is not.
+
+**And what no check could see at all is the prose.** Since 2026-11-17
+`crates/templedb-cli/tests/gate_counts.rs` reads this document and
+fails if a number in it no longer describes the tree — ten of them, the
+test count and its breakdown among them. It is the second file here
+whose subject is a check rather than a command, and the first whose
+subject is this README. See *Counting what the gate claims*.
 
 The deliberate count went from 16 to 23 when `file set` landed — seven
 of its flags are absent on purpose and each is listed individually, so
 porting any one of them shows up here as a change rather than
-disappearing into a waved-at exception — and down to 18 as sessions, the
-intent record and the session pin closed `vcs log`'s default view, its
-`--session` flag, and `file set`'s `--skip-intent` and `--session`.
+disappearing into a waved-at exception — and has fallen to 14 as
+sessions, the intent record, the session pin, the auto-stage and
+finally `--commit` closed `vcs log`'s default view, its `--session`
+flag, and `file set`'s `--skip-intent`, `--session`, `-s`, `--stage`,
+`--commit`, `-m` and `--commit-msg`. The one entry that arrived from
+the other direction is `--no-rebase`, which Python grew and this stage
+reported. It went to 15 on 2026-11-17, and the new entry was a *row*
+rather than a flag: `search files get_`, the LIKE-metacharacter
+divergence. `search files` itself added no flag exemption at all, which
+was the point of giving it no `--limit`.
+
+**It read 17 hours later with nothing changed, and that number is not a
+property of the code.** Step 32 decomposed it, because a figure this
+paragraph has tracked across eight steps turns out to be two different
+things added together: **9** are flag-surface pairs, which is every
+entry of `FLAGS_EXPECTED` and moves only when one side grows a flag,
+and the other **8** are invocation rows that *actually differed on this
+run*. Three of those eight are the `intent list --all-statuses` rows,
+and whether each differs depends on where the newest `created_at` tie
+group sits in the live data — 6 rows differed when step 31 measured and
+8 forty minutes later, because step 31's own commit wrote six
+`file set` intents inside four seconds and two of them share
+`2026-11-17 21:38:01`. See *The tie-break Python does not have*, which
+predicted exactly this and is why those rows are exempted by name
+rather than by argument choice. The lesson for *this* paragraph is
+narrower: "the deliberate count" is not a number to track, and the
+9 is.
 
 `just write-test` is **not** part of `just check`, because it needs a
 Postgres server and `check` is meant to run anywhere the build does.
-Run it alongside when touching the write path.
+It *is* part of `just check-all`, which is the recipe to reach for when
+touching the write path — and the reason that recipe exists.
 
 `just pg-reschema` is the one to remember when a write path lands,
 because the subset DDL is not static — it has grown a column or an
@@ -1379,7 +2240,7 @@ and re-applies both schemas from the file and restores the
 `templedb_ro` grants that `DROP SCHEMA` takes with it; follow it with
 `just mirror-refresh`. Destructive and deliberately not a dependency of
 anything — parity is a copy and scratch is disposable, so nothing is
-lost, but refilling parity is a 223,811-row recopy.
+lost, but refilling parity is a 242,470-row recopy.
 
 Each of the three stages has been sabotage-tested — a deliberate
 regression introduced, then the stage confirmed to report it and the
@@ -1410,19 +2271,59 @@ what needs the live database:
 
 | | `nix flake check` | `just check` |
 |---|---|---|
-| unit tests (296) | yes | yes |
+| `cargo fmt --all --check` | yes | yes |
+| `cargo clippy --all-targets -D warnings` | **no** | yes |
+| unit tests (481), the two self-checks included | yes | yes |
 | CPython oracles (difflib, clock) | yes | yes |
-| 49-invocation parity sweep, + `summary`'s panes | **no** | yes |
+| CPython oracle (importer.scanner) | **no** | yes |
+| 101-invocation parity sweep, + `summary`'s panes | **no** | yes |
 
 `nix flake check` builds in a sandbox with no live SQLite file and no
 Python `templedb` installed, so the sweep cannot run there and is not
 wired in pretending otherwise. What it *can* do it now does: the
-`checkPhase` runs the unit tests and then re-runs the five
-`#[ignore]`d oracle tests with `--ignored`, from the crate directory,
-because `cargo test` alone skips them and the one that reads this
-repository's own source needs that working directory. Verified running
-rather than merely compiling: 218 + 13 unit tests and 5 oracle tests
-pass inside the sandbox.
+`checkPhase` runs `cargo fmt --all --check`, then the unit tests, then
+re-runs two of the three oracle targets with `--ignored`, from the
+crate directory, because `cargo test` alone skips them and the one that
+reads this repository's own source needs that working directory.
+
+**Two of three, and the third is the same sandbox limit one row down
+rather than an omission.** `classify_parity.rs` imports
+`importer.scanner` out of the installed `templedb` package — through
+the `PYTHONPATH` that package's own launcher exports, which is what
+makes it diff against the same `scanner.py` the sweep's `templedb`
+runs — and the sandbox has neither the package nor the launcher. The
+other two need only the standard library. So the `checkPhase` names its
+two targets one at a time rather than running a bare `--ignored` over
+the workspace, which would have picked the third one up the day it
+existed and failed the flake with something that reads like a broken
+check instead of a missing dependency. `just oracle` runs all three.
+
+**`clippy` is in `just check` and deliberately not in the flake**, and
+the line is drawn by build cost rather than by purity: `fmt` reads the
+source and needs no build at all, while `cargo clippy --all-targets`
+recompiles the workspace and its dependencies under a second driver
+inside a sandbox that shares nothing with the dev shell's `target/`.
+Both are hermetic and both are in the gate CI is pointed at; adding the
+expensive one to the cheap check would make the cheap check the slow
+one for no coverage this project does not already have.
+
+Verified running rather than merely compiling: the formatting check,
+every default test and the 5 sandbox-runnable oracle tests pass inside
+it. This sentence used to carry the sandbox's own per-target counts —
+"218 + 13 unit tests" — and they are gone rather than corrected, on
+step 32's rule: a build log is not a file this tree can read, so no
+number written here about one can be checked by anything.
+
+The 5 is `difflib_parity`'s 3 plus `clock_parity`'s 2, and it is now
+**two fewer than the 7 the paragraph near the top of this file
+counts** — which is `just oracle`'s figure and includes
+`classify_parity`'s 2. The two numbers describe different things and
+only one of them is gate-checked: the 7 is a count of `#[ignore]`d
+python3 tests in this tree, which `gate_counts.rs` asserts, and the 5
+is a count of what a *sandbox* can run, which nothing here can check
+for the reason the paragraph above gives. Said out loud because two
+numbers that used to be equal and are now not is exactly the shape of
+drift this file keeps finding in itself.
 
 Both `checks` and `packages` build with the same `rust-bin` toolchain
 the dev shell pins, through `makeRustPlatform`. The nixpkgs default
@@ -1459,11 +2360,24 @@ crates/templedb-db/    data layer, one module per command family
                        effect can be compared across two engines
   projects.rs          project list
   files.rs             file cat / ls
-  search.rs            search content — candidate SQL + orchestration
+  search.rs            search content — candidate SQL + orchestration;
+                       search files — one query over the view, and the
+                       ORDER BY Python does not have
   textsearch.rs        matching, BM25, snippets; no SQL, no backend
+  classify.rs          importer.scanner's 179-entry path classifier and
+                       its six-entry skip list, in order — the first
+                       module here whose subject is a Python module
+                       *constant*. Pure, path-only, no SQL, no backend
+  retype.rs            `file retype`'s read half: the query, the move
+                       grouping and the renderer. The ORDER BY Python
+                       does not have, for the second time
   summary.rs           summary's observation layer: facts only, no clock
   entities.rs          entity stats / explore / trace / search / paths
   source.rs            source snapshot / revisions
+  doctor.rs            doctor history, and the measurement of why
+                       doctor entities is not here
+  intent.rs            intent list / show — the two reads that moved
+                       edit_intents to all fourteen columns
   fuzzy.rs             project name resolution
   like.rs              LIKE-pattern escaping, shared by the three
                        modules that take a user string
@@ -1474,15 +2388,25 @@ crates/templedb-db/    data layer, one module per command family
   session.rs           resolve-or-decline: the session the caller named,
                        validated live. Two of Python's seven steps, and
                        never the two that write
+  checkouts.rs         which directory holds a project's content: the
+                       read half of the checkout-role resolver, as one
+                       pure function over rows plus three predicates.
+                       Two of Python's four purposes, and the one place
+                       TEMPLEDB_SESSION is read by name — because this
+                       lookup, unlike session.rs's, creates nothing
   writer.rs            PgWriter — the one writable handle, outside the
                        Store trait on purpose. Opt-in, scratch-only
   fileset.rs           `file set`: the first write, and its six guards —
                        the sixth being the auto-stage that `commit.rs`
                        below consumes
+  filerm.rs            `file rm`: one upsert, and the writer the
+                       deletion branch of `commit.rs` had been missing
+                       since step 20. Deletes nothing itself
   commit.rs            `vcs commit-staged`: the database half of Python's
-                       `vcs commit`, with the tree-dependent half refused
-                       and the branch head advanced by a compare-and-swap
-                       the trigger over there makes impossible
+                       `vcs commit`, with the tree-dependent half
+                       deferred, and the branch head advanced by a
+                       compare-and-swap the trigger over there makes
+                       impossible
   pgtext.rs            the NUL escape: SQLite TEXT holds U+0000 and
                        Postgres text cannot. No SQL, no backend
   testdb.rs            in-memory fixture (cfg(test))
@@ -1493,6 +2417,16 @@ crates/templedb-cli/   clap binary `templedb-rs`, formatting only
                        the VCS session pin
   summary_view.rs      summary's interpretation layer: facts plus an
                        instant to lines. Ages, colour, column widths
+  table.rs             Python's Command.format_table, byte for byte —
+                       the first module here whose subject is a Python
+                       *method* rather than a command. Deliberately not
+                       shared with project list, which has its own form
+                       and is documented as not byte-comparable
+  where_view.rs        `file where`'s tree half: the mirror probes, the
+                       overlay walk, and the rendering. The only module
+                       in the port that touches a filesystem — the two
+                       TempleDB roots it probes come from checkouts.rs
+                       above, not from a path built here
 scripts/
   parity-sweep.sh      every implemented invocation, against Python /
                        the other backend / a previous build — the count
@@ -1500,12 +2434,29 @@ scripts/
                        by searching it. Plus three stages for
                        the commands whose whole stdout cannot be
                        diffed: `summary` one pane at a time, the flag
-                       surfaces of 20 commands, and `project list`'s
-                       filters by which projects they select. Not run
+                       surfaces of 26 commands, and `project list`'s
+                       filters by which projects they select. And the
+                       tree fence, which runs the rows that read a
+                       directory between two digests of it. Not run
                        by `cargo test` — it needs the live database.
+                       Its *coverage* is, by sweep_coverage.rs below.
+crates/templedb-cli/tests/
+  sweep_coverage.rs    does the sweep still name every command this
+                       binary has? Hermetic — walks the binary's own
+                       --help tree and parses the script. Also checks
+                       the other direction: an exemption that has
+                       outlived its command suppresses nothing.
+  gate_counts.rs       do the numbers in README.md still describe this
+                       tree? Hermetic — counts `#[test]` per target and
+                       parses ten claims out of the prose above
+                       *Porting order*, itself included.
 crates/templedb-db/tests/
   difflib_parity.rs    CPython difflib as an oracle (needs python3)
   clock_parity.rs      SQLite julianday as an oracle (needs python3)
+  classify_parity.rs   importer.scanner as an oracle over 24,757
+                       generated paths, plus a coverage check that the
+                       corpus reaches every type the table can produce
+                       (needs python3 AND the templedb package)
   write_parity.rs      `file set` and `vcs commit-staged` against a real
                        Postgres, read back through the ported readers
                        (needs a server)
@@ -1871,7 +2822,2935 @@ Writes last, and only once the read layer is trusted.
 
     Still open from the report: nothing. Still open from Python's
     `file set`: **`--commit` / `-m`**, which runs the commit in-process,
-    and binary content.
+    and binary content. Both closed in step 22.
+
+22. **Done** — the last of `file set`, and the first measurement that
+    changed a plan rather than confirming one. Four items, 2026-10-29.
+
+    **`--commit` / `-m`.** `set_file` and `commit_staged` in **one**
+    transaction, where Python runs two. The flag implies `--stage`, the
+    default message is Python's `file set: <path>`, and the author
+    chain is the commit's rather than the write's — which is also
+    Python's, since its `Namespace(author=None)` sends `vcs commit` to
+    resolve its own. See *`--commit`, and why it is one transaction*.
+
+    **Binary content.** `Content::Binary` stores the bytes in
+    `content_blob` as a `binary_asset` with a NULL `content_text`, which
+    is the shape Python's scanner writes for the same file. The mojibake
+    guard does not run on it, and the line count is 0 rather than a
+    count of `0x0a` — both Python's, both with its reasoning. The branch
+    exists because a file that cannot be stored is one `materialize`
+    later deletes from the checkout as a stray, which is how
+    `.authinfo.gpg` broke a Nix build.
+
+    **`doctor history`**, which is a whole new command that cost no
+    table and no column: `invariant_checks` was already mirrored, and
+    the five columns it carries are exactly the five the command prints.
+    Its query names seven — `duration_ms` and `sample_issues_json` are
+    selected and thrown away, the same shape as `vcs log`'s
+    `files_changed`. Byte-identical across 9 variants.
+
+    **The sweep is checked by `cargo test` now**, which is the
+    *Known gaps* entry about it, closed from the only angle available.
+    The sweep itself still cannot be a test — it needs the live database
+    and the Python binary — but its *coverage* can be, and that is the
+    half that was silently rotting. See *Checking the checker*.
+
+    Two things were found rather than built, and both are drift in the
+    other direction — Python moved while the port was not looking, which
+    is the failure mode the audit's method exists for:
+
+    - **`--if-match` with a malformed argument exits 2, not 1.** This
+      port exited 1 on the strength of a split the README described in
+      detail and nobody had measured: "a malformed flag is bad input, a
+      mismatched one is a conflict". Python makes no such split — both
+      leave `set()` through the same `return 2`. Fixed, and the test
+      that asserted the wrong value now asserts the measured one. It is
+      step 12's work one command later: the exit statuses were closed
+      for the read layer and this one sat behind a flag no harness could
+      reach, because a write has no diffable stdout.
+    - **`project list --type`**, which Python grew and the flag-surface
+      stage reported the first time it ran after this work. Ported, with
+      `projects.project_type` as the one column the mirror gained — and
+      it is a different column from `project_category` with an
+      overlapping value, so the fixture and the sweep both test
+      `service` specifically. See *The two columns that nearly rhyme*.
+
+    Measured: 60 invocations against Python, **0 unexpected**, 21 of 21
+    flag surfaces, 13 of 13 project-list filters, 7 of 7 summary panes.
+    Cross-backend 57 of 57, and all 21 tables digest identically over
+    **242,515 rows**. 351 unit tests, 5 oracles, 42 write tests, `fmt`
+    and `clippy` clean, `nix flake check` passes.
+
+23. **Done** — `intent list` and `intent show`, 2026-10-30. Two reads
+    that cost no new table, and the first step here chosen by
+    *correcting* the queue rather than by following it.
+
+    The README had `intent cancel` queued as the thing that would
+    unblock `edit_intents`' two missing columns. That was wrong in a
+    specific and repeated way — the *Known gaps* entry, `mirror.rs`'s
+    table comment and the Postgres DDL's header all said the columns
+    were waiting on `intent cancel` and `vcs commit`, two **writes**.
+    `intent show` is `SELECT i.*` and prints both. A read was all either
+    column ever needed, and the port's own ordering rule — reads first —
+    had been pointing at the right step the whole time.
+
+    So the step is ordinary and the finding is about the queue: the
+    reasoning went stale because `edit_intents` arrived for `file set`'s
+    provenance, genuinely had a writer and no reader for two weeks, and
+    nothing re-checked the frame when `intent show` became portable. All
+    three sites are corrected. `edit_intents` is now at **all fourteen
+    columns** and off the writer-only exception list, which drops from
+    three tables to two.
+
+    **"All three sites are corrected" was two of three**, found
+    2026-11-17 by step 31 and corrected there. *Known gaps* and
+    `mirror.rs` were; the Postgres DDL's header paragraph still said
+    "Twelve of fourteen" and still named the two writes, eighteen days
+    after the columns it describes were added to the table directly
+    below it — with the correct account sitting in the same file beside
+    those columns. Left in place here with the correction beside it,
+    because the shape of the error is the entry's own subject: nothing
+    in the gate compares a projection comment against the column list
+    under it, so a count in prose decays silently.
+
+    **One deliberate divergence, and it is an ordering one.** Python
+    orders `intent list` by `created_at DESC` with no tie-break, and
+    `created_at` has second granularity. Measured: **32 of the 1,346
+    live `created_at` values are shared by two rows**, so the order
+    among those pairs is whatever the engine returns and `--limit` can
+    cut inside a tie group — which changes *which* rows appear, not just
+    their order. This port adds `id DESC`. The decisive argument is not
+    tidiness but that the port has two backends and the sweep measures
+    them against each other: without a total key, SQLite and Postgres
+    are free to disagree. See *The tie-break Python does not have*.
+
+    The newest tie group sits at **rank 134**, which is what makes the
+    byte diff still meaningful: every sweep row stays inside the first
+    134 rows, where Python is deterministic. Past that Python disagrees
+    with itself run to run, and a row there would be diffing against an
+    unstable oracle. Three candidate `-s` rows were rejected on exactly
+    that measurement — `-s 941`, `-s 1169` and `-s 1000` all have ties
+    inside their first 50 — which is a case of checking the filtered
+    view rather than only the unfiltered one.
+
+    Two smaller findings. **Python's `list` query selects eleven columns
+    and prints eight**: `base_revision`, `new_content_hash` and `author`
+    never reach stdout. That is the fourth select-and-discard in the
+    port and the widest, after `doctor history`'s two and `vcs log`'s
+    one — enough instances now that "what does the command print" is a
+    better guide to the subset than "what does the query select". And
+    **`intent show` exits 1 on a missing id** where `source snapshot`
+    and `entity explore` exit 2 for the same class of miss; Python's is
+    a bare `return 1`, so the port reproduces the inconsistency rather
+    than tidying it, and a sweep row pins it.
+
+    `intent create`, `apply` and `cancel` stay unported. All three are
+    writes, and `apply` carries the three-way merge `file set
+    --if-match` also does not have.
+
+    **The sweep's coverage test caught this work before the parity run
+    did**, which is step 22's half-day of machinery paying for itself:
+    `cargo test` failed with "these commands are in the binary and in no
+    sweep invocation" the first time the new commands compiled.
+
+    Measured: **72 invocations against Python, 0 unexpected** (up from
+    60), 23 of 23 flag surfaces, 13 of 13 project-list filters, 7 of 7
+    summary panes. Cross-backend **72 of 72**, and all 21 tables digest
+    identically over **245,352 rows**. 374 tests across the workspace —
+    23 new — 5 oracles, 42 write tests, `fmt` and `clippy` clean,
+    `nix flake check` passes.
+
+24. **Done** — `vcs diff --staged` and the bare `vcs diff <proj>`,
+    2026-10-31. **Zero schema cost**: no new table, no new column, no
+    new machinery, and both renderers reuse the difflib and
+    unified/context output that steps 8 and 10 already built.
+
+    Both had been listed as not ported since step 9, and this is the
+    second step running whose work was mostly *finding out the stated
+    reason was wrong*. Three sites said so. The *Status* table grouped
+    `--staged` with "the working-set form" as one gap; they are not one
+    gap, and neither is tree-dependent. The sweep's flag allow-list
+    exempted `--staged` because it "needs the staging session, which is
+    a write and six environment fallbacks" — and `_diff_staged`
+    resolves no session and writes nothing. That exemption is the worse
+    of the two, because the allow-list exists so that a *closing*
+    divergence is surprising, and a wrong entry is what makes it
+    invisible instead.
+
+    Measuring also turned up that **`file` was a required positional
+    here and Python's is `nargs='?'`** — a divergence the flag-surface
+    stage structurally cannot see, since it parses the `options:` block
+    and never compares positional arity. Second blind spot in that
+    stage, alongside commands only one side has.
+
+    **One upstream bug, reproduced and reported.** `_diff_staged`
+    selects `ws.content_hash AS staged_hash` and uses it in one of its
+    three branches; the `modified` branch builds the side it labels
+    `(staged)` out of `file_contents.is_current` instead. All three
+    live staged rows diverge between those two hashes, so every
+    `--staged` diff of a modified file currently labels the database's
+    bytes as staged. The sibling `_diff_working` does it right two
+    screens away, which is what makes it a bug rather than a
+    convention. The `regr-test --staged` sweep row pins it.
+
+    **One tie-break added**, `vc.id DESC` on
+    `_get_last_committed_content`, same reasoning as `intent list`'s:
+    4 `(file_id, commit_timestamp)` groups hold more than one row, so
+    the committed side was arbitrary and could differ across the two
+    backends. Verified to change no current output.
+
+    The two forms keep two renderers rather than one parameterised
+    one, because three of their behaviours genuinely differ — the new
+    side, the empty-content test, and what an unknown state does. See
+    *The two forms that were never blocked*.
+
+    Measured: **84 invocations against Python, 0 unexpected** (up from
+    72), 23 of 23 flag surfaces with the `--staged` exemption
+    **removed** rather than retained, 13 of 13 project-list filters,
+    7 of 7 summary panes. Cross-backend **84 of 84**, and all 21 tables
+    digest identically over **246,080 rows**. 384 tests across the
+    workspace — 10 new — 5 oracles, 42 write tests, `fmt` and `clippy`
+    clean, `nix flake check` passes.
+
+25. **Done, in part** — `intent cancel`, 2026-11-03. The third write
+    and the smallest: **no new table, no new column**. `edit_intents`
+    arrived for `file set`'s provenance in step 17 and gained its last
+    two columns to `intent show` in step 23, so this writes a column
+    the port already mirrors and already reads.
+
+    That is the point of doing it, and it is about verification rather
+    than effort. `cancelled_at` had one live row behind it and was
+    verified only by the cross-backend digest over the copy — the
+    weakest claim available. Writing it and reading it back through
+    `intent show` *and* `intent list` closes the same loop that turned
+    `vcs_working_state` from the weakest-verified table in the subset
+    into the strongest.
+
+    **A compare-and-swap, where Python checks and then acts.** Python
+    reads the status, decides, then issues an unconditional
+    `UPDATE … WHERE id = ?`; two concurrent cancels both pass the guard
+    and the second overwrites the first's `cancelled_at`. This port
+    puts the guard *in* the UPDATE — `WHERE id = $1 AND status =
+    'proposed'` — and reads the row afterwards only to decide which of
+    Python's two refusals to report. Both exit statuses are reproduced
+    (1 for a missing id, 2 for a terminal status) without reproducing
+    the race. Same shape as step 20's branch-head CAS and easier to
+    justify, because no trigger is racing the application here.
+
+    **It is also the first write whose flag surface the sweep can
+    see.** `file set`'s shape differs and `vcs commit-staged`'s name is
+    the port's own, so neither can be compared; `intent cancel` shares
+    Python's name, so `--help` resolves on both sides. Flag surfaces
+    went 23 → 24, and to 25 when `file where` landed on 2026-11-05.
+
+    Measured: 48 write tests, **6 new**, all cross-read — the write is
+    read back through the two ported readers rather than through a
+    query written for the test, including through `intent list`'s
+    `status = 'proposed'` filter, so the write is observable in the
+    *view* and not only in the columns.
+
+**Steps 26 onward are not written yet, and the list stops naming them
+on purpose.** What it does name, as of the 2026-10-31 decision, is the
+*shape* of what is left, because the thing that kept going wrong was a
+step's blocked-reason outliving the blockage — four times now. So:
+
+    What is left of step 25 — everything else that is not a tree, all
+    of it unblocked: ~~`search files`~~ (**done, step 30**; it cost
+    `file_types` as the 23rd table and `files_with_types_view` as the
+    second view, and needed the ordering divergence argued because
+    Python's query has **no
+    `ORDER BY` at all** under a hardcoded `LIMIT 100`, so *which* 100
+    rows appear is arbitrary for any pattern matching more),
+    ~~`intent create`~~ (**done, step 31**; zero schema cost, and the
+    first write here whose stdout was measured against Python's rather
+    than inferred from its source), ~~`apply`~~ (**done, step 33**;
+    zero schema cost again, and the item's stated blocker — "needs a
+    merge engine this port does not carry" — dissolved on being
+    measured rather than being settled: the engine is not a three-way
+    merge, so the step is a *refusal* with evidence instead of a
+    feature with a dependency. That is the fifth time a queued step's
+    blocked-reason has outlived the blockage, and the first where the
+    reason was wrong about the thing itself rather than about which
+    command would unblock it), `summary`'s agent-fleet pane once the
+    subset reaches its tables, and the rest of the ~270 subcommands
+    that touch no filesystem. This is most of what remains.
+
+    With `apply` done, **`intent` and `source` are both complete and
+    `file` is at 5 of Python's 10** — counting `cat`, which is an alias
+    for `show` over there, as covering both. (6 of 10 since 2026-11-18;
+    see step 34 — and **7 of 10 later the same day**, see step 35.)
+    What is left of `file`
+    sorts into two halves rather than one, and the first draft of this
+    sentence got it wrong by calling them all tree work: `edit` and
+    `checkout` do touch a filesystem and belong to step 27, but ~~`rm`~~
+    (**done, step 34**; zero schema cost, and chosen from the three on
+    the one property the other two lack — the commit's deletion branch
+    had been reachable only from hand-written fixture SQL since step
+    20),
+    `retype` and ~~`mark`~~ (**done, step 35**; zero schema cost again,
+    and the prediction below was the one in this list that held —
+    it named the property that made the step worth taking and the step
+    took it for that property) are **database writes** — a staged
+    deletion, a `file_type_id` rewrite and an `edit_mode` change. Those
+    three are unblocked today, and `retype` is the one that would move
+    the mirror, since `file_types` is carried at 2 of its 5 columns.
+
+    `mark` is the one with the shape `rm` turned out to have, and it is
+    worth naming rather than leaving to be rediscovered: its column,
+    `project_files.edit_mode`, is **already mirrored and already read**
+    — `file ls -l` prints it and `file ls --edit-mode` filters on it —
+    so it is another zero-cost write whose effect is visible through a
+    byte-diffed reader. `retype` is the expensive one of the three and
+    not because of the mirror: it needs `importer.scanner`'s
+    `classify_path` and `is_ignored_path`, which is a classifier rather
+    than a query, and it *creates* `file_types` rows for names it
+    cannot resolve.
+
+    **Step 35 kept this paragraph's promise and found one it had not
+    made.** The zero-cost claim and the byte-diffed-reader claim both
+    held — which is worth recording only because this list's tally runs
+    the other way: five queued reasons have outlived their blockage by
+    step 33's count, and this is a queued *reason to act* that was still
+    true when acted on. No new tally is started here; the point is that
+    the two kinds of stale note are not symmetrical, and a note saying
+    "do this because X" decays more slowly than one saying "cannot do
+    this because Y". What it did not predict is that `file mark` is the
+    first write with **no clock**, because the one timestamp it moves
+    is moved by a trigger on a column the subset does not carry. A
+    paragraph written from the mirror correctly described the mirror and
+    could not have seen the trigger; see *The mode that is spelled by a
+    NULL*.
+
+    The next step is still not named here, for the reason the
+    paragraph above gives.
+
+26. **Done, 2026-11-05, and it is a fence rather than a pin** — the
+    tree harness, plus its first consumer. Not a command. The byte-diff
+    method runs the two binaries sequentially, so a tree edited between
+    the invocations is a difference neither implementation produced.
+
+    This entry said "needs a fixture tree or a snapshot mechanism
+    first" and named `file where` plus "the 15 non-database checks in
+    `doctor entities`" as what it unblocks. **Two of those three claims
+    were wrong**, and finding out which cost less than building the
+    thing they recommended:
+
+    **A fixture was the wrong shape.** `checkout_matches_db` does not
+    read a fixed path — it loops every project and calls
+    `CheckoutRepository.resolve(id, PURPOSE_EDIT)`, which picks the
+    tree from the **`checkouts` table** and the ambient session. So a
+    fixture tree needs fixture rows, and those rows live in the SQLite
+    file this port must not write; point one side at a fixture and the
+    sweep compares Python-on-live against Rust-on-fixture, which
+    compares nothing. A fixture is also blind to the one check whose
+    subject is POSIX mode, because the content store carries no execute
+    bit. Two of resolve()'s three inputs were already solved: the
+    session by step 16's pin, which the sweep has used since, and the
+    table by being a read.
+
+    **It unblocks four `doctor entities` checks, not fifteen.** The
+    re-derivation above splits that bucket; only 4 of the 8 filesystem
+    checks read a checkout tree, and 8 others are blocked on the
+    verification backend instead.
+
+    **What was true is the churn.** Measured: 432 non-`.git` files
+    under `checkouts/` changed in 24 hours and 1,749 in seven days of
+    229,389. Real, but *bursty* — a `publish` moves a few hundred at
+    once and nothing moves between. So the harness detects rather than
+    prevents: digest the roots, run both binaries, digest again, and
+    retry up to three times. A row that churns through every attempt is
+    reported as `churned` and counted in neither `pass` nor
+    `unexpected`, because the tree moving says nothing about whether
+    the two implementations agree. Same argument as `summary_parity`
+    one substrate over. 471 ms per digest, four fenced rows, zero
+    churned on the first run.
+
+    **`file where` is ported** and is the first command in this port
+    that reads a filesystem — six sweep rows byte-identical including
+    the colour escapes, the `os.walk` ordering of overlay hits and all
+    three exit statuses. (This said "9 variants" and the sweep had six
+    rows; the count is corrected under *The first tree read*, where
+    step 29 took it to eight.)
+
+    What is still not started is the half this step was conflated with:
+    pinning a tree the port would *write*. Nothing here writes one.
+
+27. **Not started, and not without a design document** — the tree
+    layer: the workspace scanner, the checkout-role resolver, the
+    mirror-to-disk step. The 2026-10-24 report calls this "a different
+    project, not a harder version of this one", which is accurate about
+    its size and was being read as a refusal for a week. Same shape as
+    *The write path* report, which is what made step 15 tractable, and
+    the document comes before the code for the same reason.
+
+    The incidents are the argument for the document. `materialize`
+    deleted `.authinfo.gpg` as a stray and broke a Nix build; on
+    2026-09-24 a mirror-to-disk miss made a refresh classify a staged
+    file as deleted and the next commit hard-deleted its
+    `project_files` row — "announced Files: 2 and committed one". A
+    half-right tree layer destroys data rather than printing the wrong
+    bytes, which is a different failure class from everything above.
+
+28. **Not started** — the tree-touching commands (`materialize`,
+    `templedb commit <slug> <dir>`, the `project checkout-*` family,
+    `vcs commit`'s five filesystem guards), and then **cutover**: the
+    rename to `templedb`, the point at which `backend/sqlite.rs` is
+    deleted and the in-memory fixture question in 15b becomes live.
+    Nothing before this step competes with Python for authority, and
+    after it there is nothing to compete with.
+
+29. **Done, 2026-11-15, written up and gated 2026-11-16** — the read
+    half of the checkout-role resolver, which is `file where`'s two
+    mirror roots coming from the `checkouts` table instead of from two
+    paths built by hand. `checkouts` is the **22nd mirrored table**, at
+    seven of its nine columns, and `vcs_sessions` goes from two columns
+    to four.
+
+    **The number is higher than two steps that have not started, and
+    that is deliberate**: these numbers record landing order, and 27 and
+    28 are the *shape* of what is left rather than the next two things
+    to do. Nothing here needs 27's design document, because the
+    document is for the half that writes a tree. This half is a
+    `SELECT`, a `stat` and a pure function — and splitting it out is the
+    same move step 26 made when it took `file where` before the tree
+    layer.
+
+    **This step was chosen by the sweep rather than from the queue, and
+    it was a defect rather than a feature.** Measured 2026-11-15, `file
+    where` differed from Python on **three of its four tree-reading
+    rows**, in both directions at once: three `edit-work` lines that
+    Python prints and this did not, one `checkout ` line Python prints
+    and this did not (`woofsledger`, whose canonical tree is not at the
+    canonical path), and one `checkout ` line **this port invented**
+    (`nixos_anywhere_vultr_woofs`, where the hardcoded path exists and
+    is not what resolution picks). An invented mirror is the worse of
+    the two: the command exists to make drift visible, and it was
+    reporting drift between the database and a tree no other command
+    reads.
+
+    **It is the second time this port has fallen behind a moving
+    Python**, and the first one with a measurement standing behind the
+    mistake. Step 26 reproduced Python's `edit-work` probe as "can never
+    fire" and backed that with a count of the data the probe depended on
+    — "none of the 24 project directories under that root holds a file
+    at depth 1" — which was true, is still true, and never bore on the
+    question, because upstream had already moved both labels onto
+    `CheckoutRepository.resolve`. The heading *The one place this port
+    fell behind Python* is now *The first place*. See *The resolver the
+    hardcoded paths were standing in for* for the resolver, the two
+    purposes deliberately not ported, and the one session variable this
+    module reads where `session.rs` refuses it.
+
+    Measured 2026-11-16, after the fix: **92 invocations against Python,
+    0 unexpected**, 87 stdout-identical with 23 differing on stderr
+    only, 14 deliberate; **25 of 25 flag surfaces**, 13 of 13
+    project-list filters, 7 of 7 summary panes, and **6 of the 92 rows
+    fenced with 0 churned out**. Cross-backend **92 of 92**, and **all
+    22 tables digest identically over 274,270 rows** after a
+    `pg-reschema` and a full re-mirror. 411 tests across the workspace —
+    **18 new**, 15 of them the resolver's branch table and 3 the probe
+    paths it feeds — 5 oracles, 48 write tests, `clippy` clean,
+    `nix flake check` passes.
+
+    **`cargo fmt --check` is not clean, and it was not this step.** It
+    reports two hunks, both in `files.rs:161`–`169`, both from step
+    26's `current_hash` test — over-long `assert_eq!` lines rustfmt
+    wants wrapped. They are left alone here because the file is
+    otherwise untouched by this step, and they are named because this
+    README has claimed "fmt and clippy clean" in four step entries and
+    a reader is entitled to know when it stops being true. The reason
+    it survived eleven days is that **`just check` does not run
+    `cargo fmt`** — see *Known gaps*.
+
+    The "411 tests" above is two high; the figure was **409**, measured
+    with `cargo test -- --list` on 2026-11-17 by subtracting step 30's
+    twenty from 429. Left in place with the correction beside it rather
+    than silently edited, because what it demonstrates is the entry's
+    own point one line up: nothing in the gate counts tests either.
+
+30. **Done, 2026-11-17** — `search files`, which the list above has
+    named as the next read since 2026-10-31. The **23rd mirrored
+    table** (`file_types`, at two of five columns) and the **second
+    view** (`files_with_types_view`, at five of seventeen columns). It
+    is the first table in the subset reached only through a view: no
+    query in either implementation selects from `file_types` directly,
+    so the boundary moved for a join rather than for a projection — and
+    the DDL header had named that table, by name, as an example of
+    where the boundary should *not* be dragged. A reader appeared, so
+    it moved; that is the rule working rather than an exception.
+
+    **The ordering divergence the queue predicted is real, and smaller
+    than it sounded.** Python's query is `WHERE file_path LIKE ?
+    LIMIT 100` with no `ORDER BY` at all, so which hundred rows it
+    prints is the planner's choice — not merely an unstable order but a
+    different answer. This port adds `ORDER BY id`, and the reason that
+    is the right key rather than `(project_slug, file_path)` is a
+    measurement: SQLite returns exactly the `ORDER BY id` sequence
+    today. Over **702 comparisons** — 26 patterns unfiltered and 26
+    across each of 26 project slugs, **71 of them matching more than
+    the hundred** so the cut actually bites — Python's output and this
+    port's agree row for row, **0 mismatches**. Any other total key
+    would have reordered every row of every table for no gain.
+
+    What makes it *incidental* on Python's side, and therefore worth
+    saying out loud, is that the agreement does not depend on one plan:
+    unfiltered, SQLite scans `project_files` by rowid, and under `-p` it
+    drives from `projects` through `idx_project_files_project_id` — two
+    different plans, both ascending by rowid, neither promised. This
+    port has two backends and the sweep compares them, so a Postgres
+    sequential scan returning heap order would have been free to
+    disagree about *which* hundred. `id` is the only total key the view
+    carries that also reproduces Python.
+
+    **The cross-backend sweep earned its keep, on a bug the byte-diff
+    structurally cannot see.** Written the faithful way — a bare
+    `file_path LIKE ?` — the query found `bza/NIX_FLAKE_GUIDE.md` for
+    `search files flake` on SQLite and not on Postgres, because
+    SQLite's `LIKE` folds ASCII case and Postgres's does not. Python
+    has one engine, so a diff against it would have passed forever. The
+    fix is `entity search`'s shape, `LOWER(file_path) LIKE <folded
+    pattern>`, which agrees on both: SQLite's `LOWER()` is ASCII-only
+    and so is Postgres's on a `COLLATE "C"` column — measured, both
+    return `École_Ä.md` for `ÉCOLE_Ä.md`. The pattern is folded with
+    `to_ascii_lowercase`, **not** `to_lowercase`, and that one-word
+    difference from `entity search` is itself a parity decision: there
+    Python calls `.lower()` and the port reproduces its half-working
+    full-Unicode fold, here Python folds nothing and SQLite's `LIKE`
+    does not fold non-ASCII either, so folding further would make this
+    port match where Python does not.
+
+    **One deliberate divergence, and it is the widest instance of this
+    bug class the port has found.** Python interpolates `f"%{pattern}%"`
+    raw, so `_` is a wildcard: `search files get_` returns ten rows and
+    **not one of them contains `get_`** — `docs/GETTING_STARTED.md`,
+    `get-booking-availability/index.ts`, `getDialpadOpts.mjs`. `set_`
+    gives 321 against a ground truth of 5, `api_` 128 against 4, and
+    1,112 of the 2,780 live paths hold a literal underscore. Same bug
+    `entity search` (858 against 256) and the `file ls` prefix had, both
+    fixed upstream; this is the copy still live. Escaped here, with the
+    `search files get_` row in the sweep's EXPECTED list so that
+    upstream converging is a surprise rather than a silence.
+
+    **Two upstream findings, neither fixed here.** `search files` lists
+    **deleted** files: `files_with_types_view` has no `status` filter
+    where `file ls` and `search content` both do, so all 373 live
+    `status = 'deleted'` rows are findable and print identically to a
+    present file. It is the only file-listing surface in either
+    implementation that does this, and the
+    `search files src/main.py -p templedb-rust` row pins it — a path
+    `file ls templedb-rust` does not show. And **Python's `search`
+    module is the one command family that never resolves a project
+    name**, which falsified a blanket claim this README had carried near
+    the top ("every Python command does"). `search files -p` is
+    therefore an exact slug here too; `search content -p`, which already
+    shipped resolving fuzzily, is left alone and moved to *Known gaps*
+    rather than changed from a step about something else.
+
+    **`format_table` had to be ported first**, which is why this step
+    touches `templedb-cli`. `crates/templedb-cli/src/table.rs` is
+    Python's `cli/core.py:348` byte for byte — the first module here
+    whose subject is a Python *method* rather than a command. The parts
+    that matter are the ones a plausible renderer gets wrong: the header
+    labels are the raw column keys, the rule is `'-' * len(header)` and
+    so spans the separators, the last column is padded like the others
+    so most rows end in spaces, and `str(None)` is the literal word
+    `None` — which 576 of the 2,780 live `lines_of_code` values are, so
+    it is the common case and not an edge. It is deliberately **not**
+    shared with `project list`, whose own form is documented as the one
+    implemented command that is not byte-comparable; routing that
+    through here would close a gap this README argues against closing,
+    from a step that is about something else.
+
+    Two smaller things. The command has **no `--limit`**, because
+    Python's hundred is hardcoded — unlike its FTS path, which applies
+    no limit at all and is why `search content` has the flag. So the
+    flag surface agrees exactly and needs no allow-list entry, and when
+    the hundred does cut the list this says so on **stderr**, leaving
+    stdout identical; Python's `(100 results)` reads as "there are a
+    hundred" for the 536 files matching `.py`. And the unfiltered form
+    selects `lines_of_code` and never prints it — the **fifth**
+    select-and-discard in this port, and the first where the discarded
+    column is printed by the *other* form of the same command, which is
+    why one query serves both here where Python runs two.
+
+    Measured: **101 invocations against Python, 0 unexpected** (up from
+    92), 95 stdout-identical with 24 differing on stderr only, 15
+    deliberate; **26 of 26 flag surfaces**, 13 of 13 project-list
+    filters, 7 of 7 summary panes, 6 of the 101 rows fenced with 0
+    churned out. Cross-backend **101 of 101** after the `LOWER()` fix
+    and 100 of 101 before it. **All 23 tables digest identically over
+    277,295 rows** after a `pg-reschema` and a full re-mirror. 429
+    tests across the workspace — **20 new**, 11 the query's and 9 the
+    table renderer's — 5 oracles, 48 write tests, `clippy` clean,
+    `nix flake check` passes. `cargo fmt --all --check` reports the
+    same two `files.rs` hunks as 2026-11-16 and nothing from this step.
+
+31. **Done, 2026-11-17** — `intent create`, the fourth write and the
+    item this list has named as next since 2026-10-31. **Zero schema
+    cost**: no new table, no new column, no new view. `edit_intents`
+    arrived for `file set`'s provenance in step 17 and completed to
+    fourteen columns for `intent show` in step 23; `content_blobs` has
+    been written since the first write. Every column this command
+    fills was already mirrored, already read, and already verified.
+
+    **The method moved, and that is the part worth recording.** This
+    README has said since step 15 that a write "can never be
+    byte-diffed, ever" — Python writes SQLite and the port writes
+    Postgres, so there is no shared input. That is true of the *effect*
+    and it was being applied to the *output*, which does not follow.
+    Python's `TEMPLEDB_PATH` points it at any SQLite file, so a copy of
+    the live database is a sandbox it will happily write: `cp` the
+    483 MB file plus its `-wal` and `-shm`, run `intent create` against
+    the copy, and capture the bytes. Measured that way, the port's
+    stdout is **identical to Python's, byte for byte, with only the
+    intent id substituted** — 173 bytes for the plain form and 195 for
+    the `-m` plus `--base-rev` form, `diff` clean both times. Those
+    bytes are now pinned in `intent.rs`'s renderer tests rather than
+    described in prose.
+
+    It matters because reading the source would have got three things
+    wrong, and each is invisible in a `print(f"...")`: the label
+    padding is hand-counted and lands in **two** columns, not one
+    (`base:`/`new:`/`note:` at column 9, `Apply:`/`Cancel:` at 10 —
+    `{:<N}` over all five would align all five and differ on two
+    lines); there is a bare `print()`, so line six is empty rather
+    than absent; and the two hints name `templedb`, one of them for
+    `intent apply`, a command this port does not have. All three are
+    reproduced.
+
+    The technique does not generalise to the whole sweep and the
+    `UNSWEEPABLE` entry says so: repeating it on every run would mean a
+    sweep that writes, and a copy per row. It is a one-off measurement,
+    which is still strictly better than a reading.
+
+    **What the command deliberately does not do** is the other half of
+    why it was safe to land with `apply` unported. It writes
+    `edit_intents` and `content_blobs` and **nothing else** — no
+    `file_contents`, no `project_files`, no stage — and the test for
+    that is driven with a branch *and* a live session available, the
+    exact state under which `file set` stages. It also does not require
+    the path to exist: Python's `apply` is where a missing
+    `project_files` row becomes an exit 3, so a proposal against an
+    unregistered path is legal on both sides.
+
+    **The loop closes.** `write_parity.rs` has minted its `proposed`
+    rows with a raw `INSERT` since step 25, because "`intent create` is
+    not ported — the fixture has to mint the row the command
+    consumes". It is ported, and `a_created_intent_is_cancellable`
+    drives `create_intent` into `cancel_intent` with no SQL in
+    between. `Fixture::propose` stays, for `Fixture::stage`'s reason:
+    it can force a terminal status, which no ported command can.
+
+    Three divergences, and **none of them is new** — all three are
+    inherited from decisions already argued for `file set`, which is
+    what a precondition looks like from the far side:
+
+    - **The slug is exact where Python's is fuzzy.** `file set`'s
+      divergence, plus one reason that is forced rather than chosen:
+      the id is resolved inside the write transaction, because the
+      reader and the writer point at *different databases*.
+    - **The session is the resolved pin, not `int()` of the
+      environment.** Python's `_current_session_id` parses and
+      swallows and checks nothing; this port has one resolver and it
+      requires `ended_at IS NULL`. The copy made the three cases
+      measurable and they do not behave alike upstream — see
+      *A third thing the copy found* below, because one of them is a
+      bug and not a divergence.
+    - **`created_at` comes from the clock** where Python lets the
+      column default. The same value by construction, and the reason
+      step 13 came before any write.
+
+    What is *not* a divergence, and was checked rather than assumed:
+    the `TEMPLEDB_SESSION` warning `vcs log` prints is deliberately
+    absent here, because that variable changes nothing on either side —
+    Python reads `TEMPLEDB_SESSION_ID` and stops. A warning there would
+    be this port apologising for an answer that agrees.
+
+    **A third thing the copy found, and this one is an upstream bug.**
+    A stale `TEMPLEDB_SESSION_ID` naming no row makes Python's
+    `intent create` fail with **`Error: FOREIGN KEY constraint
+    failed`** and exit 1 — a raw constraint message with no mention of
+    a session, from a variable a script exports. Measured on the copy,
+    2026-11-17, and the three cases do not behave alike:
+
+    | `TEMPLEDB_SESSION_ID` | Python | this port |
+    |---|---|---|
+    | `notanumber` | `int()` raises, is swallowed, intent created with a NULL session, **exit 0** | exit 1, names the variable |
+    | `999999999` (no such row) | **`FOREIGN KEY constraint failed`**, exit 1, nothing written | exit 1, names the variable and where to get a live id |
+    | `1295` (a session that has *ended*) | intent created, **exit 0**, with the dead id in the column | exit 1, "references no live session" |
+
+    Three behaviours for one class of mistake, and the middle one
+    leaks a database error. The statuses happen to agree on that row —
+    1 and 1 — for entirely different reasons, which is the sort of
+    accidental agreement step 12's work exists to stop being mistaken
+    for a contract. Reported, not fixed here: Python is a different
+    project.
+
+    It also retroactively justifies a schema decision. The subset
+    declares **no FK** on `edit_intents.session_id` even though the
+    live schema does, on the recorded grounds that "the live constraint
+    is a latent bug rather than a guarantee" — `prune_sessions` guards
+    only `vcs_working_state` and would hit this FK on a batch delete.
+    Dropping it means nothing in the port's Postgres would refuse a
+    dangling id, so the liveness check in `session.rs` is the only
+    thing keeping one out. That was true of `file set` already and
+    nobody had said it: the FK's absence is safe *because* the
+    resolver is strict, and the two decisions have to move together.
+
+    **One upstream inconsistency, reproduced and reported.**
+    `intent create` **accepts empty content** and `file set` refuses
+    it. Measured on the copy: `printf '' | templedb intent create`
+    created intent #1627, recorded `patch_summary: 1 lines, 0 bytes`
+    and exited 0, where `file set` with nothing on stdin refuses
+    outright on the grounds that it is "almost always a pipe that
+    produced nothing". The two code paths never converged — `file set`
+    tests `if not content` and `intent create` tests
+    `if content is None`, so `-c ''` and an empty pipe both count as
+    content over there. Reproduced rather than harmonised, and in
+    *Known gaps*.
+
+    **And the line-count arithmetic is Python's second one.**
+    `_short_summary` is `decode().count('\n') + 1` with **no empty
+    case**, where `file set`'s line count has an explicit `0 if not
+    content`. So an empty proposal is `1 lines, 0 bytes` and the same
+    content through `file set` is 0 lines. One character apart in the
+    source, and a port that reused the other function would look right
+    and be wrong on one input. Measured, not read.
+
+    **A stale comment found and corrected, and it is this README's own
+    claim that was wrong.** Step 23 says of `edit_intents`' two late
+    columns that "All three sites are corrected" — *Known gaps*,
+    `mirror.rs`'s table comment and the Postgres DDL's header. Two of
+    three were. The DDL's header paragraph still said "Twelve of
+    fourteen" and still named `intent cancel` and `vcs commit` as the
+    unblocker for two columns the table below it has carried since
+    2026-10-30, with the correction sitting *in the same file* beside
+    the columns themselves. Eighteen days, and nothing in the gate
+    compares a projection comment against the column list under it.
+    Corrected, with the error kept rather than deleted.
+
+    The `status` column's comment is corrected too, and by this step
+    rather than by drift: it said "the writer only ever inserts
+    `'applied'`", which was true of one writer. All three values are
+    written here now — `'applied'` by `file set`'s intent, `'proposed'`
+    by this, `'cancelled'` by `intent cancel`.
+
+    **One statement extracted rather than copied.** The
+    `content_blobs` insert is now `fileset::store_blob`, called by both
+    writers. Its own comment is the argument: the two arms are written
+    as one statement *so that* a change to a shared column cannot reach
+    one and miss the other, and two copies in two modules is a worse
+    version of the same hazard than two arms in one. The `file set`
+    tests pass unchanged through it, including the NUL round-trip, and
+    `proposed_content_with_a_nul_round_trips` is the assertion that
+    sharing it did not cost the new path `pgtext`'s escape.
+
+    Measured: **101 invocations against Python, 0 unexpected**
+    (unchanged — a write adds no sweep row), 95 stdout-identical with
+    24 differing on stderr only, 15 deliberate; **27 of 27 flag
+    surfaces** (up from 26, and with **no allow-list entry**: all four
+    of Python's flags are ported and none was invented), 13 of 13
+    project-list filters, 7 of 7 summary panes, 6 of the 101 rows
+    fenced with 0 churned out. Cross-backend **101 of 101**, and **all
+    23 tables digest identically over 279,009 rows**. **59 write
+    tests, 11 new**, every one of them cross-read — the proposal is
+    read back through `show_intent` and `list_intents` rather than
+    through a query written for the test. `clippy` clean.
+    `cargo fmt --all --check` reports the same two `files.rs` hunks as
+    2026-11-16 and nothing from this step; this step's four changed
+    `.rs` files were formatted before it landed, with `rustfmt` on the
+    files rather than `cargo fmt --all`, so the two pre-existing hunks
+    are still there for whoever next edits `files.rs`.
+
+    **The test count is 502 and step 30's "429" does not reconcile.**
+    Measured here with the command that entry names — `cargo test
+    --workspace -- --list | grep -c ': test'` — which reports 502 on
+    this tree. The delta this step contributes is **20**: 9 unit tests
+    in `intent.rs` for the renderer and the summary arithmetic, and 11
+    write tests. Counting `#[test]` attributes across the DB's copy of
+    every `.rs` file — a method a reader can re-run without a build —
+    gives 483 before this step against 503 after, which agrees with the
+    delta and not with 429. Step 30's figure is therefore low by about
+    fifty and this does not re-derive how; what it does is name the
+    method beside the number, because the entry two above this one is
+    itself a correction of a test count and the lesson evidently did
+    not take. **Nothing in the gate counts tests**, which is the
+    standing reason any figure here decays — the same gap as the
+    `cargo fmt` one.
+
+    **That "503" is one high, and the reason is worth more than the
+    one.** Found by step 32 hours later, which had to pick a counting
+    rule a test could apply: `grep -c '#\[test\]'` counts a line of
+    `sweep_coverage.rs`'s own module doc, the one that says "the sweep
+    should become a `#[test]`, and it cannot". The attribute count is
+    502, not 503, and it then agrees with `cargo test -- --list`
+    exactly rather than approximately — per target as well as in total.
+    So the sentence above is right that the two methods disagree with
+    429 and wrong that they agree with each other. A file about testing
+    talks about tests, and a count of a thing is not a count of
+    mentions of it.
+
+32. **Done, 2026-11-17** — the gate's own bookkeeping. Not a command,
+    no schema cost, no query touched, and no divergence from Python
+    either way: the subject is this repository's checks and this
+    document's numbers. It closes the two *Known gaps* entries that
+    were about the gate rather than about Python, and it is the step
+    that entry asked for in those words — "the *gate* is the actual
+    gap … which is the argument for fixing the gate rather than the
+    hunks".
+
+    **Two checks that existed and were not wired in.** `just check` and
+    `just check-all` now start with `cargo fmt --all --check` and
+    `cargo clippy --all-targets -D warnings`, cheapest first, and
+    `nix flake check`'s `checkPhase` runs the first of the two. Both
+    were things this README claimed — four step entries say "fmt and
+    clippy clean" — and nothing ran either, which is how two
+    `assert_eq!` hunks in `files.rs` survived twelve days and three
+    steps that each declined to reformat a file they had not otherwise
+    changed. That rule was right every time it was applied; what it
+    could not do was end. The hunks are formatted here because here
+    they fail a check.
+
+    `clippy` is in `just check` and **deliberately not** in the flake.
+    `fmt` reads the source and needs no build; `cargo clippy
+    --all-targets` recompiles the workspace and its dependencies under
+    a second driver in a sandbox that shares no `target/` with
+    anything. Measured in the dev shell at **1.5 s incremental and
+    clean**, which is why it belongs in the gate at all, and the
+    sandbox figure is the one that would not be incremental.
+
+    **And a test whose subject is this README.**
+    `crates/templedb-cli/tests/gate_counts.rs` — 7 tests, hermetic, no
+    database and no interpreter — counts `#[test]` attributes per
+    target and compares them against **ten numbers** parsed out of the
+    prose above *Porting order*: the test total, each of its four
+    parts, the two `#[ignore]`d groups and their split, and a second
+    statement of the total 1,800 lines further down that had been
+    **296 against an actual 438** since some earlier revision. It also
+    checks the breakdown sums to its own total, which is prose against
+    prose and is the half that catches a total edited without its
+    parts — step 31's mistake.
+
+    It reads the prose rather than a machine-readable block, for
+    `sweep_coverage.rs`'s reason: parse the authoritative artifact
+    instead of keeping a second copy, and here the artifact is the
+    sentence a reader believes. The cost is that the anchors are
+    fragments of English, so rewording one fails a test — deliberately,
+    with a message saying to re-aim it. One convention falls out and is
+    now house style: **a gate-checked number is written as a numeral**,
+    because the parser looks for digits. That is why the *Status*
+    paragraph no longer says "Five more are `#[ignore]`d".
+
+    Its region stops at `## Porting order` **on purpose**. Everything
+    below that heading is a measurement taken on a date; step 22's "351
+    unit tests" is not a claim about this tree, and a gate that forced
+    those numbers forward would destroy the record this README keeps
+    deliberately — every entry above that left an error in place with
+    the correction beside it.
+
+    **Sabotage-tested four ways**, because a check that cannot fail on
+    demand is not evidence of anything: a total edited by one (caught
+    by two tests, one of them as a prose-internal contradiction), a real
+    `#[test]` added to `value.rs` (caught, naming all three numbers it
+    moved), an anchor reworded (caught as "occurs 0 times", with the
+    instruction rather than a wrong number), and a new integration
+    target nothing claims (caught by the direction an exemption list
+    cannot check by being consulted). All four messages name the cause;
+    none of them points at the README when the tree is what moved.
+
+    **The finding is about counting, and it is one the step had to
+    settle before it could assert anything.** The two methods this
+    README has used disagreed: `cargo test --workspace -- --list |
+    grep -c ': test'` reports **502** and `grep -c '#\[test\]'`
+    reports **503**, and the extra one is a doc comment in
+    `sweep_coverage.rs` *discussing* `#[test]`. Step 31 had reported
+    the second as agreeing with its delta hours earlier. The rule the
+    test uses — the attribute alone on its line — reproduces `--list`
+    exactly, 502 for 502, and **per target as well as in total**: 381,
+    51, 6, 59, 3, 2. A unit test pins the rule against a sample whose
+    third line is the mention that caused the problem.
+
+    **What stays uncounted is named in *Known gaps* rather than left to
+    be inferred from a passing test**: the sweep's invocation count,
+    because three rows are discovered at run time; every count
+    describing the live database; and what a test covers rather than
+    whether it exists. Where the gate cannot count, this step's rule is
+    to stop claiming — the two `justfile` recipe descriptions that said
+    "all 54 invocations" while the sweep ran 101 now give no number,
+    and the sweep still prints the one it ran.
+
+    **And the gate's own report turned out to carry one of these.**
+    This run read **17 deliberate** where step 31 read 15, with nothing
+    changed in between, and the number had to be decomposed rather than
+    copied: **9 of the 17 are flag-surface pairs** — every entry of
+    `FLAGS_EXPECTED`, which moves only when a flag does — and the other
+    **8 are invocation rows that differed on this run**, three of them
+    the `intent list --all-statuses` rows whose difference depends on
+    where the newest `created_at` tie group sits in the live database.
+    Step 31's own commit put it at rank 4: six `file set` intents
+    written inside four seconds, #1629 and #1630 both stamped
+    `2026-11-17 21:38:01`. So the port's write path manufactured the
+    tie that moved the sweep's headline count forty minutes later, and
+    *The tie-break Python does not have* had already argued why the
+    rows are exempted by name instead of by argument choice. The *Checks*
+    section now tracks the 9 and not the 17 — a sum of a static list and
+    a live measurement is not a figure anyone can watch for drift.
+
+    Measured: **101 invocations against Python, 0 unexpected** (nothing
+    here touches a command), 93 stdout-identical with 24 differing on
+    stderr only, 17 deliberate as decomposed above; 27 of 27 flag
+    surfaces, 13 of 13 project-list filters, 7 of 7 summary panes, 6 of
+    the 101 rows fenced with 0 churned out. **509 tests across the
+    workspace, 7 new**, of which 445 run by default and 64 are
+    `#[ignore]`d. `cargo fmt --all --check` is **clean for the first
+    time since 2026-11-05**, and is now checked rather than claimed;
+    `clippy` clean and likewise checked; `nix flake check` passes.
+
+33. **Done, 2026-11-18** — `intent apply`, the fifth write and the
+    last of the intent family. **Zero schema cost**: no new table, no
+    new column, no new view, no new identity sequence — the third step
+    running at zero, and the one with the strongest claim to it.
+    `edit_intents` arrived in step 17 and completed in 23,
+    `file_contents` has been written by `file set` since step 15,
+    `content_blobs` since the first write, and `project_files` is
+    read-only here. Every column this command touches was already
+    mirrored, already read, already written and already verified.
+
+    It is the item the list above has named as next since 2026-10-31,
+    and the item three *Known gaps* entries have been deferring on one
+    sentence: it "needs a merge engine this port does not carry". **That
+    sentence was never measured, and measuring it is this step's
+    finding.** The engine exists upstream, it is called
+    `merge_resolver.ThreeWayMerge`, its docstring says "diff3
+    algorithm", and it is not a three-way merge. It walks base, ours
+    and theirs with three indices it advances in lockstep — one line
+    each, every iteration — so it is correct only while all three
+    versions have the same line count, and its loop never visits
+    anything either side added past the end of base. It also computes
+    two `difflib.unified_diff`s and reads neither: the sixth
+    select-and-discard in this README and the first in code rather than
+    SQL.
+
+    Measured against `git merge-file -p --diff3` over 11
+    `(base, ours, theirs)` triples: **3 agree.** 4 report a clean merge
+    and produce different text, 3 conflict where a real diff3 merges,
+    and 2 report clean where a real diff3 conflicts. The failures are
+    not conservative — 7 triples report clean, 5 of those 7 produce
+    text a three-way merge does not yield,
+    `rebase_onto_current`'s `merged == current_text` guard catches 1 of
+    the 5, and **4 reach `file_contents`**.
+
+    **And it was reproduced end to end, in the shipping command.** On a
+    copy of the live database: `templedb intent apply 1645` printed
+    `✓ Intent #1645 applied`, exited **0**, and left the file holding
+    `ONE/two/NEW/three` where base, ours and theirs had all held a
+    fourth line. Nobody deleted it. See
+    *The rebase this port refuses to do*, whose heading changed from
+    *does not* with this step.
+
+    So the divergence is decided rather than deferred: **a moved base
+    exits 4, always**, which is what Python's `--no-rebase` selects.
+    That is `file set --if-match`'s divergence one command over, and
+    the step did not make it — it gave it evidence. Reproducing the
+    engine would mean writing content neither the author nor the
+    database ever held, under a success message, into the one table
+    whose rows are the user's files.
+
+    **The non-stale path is byte-identical**, measured by step 31's
+    copy technique rather than read off the source: Python's two lines
+    for intent #1639, `cat -A`'d, then produced by this port against
+    the write scratch for the same content and `diff`'d clean with only
+    the id substituted — and the hash matched without substitution,
+    because both sides sha256 the same bytes. Three things in those two
+    lines a renderer from the source gets wrong: the path carries **no
+    project prefix** where `intent create`'s second line does, the
+    arrow is U+2192 with one space each side, and the hash is cut to
+    twelve.
+
+    **A second upstream bug, independent of the merge, and it is the
+    one that justifies the port's structure.** `intent apply` runs four
+    statements through a helper that commits each one, and the third is
+    `DELETE FROM file_contents WHERE file_id = ? AND is_current = 1`.
+    Measured on the copy: an intent whose `new_content_hash` has no
+    blob makes the fourth statement's scalar subquery yield NULL, it
+    fails `NOT NULL constraint failed: file_contents.file_size_bytes`,
+    exit 1 — and `templedb file cat` then answers *"Could not read file
+    content from database"* for a file that was intact a moment
+    earlier. The delete committed and the insert did not. This port's
+    apply is one transaction across both tables, so the same input is a
+    refusal that changes nothing. Pinned by
+    `a_proposal_whose_blob_is_gone_leaves_the_file_intact`.
+
+    **Two columns Python leaves behind, reproduced rather than
+    improved.** Its `INSERT` names four columns, so `line_count` is
+    left NULL and `version` falls back to `DEFAULT 1` — the row is
+    deleted and re-inserted rather than updated, so a file on version 7
+    is on version 1 after an apply. Both differ from `file set`, which
+    writes the line count and leaves the version alone. Verified on the
+    copy (`file_contents` row 49986) and pinned by a test whose helper
+    exists *because* `Fixture::stats` unwraps the line count and cannot
+    represent a NULL — asserting Python's behaviour through a reader
+    that cannot hold it is how the behaviour gets quietly fixed.
+
+    **`--no-rebase` is accepted**, which took a decision rather than
+    being free: what it selects is this port's behaviour either way.
+    It is not the `--no-fts` case — that flag would promise matching
+    the port cannot deliver, this one promises a refusal the port does
+    deliver — but it *is* inconsistent with `file set`, where the same
+    flag is absent and allow-listed. Both arguments are in
+    *The rebase this port refuses to do*; one of the two commands is
+    wrong and reconciling them is not this step. Flag surfaces go
+    **28 of 28** with no allow-list entry.
+
+    It also opened the **fourth blind spot** in the sweep's flag stage,
+    and this command is the first concrete instance rather than a
+    hypothetical: the stage compares flag *names*, so these two
+    surfaces agree perfectly while `--no-rebase` means different things
+    on the two sides. Stated in `parity-sweep.sh` beside the other
+    three.
+
+    **The loop closes a third time.** `create_intent` →
+    `apply_intent` → `read_file`, with no SQL between them, which is
+    the move step 21 made for the stage and step 31 for the cancel.
+    Only two of the twelve new write tests write SQL at all, and both
+    are for states no ported command can produce: a blob that has been
+    reaped, and a `project_files` row with no content beside it.
+
+    Measured: **101 invocations against Python, 0 unexpected**
+    (unchanged — a write adds no sweep row), 93 stdout-identical with
+    24 differing on stderr only, 17 deliberate; **28 of 28 flag
+    surfaces** (up from 27, with no allow-list entry), 13 of 13
+    project-list filters, 7 of 7 summary panes, 6 of the 101 rows
+    fenced with 0 churned out. Cross-backend **101 of 101**, and **all
+    23 tables digest identically over 281,416 rows** after a
+    `mirror-refresh`. **529 tests across the workspace, 20 new** — 8
+    unit tests for the renderer and the staleness branch table, 12
+    write tests — of which 453 run by default and 76 are `#[ignore]`d.
+    **71 write tests, 12 new**, every one of them cross-read: the
+    applied content is read back through `read_file`, `show_intent`
+    and `list_intents` rather than through a query written for the
+    test. `fmt` and `clippy` clean and both checked rather than
+    claimed; `nix flake check` passes.
+
+    Still open from Python's intent family: **nothing**. `create`,
+    `list`, `show`, `apply` and `cancel` are all here, which makes
+    `intent` the second command family complete at 5 of 5 after
+    `source`'s 2 of 2.
+
+34. **Done, 2026-11-18** — `file rm`, the sixth write. **Zero schema
+    cost**: no new table, no new column, no new view, no new identity
+    sequence — the fourth step running at zero. `vcs_working_state`
+    arrived in step 19 for a writer it did not yet have, got that
+    writer in step 21 and a reader in step 20; this writes four of the
+    nine columns already mirrored there, and every one of them has been
+    written and read back by this port for three weeks.
+
+    It is the first of the three database writes the list below has
+    named as unblocked since 2026-10-31, and it was chosen over
+    `retype` and `mark` on a property neither of those has: **it gives
+    an existing reader its missing writer.** `vcs commit-staged` has
+    handled `state = 'deleted'` since step 20 — it is the one path in
+    the system that hard-deletes a `project_files` row — and nothing in
+    this port could produce such a row. Every test of that branch had
+    to mint it with `Fixture::stage`, whose own doc comment says why:
+    *"still SQL, and still needed, for the states no writer
+    produces: a `deleted` row comes from a workspace scan."* That
+    sentence is now two-thirds true. The two corruptions the commit's
+    guards exist for still need SQL; the deletion does not, and
+    `the_loop_closes_when_file_rm_stages_its_own_commit` drives
+    `file set` → `file rm` → `vcs commit-staged` → `file cat` with no
+    SQL between any two of them.
+
+    **The stdout was measured, and then reproduced end to end.** Step
+    31's copy technique first: `cp` the 494 MB SQLite file plus its
+    `-wal` and `-shm`, point `TEMPLEDB_PATH` at the copy, run
+    `templedb file rm templedb-rust .gitignore`, `cat -A` the bytes. It
+    is one line, 35 bytes — `✓ Staged .gitignore for deletion`. Then
+    the same path through the port's own binary against the write
+    scratch, captured and `diff`'d against Python's file: **clean, with
+    nothing substituted**, which `intent create` and `intent apply`
+    could not claim because their lines carry an id. The bytes are
+    pinned in `filerm.rs`'s renderer tests.
+
+    What reading the source would have got wrong is one thing and it is
+    the kind only a sibling comparison exposes: the path carries **no
+    project prefix**. `intent create`'s first line has one, `file set`'s
+    has none, `intent apply`'s has none, and there is no rule — each is
+    whatever that function interpolates. So a caller who typed a fuzzy
+    project name cannot tell from `file rm`'s stdout which project was
+    staged.
+
+    **One deliberate divergence, and it is `file set --stage`'s.** No
+    session is a refusal here, where Python creates one. Measured on
+    the copy: with neither variable set, Python printed its success
+    line, exited 0 and left `vcs_sessions` **one row longer** — id
+    1331, minted to own a staged deletion. Unlike `file set` there is
+    no "write the content and stage nothing" half to fall back on,
+    because this command's entire effect *is* the stage, so there is
+    one outcome and no flag to make it conditional. The refusal carries
+    the `TEMPLEDB_SESSION` note that `intent create`'s deliberately
+    omits, and that is a measurement rather than a copy: Python's
+    `file rm` resolves through `get_current_session`, whose step 3 reads
+    the *name* variable and creates when none matches —
+    `TEMPLEDB_SESSION=zz-no-such-name templedb file rm …` exited 0 and
+    minted session 1333. Ignoring the name changes the answer here,
+    which is the condition the warning exists for.
+
+    **No flags, and that took a decision.** Python's `file rm` has none
+    beyond `-h`, and the obvious thing to give this port's stricter
+    version was a `--session` — `file set` has one, and here the
+    environment variable is the *only* way to supply the session the
+    command now requires. Not invented: it would have bought
+    convenience and a permanent `FLAGS_EXPECTED` entry, and the
+    surfaces agree exactly instead. Flag surfaces go **29 of 29 with no
+    allow-list entry**, which is `file where`'s missing `--no-color`
+    one command over.
+
+    **Python's session resolver here is the strict one**, which
+    falsifies a frame step 31 set up. `intent create`'s
+    `_current_session_id` parses with a swallowed `int()` and never
+    checks `ended_at`, so it answered three ways for one class of
+    mistake and the port diverged on all three. `file rm` goes through
+    `get_current_session`, which raises on both — measured on the copy,
+    `notanumber` gives `TEMPLEDB_SESSION_ID must be an integer, got
+    'notanumber'` and an ended session's id gives `references no live
+    session`, both exit 1, both **agreeing with this port's resolver
+    word for word on the first message**. So upstream has two session
+    resolvers with different strictness and the lax one is the odd
+    case, not the rule. Worth recording because the README's account of
+    that divergence was a sentence away from reading as "Python is lax
+    about sessions".
+
+    **Three things reproduced that a tidier port would have changed**,
+    all three verified on the copy rather than argued:
+
+    - **`content_hash` survives the upsert.** Python's
+      `DO UPDATE SET` names three columns and not this one, so a file
+      staged `modified` by an earlier `file set` keeps that write's
+      hash under a `deleted` state — the row for `.gitignore` held
+      `c20683…` before and after. It reads like an oversight and it is
+      load-bearing: the commit records that hash in
+      `vcs_file_states.content_hash`, so **the history of a committed
+      deletion names the bytes that were deleted** instead of the
+      `DELETED` sentinel. Both branches are pinned —
+      `a_staged_deletion_moves_three_columns_and_leaves_two_alone` and
+      `an_unstaged_file_deletes_through_the_sentinel` — and the pairing
+      is the finding: which of the two a deletion gets depends on
+      whether the caller staged the file first, not on anything this
+      command does.
+    - **`intent_id` survives too**, and that follows from the above
+      rather than standing on its own. Migration 088's link names the
+      intent whose hash the row holds; the hash does not move, so the
+      link stays correct. Clearing it would break the invariant step 21
+      went and fixed.
+    - **No `edit_intents` row at all.** Every `file set` records
+      provenance and a deletion records none, on either side — 1,647
+      intents before Python's `file rm` and 1,647 after. Reproduced:
+      inventing a row would put a `status` value in a column nothing
+      else in either implementation writes.
+
+    **A third copy of the active-branch lookup, and it is Python's
+    weakest.** `vcs commit`'s joins `vcs_branches`; the auto-stage's
+    does not; `file rm`'s does not either, and its `is_default = 1`
+    fallback is the only place it joins. So an `active_branch_id`
+    naming no branch row stages against a branch that does not exist
+    and `vcs commit`, which joins, then finds nothing staged. This port
+    calls the one shared [`active_or_default_branch`], so it joins
+    *and* refuses a pointer into another project's branch — two
+    divergences in the stricter direction, both latent: measured
+    2026-11-18, **no live project has an `active_branch_id` naming a
+    missing or foreign branch**.
+
+    **One message this step had to fix rather than add.** The
+    write-target session refusal ended with "or unset it to record the
+    intent with no session", which was true of both callers it had —
+    `file set` and `intent create` both proceed without one — and is
+    wrong for `file rm`, which refuses. Made generic rather than
+    specialised per caller, for `resolve_project_exact`'s stated
+    reason: a refusal that explains itself in another command's terms
+    is worse than one that explains less. It is the smallest instance
+    of the thing this list keeps finding — a true sentence that a later
+    caller makes false — and the only reason it was caught is that the
+    new caller was driven at the command line rather than only through
+    its tests.
+
+    **The heading above this document's status table said "four opt-in
+    writes" and there were five.** It has said four since step 31 and
+    `intent apply` did not revisit it. Corrected to six here, and named
+    because it is the *fifth* count in this README to decay — the four
+    that `gate_counts.rs` now catches were all test counts, and this
+    one is outside the region that test reads, in the heading of the
+    section it reads. Nothing counts commands.
+
+    Measured: **101 invocations against Python, 0 unexpected**
+    (unchanged — a write adds no sweep row), 93 stdout-identical with
+    24 differing on stderr only, 17 deliberate; **29 of 29 flag
+    surfaces** (up from 28, with no allow-list entry), 13 of 13
+    project-list filters, 7 of 7 summary panes, 6 of the 101 rows
+    fenced with 0 churned out. Cross-backend **101 of 101**, and **all
+    23 tables digest identically over 282,874 rows** after a
+    `mirror-refresh`. **541 tests across the workspace, 12 new** — 2
+    unit tests for the renderer, 10 write tests — of which 455 run by
+    default and 86 are `#[ignore]`d. **81 write tests, 10 new**, every
+    one of them cross-read: the staged deletion is read back through
+    `read_file`, `file ls`'s stats and the ported commit rather than
+    through a query written for the test. `fmt` and `clippy` clean and
+    both checked rather than claimed; `nix flake check` passes.
+
+    Still open from Python's `file`: `retype` and `mark`, both database
+    writes and both unblocked, plus `edit` and `checkout`, which are
+    step 27's. `file` goes from 5 of 10 to **6 of 10**.
+
+35. **Done, 2026-11-18** — `file mark`, the seventh write and the
+    smallest in the port: **one column on one row**. **Zero schema
+    cost** — no new table, no new column, no new view, no new identity
+    sequence — the fifth step running at zero.
+
+    It is the item step 34's list nominates, and it was named there on
+    the property that turned out to matter: `project_files.edit_mode`
+    is **already mirrored and already read**, by `file ls -l`, which
+    prints it, and `file ls --edit-mode`, which filters on it. That
+    makes it the only write here whose cross-read runs through output
+    the parity sweep *byte-diffs against Python*. Every other write in
+    this port is verified by a reader the port wrote for it — the
+    commit for `vcs_working_state`, `intent show` for `edit_intents` —
+    and both of those readers landed within days of the writer they
+    verify. This one reads back through a function that has been
+    byte-identical against Python since before the write path existed.
+
+    **All four of its stdout lines are byte-identical to Python's**, and
+    the measurement went further than `file rm`'s. Step 31's copy
+    technique first — `cp` the 498 MB SQLite file plus `-wal` and
+    `-shm`, point `TEMPLEDB_PATH` at the copy, run the four transitions
+    and `cat -A` each. Then a project and a path of the same names in
+    the write scratch, the port's own release binary driven over the
+    same four, and each stdout `diff`'d against Python's captured file:
+    **four of four clean, with nothing substituted.** `file rm` could
+    claim that for one line; `intent create` and `intent apply` could
+    not claim it at all, because their lines carry an id.
+
+    The four, with their byte counts:
+
+    ```text
+    ✓ templedb-rust/.gitignore: edit_mode immutable → hot-reload      65
+    ✓ templedb-rust/.gitignore: edit_mode hot-reload → hot-reload     66
+    ✓ templedb-rust/.gitignore: edit_mode hot-reload → live-symlink   68
+    ✓ templedb-rust/.gitignore: edit_mode live-symlink → immutable    67
+    ```
+
+    **No deliberate divergence in its own behaviour**, which is the
+    first time that sentence has been available here. `file set` is
+    stricter on five counts, `file rm` refuses a session Python creates,
+    `intent apply` refuses a merge, `intent cancel` and
+    `vcs commit-staged` are compare-and-swaps where Python checks and
+    acts. This one takes the exact slug every write here takes and
+    otherwise does what Python does. Its one implementation choice —
+    one statement rather than two — changes no output and is argued
+    below.
+
+    **The first write with no clock**, and that absence is the step's
+    main finding rather than a convenience. Step 13 built the clock seam
+    as a precondition for *any* write, and six writes have taken one
+    since. Python's statement here names one column; the `updated_at` it
+    also moves is moved by **a trigger** —
+    `update_project_files_updated_at`, one of the three on
+    `project_files` that are not cr-sqlite's. Measured on the copy: the
+    row for `.gitignore` held `2026-10-16 15:27:09` before and
+    `2026-11-19 03:33:59` after.
+
+    This port has none of the live database's 61 triggers and
+    `project_files` is mirrored at seven columns of which `updated_at`
+    is not one, so the bump is **not reproduced and cannot be without a
+    schema change.** It is the step-20 situation a second time — a
+    column written by a mechanism the port does not carry — and it came
+    out the opposite way, because the two cases differ on the thing that
+    decides it: the branch head has readers in both implementations and
+    a frozen one makes `vcs commit` find nothing, whereas
+    `project_files.updated_at` has **no reader in either
+    implementation**. The only two `SELECT`s naming it are in
+    `services/component_service.py`, which nothing imports and which
+    also selects two columns the table does not have.
+
+    **And it is not new.** `file set`'s un-delete arm is
+    `UPDATE project_files SET status = 'active'`, which has fired the
+    same trigger since the first write in step 15 and went a month
+    unrecorded. So the choice was not "reproduce it or not" but
+    "reproduce it *here*, and leave the older writer wrong" — which is
+    worse than two writers diverging identically and in writing, by the
+    rule step 30 used for `search content -p` and step 33 for
+    `file set --no-rebase`. It is in *Known gaps* with both writers
+    named and the two-part fix spelled out. The honest summary is that
+    this is the most latent divergence on that list and nothing in the
+    gate can catch the entry going stale, which is the prose-count
+    problem one layer down.
+
+    The other two triggers do not fire: `file_contents_fts_file_update`
+    is `AFTER UPDATE OF file_path, status`, so this is the first
+    `project_files` write in the port that touches no full-text index —
+    which is what made it the clean case to ask the column question on.
+
+    **One upstream bug, measured and reported.** Python's success line
+    interpolates `args.project` — *the string the caller typed* — and
+    resolves the row with `fuzzy_match_project`. Measured on the copy:
+    `templedb file mark templedb-RUST .gitignore --edit-mode hot-reload`
+    printed `✓ templedb-RUST/.gitignore: …`, exited 0 and wrote the
+    `templedb-rust` row. There is no `templedb-RUST`. The same
+    interpolation is in the command's `File not found:`. This port is
+    byte-identical anyway and by construction rather than luck —
+    `resolve_project_exact` accepts only the slug, so the typed string
+    and the written row's slug are one string, and the gap is confined
+    to inputs the port refuses outright.
+
+    It is the **mirror image of step 34's finding**, which is the pair
+    worth keeping: `file rm`'s line carries no project prefix and a
+    caller cannot tell which project was staged; `file mark`'s carries
+    one and it can name a project that does not exist. Neither is a
+    rule. Forty lines apart in one file, two interpolations, two
+    different answers to the same question — which is the second time
+    reading the siblings rather than the source was what caught it.
+
+    **One statement where Python has two**, and a measurement rather
+    than a principle. Python reads the row, decides, then issues an
+    unconditional `UPDATE`; this does the lookup, the read of the
+    replaced value and the write in one `UPDATE … FROM` with a
+    self-join, so `RETURNING` can hand back the pre-command value of
+    the column the statement is overwriting. The missing-file refusal
+    then falls out of `RETURNING` returning no row.
+
+    Explicitly **not** a compare-and-swap, unlike steps 20 and 25:
+    `mark` has no precondition on the old value, so there is nothing to
+    refuse and the window closed is a *reporting* one. What it buys is
+    measured by `a_racing_mark_reports_the_value_it_actually_replaced`
+    — a transaction that reads the row, has it changed under it, then
+    marks it reports the value it overwrote, where Python's shape
+    reports the one its own `SELECT` returned, a transition that never
+    happened. That test also names what it does **not** reach, because
+    the mechanism is easy to claim: a commit landing while the statement
+    is blocked on the row lock goes through Postgres's `EvalPlanQual`
+    recheck, and producing it needs two threads rather than two
+    transactions in sequence. Nothing here claims anything about that
+    interleaving. The first draft of this entry attributed the measured
+    result to the recheck and was wrong — the per-statement snapshot of
+    READ COMMITTED is sufficient to explain it.
+
+    **Four things reproduced that a tidier port would have changed**,
+    all four verified on the copy:
+
+    - **An unconditional write, including the no-op.** Marking a
+      `hot-reload` file `hot-reload` still issues the `UPDATE`, prints
+      `hot-reload → hot-reload`, exits 0 and fires the trigger.
+    - **A soft-deleted row is markable**, and the write is then
+      invisible to every reader either implementation has. Measured:
+      `templedb-rust/src/main.py` took `live-symlink` at exit 0, and
+      `file ls -l --edit-mode live-symlink` listed nothing, because
+      `file ls` filters on `status`. The only success among the seven
+      writes with no cross-read available, and the test asserts it *as*
+      that rather than skipping the case.
+    - **`immutable` is stored as a NULL**, so `file ls --edit-mode
+      immutable` does not match a row this command marked `immutable`.
+      Both halves are Python's, in two commands, and each reads like a
+      bug from the other's side. Pinned as a pair.
+    - **An empty-string `edit_mode` prints as `immutable`.** Python's
+      renderer is `row['edit_mode'] or 'immutable'`, which is falsiness
+      and not a null check. Caught by writing the test before trusting
+      the obvious `unwrap_or`, which would have been right on every
+      input this port can produce and wrong on one the table can hold.
+
+    **No flags invented, and the surface agrees exactly.** One flag on
+    each side — `--edit-mode`, required on both, three choices on both —
+    and no `FLAGS_EXPECTED` entry. The tempting fourth value is
+    `non-immutable`, which `file ls --edit-mode` takes and this must
+    not: upstream's two `choices=` lists genuinely differ, so the port
+    carries two enums rather than one. That divergence would have been
+    invisible to the sweep in any case — its flag stage compares
+    *names*, so a port-only flag **value** is a fifth blind spot, and it
+    is noted in `parity-sweep.sh` beside the other four. Flag surfaces
+    go **30 of 30**.
+
+    All four of Python's exit statuses reproduced and measured on both
+    sides: missing file 1, unresolved project 1, bad `--edit-mode` 2,
+    absent `--edit-mode` 2. The third is worth a note — Python's body
+    carries its own `valid = {...}` check returning 1, and it is
+    **dead code**, because argparse's `choices=` rejects the value
+    first. Measured: the bad value never reaches `mark()` at all, and
+    upstream's dispatcher reports it as `❌ Unknown command: 'bogus'`.
+    The status agrees at 2; the message is the port's own, like every
+    other stderr line here.
+
+    Measured: **101 invocations against Python, 0 unexpected**
+    (unchanged — a write adds no sweep row), 93 stdout-identical with
+    24 differing on stderr only, 17 deliberate; **30 of 30 flag
+    surfaces** (up from 29, with no allow-list entry), 13 of 13
+    project-list filters, 7 of 7 summary panes, 6 of the 101 rows fenced
+    with 0 churned out. Cross-backend **101 of 101**, and **all 23
+    tables digest identically over 284,097 rows** after a
+    `mirror-refresh`. **555 tests across the workspace, 14 new** — 5
+    unit tests for the renderer and the mode type, 9 write tests — of
+    which 460 run by default and 95 are `#[ignore]`d. **90 write tests,
+    9 new**, and every one of the nine cross-reads through `file ls`
+    rather than through a query written for the test. `fmt` and
+    `clippy` clean and both checked rather than claimed;
+    `nix flake check` passes.
+
+    Still open from Python's `file`: **`retype`**, plus `edit` and
+    `checkout`, which are step 27's. `file` goes from 6 of 10 to **7 of
+    10**, and `retype` is now the only database write left in the
+    family — the expensive one, and not because of the mirror: it needs
+    `importer.scanner`'s `classify_path` and `is_ignored_path`, which
+    is a classifier rather than a query, and it *creates* `file_types`
+    rows for names it cannot resolve. It is also the one that would
+    move the mirror, since `file_types` is carried at 2 of its 5
+    columns.
+
+36. **Done in part, 2026-11-19** — `file retype`, the item step 35
+    nominates, at its **read half**: the classifier, the query, the move
+    grouping and the renderer. `--apply` is not ported and is argued
+    below rather than deferred silently. **Zero schema cost** — the
+    sixth step running at zero — and the one step here whose *cost* was
+    a dependency rather than a table.
+
+    **The step entry step 35 wrote was wrong about which half is
+    expensive, and right that something was.** It called `retype` "the
+    expensive one … not because of the mirror: it needs
+    `importer.scanner`'s `classify_path` and `is_ignored_path`" and
+    predicted the mirror would move for the `file_types` rows the
+    command creates. Both halves of that hold. What it did not see is
+    that the two sit on **opposite sides of the dry/apply line**: the
+    classifier is all of the read and none of the write, and the
+    `file_types` insert is all of the write and none of the read. So the
+    expensive half and the schema-moving half are separable, and
+    separating them is what let the classifier land verified instead of
+    landing behind a re-mirror. Sixth time a queued reason has been
+    re-derived on contact; the first where the reason was *true* and
+    pointed at the wrong seam.
+
+    **The dry form is a read, and that is the whole reason this half
+    was worth taking first.** Python's `retype` is dry by default and
+    `--apply` writes, so the default form has a **diffable stdout** —
+    the only thing in the `file` family with that property that is not
+    already ported. Every write in this port had to be verified by
+    cross-read or by step 31's copy technique, because a write has no
+    stdout to diff. This one's entire answer is stdout, over 2,413 live
+    rows, so it goes in the sweep and gets byte-diffed like a read.
+    Nine rows, **0 unexpected**, exit statuses included.
+
+    **`classify.rs` is the first module here whose subject is a Python
+    module *constant*.** `table.rs` was the first whose subject was a
+    Python method; this is a 179-entry ordered list of
+    `(regex, type_name, test_func)` triples plus a six-entry skip list,
+    transcribed as a list and compiled, so the table diffs against
+    `scanner.py`'s line by line.
+
+    That decision cost the port's **first dependency that was not
+    already in `Cargo.lock`** — `regex`, plus three transitive crates —
+    and it is argued in the workspace manifest rather than slipped in.
+    The alternative was a hand-written matcher over the dozen shapes
+    the patterns actually use, rejected on verification grounds: it
+    turns all 179 entries into judgment calls, and `(^|/)Dockerfile\.`
+    being a path-*segment* prefix rather than a basename prefix is the
+    kind of mistake that looks like nothing in a review.
+
+    **The oracle is the deliverable as much as the module is, and it
+    earned that in the first run.** `classify_parity.rs` imports
+    `importer.scanner` — it does not restate it, because a transcribed
+    oracle only proves two transcriptions agree — and runs both
+    functions over a generated corpus of **24,757 paths**: 229 literal
+    basenames the table names, under twelve directory prefixes, with
+    eight suffix decorations and an Emacs-lock form. **0 mismatches on
+    `classify_path` and 0 on
+    `is_ignored_path`**, and the two table lengths compared against
+    CPython's `len()` rather than against a number written here.
+
+    It is the **third** CPython oracle and the first that needs more
+    than the standard library, so it is in `just oracle` and
+    deliberately *not* in `nix flake check` — the sandbox has no
+    `templedb` package. The `PYTHONPATH` is read out of the `templedb`
+    launcher on `PATH` rather than guessed, which is what makes the
+    oracle diff against the same `scanner.py` the sweep's `templedb`
+    runs.
+
+    **Three things the unit tests asserted from a reading of the source
+    and got wrong**, all three caught by the oracle on its first run,
+    all three now asserting the measured answer:
+
+    - **`readme` and `ReadMe` classify as `None`, not `readme`.** The
+      guard is `p.upper() == 'README'`, which reads as "any casing" and
+      *is* case-insensitive — and it is only consulted for a path the
+      pattern `README$` already matched, which is case-**sensitive**.
+      So the guard's tolerance is unreachable. A port that read the
+      guard would be wrong on two of three inputs; one that read only
+      the pattern would be right by accident.
+    - **The table has 179 entries, not 240.** Asserted from a glance at
+      the list. The oracle compares against `len()`.
+    - **The skip list has six patterns, not five**, because its last
+      source line holds two of them.
+
+    The lesson is an ordering one and it is the same one step 31 drew
+    about `intent create`'s renderer: the unit tests in `classify.rs`
+    are regression guards on an answer the oracle *establishes*, not
+    the establishment of it. Written the other way round they are 240
+    restatements of a misreading.
+
+    **One upstream bug, measured and reported: `pm2_config` is dead
+    code.** Found by the oracle's own coverage check, which asserts the
+    corpus reaches every `type_name` the table can produce and reported
+    exactly one it could not. `ecosystem\.config\.js$` → `pm2_config`
+    is entry 135; `\.js$` → `javascript` is entry 29, carries no guard,
+    and matches every string the later pattern can match, since a path
+    ending `ecosystem.config.js` ends in `.js` by construction. So no
+    path can ever receive that type.
+
+    Measured on the live database: `file_types` carries `pm2_config` as
+    id 131 in category `infrastructure`, **0 of the 2,786
+    `project_files` rows hold it**, and there is exactly one
+    `ecosystem.config.js` — which this command correctly proposes to
+    move to `javascript`. Reported, not fixed: the repair is a reorder
+    of `FILE_TYPE_PATTERNS`, which changes what every command that
+    classifies anything answers, and that is upstream's call.
+
+    A second entry is shadowed identically and is **harmless**, which
+    is the pair worth keeping rather than the single finding:
+    `templedb-deploy\.sh$` (138) is covered by `deploy\.sh$` (136),
+    which is unanchored at the start and yields the same
+    `deployment_script`. One dead rule changes an answer and one does
+    not, and the difference is whether the shadowing entry carries the
+    same name. The exclusion list in the oracle therefore holds one
+    name and not two, and it is asserted in **both** directions — a
+    name on it that becomes reachable fails the test, so upstream
+    reordering the table arrives as a surprise rather than a silence.
+
+    **A second upstream finding, and it is a stale docstring with a
+    live symptom.** Python's `retype` docstring explains the bug the
+    command exists to repair: `_get_file_type_id` used to fall back to
+    `SELECT id FROM file_types LIMIT 1`, and "that row is `api_route`,
+    which is how 495 rows across 10 projects … came to be recorded as
+    API routes". Measured 2026-11-19: the first row of `file_types` is
+    now **`ansible_inventory` (id 126)**, not `api_route` (id 18) —
+    migration 138 reseeded the table and moved it. The docstring names
+    the wrong culprit, and the live evidence is that 44 of the 88
+    changes this command proposes are `ansible_inventory -> …`. The
+    *mechanism* it describes is exactly right; only the row it names
+    has moved. Reported.
+
+    **One deliberate divergence, and it is `search files`'s shape with
+    teeth.** Python's query has **no `ORDER BY`**, and here the order
+    decides the answer rather than only its presentation:
+    `Counter.most_common(25)` breaks ties by first-encounter order,
+    which is row order, and the list is cut at 25 kinds.
+
+    Measured on live data: the unfiltered form finds **26 kinds of
+    change with 11 of them at a count of 1**, and the 25th and 26th
+    both have count 1 — so the cut falls **inside a tie group**, and
+    which kind prints versus which becomes `… and 1 more kinds of
+    change` is whatever the planner returned first. This port adds
+    `ORDER BY pf.id`.
+
+    `pf.id` because it is the key that reproduces Python, measured
+    across all three forms — unfiltered (2,413 rows), `-p
+    templedb-rust` (54) and `--from-type ansible_inventory` (44) —
+    where SQLite returns exactly that sequence today. So the clause
+    changes no current output. The decisive argument is the one step 30
+    made: this port has two backends and the sweep compares them, and
+    **110 of 110 cross-backend rows are identical** with the clause.
+    Without it, SQLite's rowid scan and a Postgres heap-order scan
+    would both be correct and free to disagree about *which rows
+    appear*.
+
+    **`--apply` is absent from the parser rather than accepted and
+    ignored**, and that took choosing between two precedents this
+    README already carries rather than following one. `search content
+    --no-fts` is listed absent because it would promise matching the
+    port cannot do; `intent apply --no-rebase` is accepted because it
+    promises a refusal the port delivers on every input. `--apply` is
+    neither shape: it switches **on** the only behaviour that writes,
+    so accepting it would mean `file retype --apply` exiting 0 having
+    written nothing — the silent divergence this project treats as its
+    one real defect. Refused at the parser, exit 2, one
+    `FLAGS_EXPECTED` entry.
+
+    The blocker is the **create** arm and not the update, which is
+    worth being precise about because "the write is not ported" sounds
+    like effort and is a schema boundary. `file_types.category` is
+    `TEXT NOT NULL` with no default; this port mirrors `file_types` at
+    **two of five columns**; Python inserts `(type_name,
+    'uncategorized', 'Auto-registered by file retype')`. So the faithful
+    insert needs the subset to grow two columns, a `pg-reschema` and a
+    full re-mirror, and an unfaithful one would write a row only this
+    port could read back. In *Known gaps* with the two-part fix.
+
+    **Four things reproduced that a tidier port would have changed**,
+    two of them unreachable on live data and unit-tested for that
+    reason:
+
+    - **A NULL `current_type` prints as the literal word `None`.** The
+      join is a `LEFT JOIN` and the comparison is `want ==
+      r['current_type']`, so a NULL is never equal to a target and the
+      row is *always* a change; the label is an f-string, so
+      `str(None)` reaches stdout. The fourth `str(None)` in this port
+      after `format_table`'s three. Measured: 0 of 2,413 active rows.
+    - **The debris block counts every ignored row and lists ten.**
+      Measured: 0 of 2,413 active paths match `SKIP_FILE_PATTERNS`, so
+      the block never prints on live data. Its `… and N more` is
+      `len - 10`, a *different* expression from the move list's
+      `len - 25`, and the two are off by one in opposite directions if
+      copied from each other.
+    - **Debris is excluded from the numerator and counted in the
+      denominator.** So a project of pure debris lists its debris and
+      then says `Nothing to re-type (N active file(s) checked)`.
+    - **`unresolved` counts paths considered, not paths changed.** A
+      path the classifier cannot name that is *already* `text_file`
+      increments the count and produces no move, so the trailing line
+      can report paths that appear nowhere above it. 9 against 88
+      changes on live data.
+
+    **`--from-type` is a condition on a `LEFT JOIN`ed column**, which
+    means it silently drops every row whose `file_type_id` is NULL or
+    dangling — the rows most likely to need re-typing. Python's, and
+    reproduced rather than moved into the `ON` clause.
+
+    **The project is fuzzy here**, unlike every write in this port.
+    That is not a relaxation of the exact-slug rule but the rule's
+    scope: the rule exists because a mis-resolved *write* overwrites a
+    file, and nothing here writes.
+
+    Measured: **110 invocations against Python, 0 unexpected** (up from
+    101 — 9 new rows, and the first new *sweep* rows since step 30,
+    because the five steps in between were all writes), 102
+    stdout-identical with 25 differing on stderr only, 18 deliberate;
+    **31 of 31 flag surfaces** (up from 30, and the first new command
+    since step 31 to arrive *with* an allow-list entry), 13 of 13
+    project-list filters, 7 of 7 summary panes, 6 of the 110 rows
+    fenced with 0 churned out. Cross-backend **110 of 110**, and **all
+    23 tables digest identically over 285,687 rows** after a
+    `mirror-refresh`. **578 tests across the workspace, 23
+    new** — 12 unit tests in `classify.rs`, 9 in `retype.rs` and 2
+    oracle tests — of which 481 run by default and 97 are
+    `#[ignore]`d. 3 oracles, 90 write tests unchanged, `fmt` and
+    `clippy` clean.
+
+    One gate note, and it is the gate doing its job rather than a
+    problem: adding an integration target made
+    `no_test_target_is_unaccounted_for` fail by name — "these test
+    targets hold tests and no README claim counts them:
+    `classify_parity`" — which is precisely what step 32 built it to
+    say. Three README numbers moved with it and the gate named all
+    three.
+
+    Still open from Python's `file`: **`retype --apply`**, plus `edit`
+    and `checkout`, which are step 27's. `file` stays at **7 of 10**
+    rather than going to 8, deliberately: a command with its write half
+    missing is not a ported command, and counting it would make the
+    tally the kind of claim this file keeps catching itself making.
+
+### The classifier, and the write that needs two more columns
+
+`file retype` is the first command in this port whose *answer* is
+mostly not a query. The SQL is four lines and a join; everything
+interesting is a 179-entry regex table walked in order, and the
+decisions worth recording are about how to be sure a transcription of
+that table is right.
+
+**The short version of what happened.** The module was written from
+`scanner.py`, its unit tests were written from the same reading, all
+twelve passed, and then the oracle found three of the assertions wrong
+on its first run. None of the three was a typo in a pattern — the
+patterns were transcribed correctly. All three were *descriptions* of
+what the patterns do, which is the failure mode a reading cannot catch
+and a differential test catches immediately.
+
+The sharpest is `README`. Its entry is
+`(r'README$', 'readme', lambda p: p.upper() == 'README')`, and read
+top to bottom that says "a file called README in any casing". It does
+not, because the guard runs only for paths the pattern matched and the
+pattern is case-sensitive:
+
+| path | CPython | what reading the guard suggests |
+|---|---|---|
+| `README` | `readme` | `readme` |
+| `readme` | **`None`** | `readme` |
+| `ReadMe` | **`None`** | `readme` |
+| `docs/README` | `None` | `readme` |
+
+Three of four wrong. The fourth is right for a different reason worth
+naming on its own: the pattern is unanchored at the start, so
+`docs/README` *does* match it, and then fails the guard because the
+guard compares the whole relative path rather than the basename. The
+`continue` falls through to `README\.md`, which needs the extension,
+and nothing below matches an extensionless name — so an ordinary
+`docs/README` classifies as nothing at all.
+
+That `continue` is the other thing a reimplementation gets wrong.
+Python's loop body is `if matched: if guard and not guard(p): continue;
+return name`, so a failed guard falls through to the *rest of the
+table* rather than returning `None`. Three of the four guards produce
+nothing without it: `\.sql$` + `'migration' in p.lower()` falls through
+to a bare `\.sql$` → `sql_file`, `\.ts$` + `'supabase/functions' not in
+p` falls through to `supabase/functions/.*\.(ts|js)$` →
+`edge_function`, and `settings\.json$` + `'.vscode' in p` falls through
+eventually to `\.json$` → `config_json`. Each pair is written as a
+guard plus a fallthrough where two ordered patterns would have done,
+and the fallthrough is load-bearing.
+
+**Why the corpus is generated and not sampled.** The live database has
+2,786 paths and they are overwhelmingly `.py`, `.ts`, `.md` and
+`.nix`: measured, they reach **74 of the 179 entries and 66 of the 164
+distinct type names**. A corpus sampled from the database would leave
+98 names untested — including every one of the four guards' negative
+branches. The generated cross product reaches **163 of the 164**, and
+the 164th is `pm2_config`, which is unreachable by construction.
+
+That last number is the part that makes the corpus checkable rather
+than merely large. A corpus can only be trusted if something fails when
+it shrinks, so the oracle asks CPython for the table's own name set and
+asserts the corpus covers it. Delete an atom and a name goes uncovered
+and the test says which. It is `sweep_coverage.rs`'s argument one layer
+down: coverage means a probe exists, and the only way to keep that true
+is to have a test whose subject is the coverage.
+
+**Three regex-dialect differences, two inert and one recorded.**
+Python's `re` and the `regex` crate agree across this table's whole
+feature set except for `$`: Python's matches at end of string *or*
+immediately before a trailing newline, Rust's only at end of haystack.
+So `a.py\n` is `python` upstream and `None` here, and `a.orig\n` is
+ignored upstream and not here. Measured: **0 of 2,786 live
+`file_path` values contain a newline**, and a path that did would be
+unopenable on the filesystem the column describes. It is asserted by a
+test rather than argued away, because a reader who assumes the two
+dialects agree on `$` will be wrong about exactly this and nothing else
+would tell them. Alternation semantics are inert because this module
+only ever asks *whether* a pattern matched, never what it matched, and
+`\d` is Unicode-aware on both sides and left that way.
+
+**Why the write half is a schema question.** `--apply` is two
+statements: resolve-or-create a `file_types` row per target name, then
+one `UPDATE project_files SET file_type_id = ?, updated_at =
+datetime('now') WHERE id = ?` per change. The update is ordinary. The
+create is not, and the reason is the subset boundary rather than the
+SQL:
+
+```sql
+CREATE TABLE file_types (
+    id INTEGER PRIMARY KEY,
+    type_name TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL,           -- no default
+    description TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+```
+
+This port mirrors two of those five columns, `id` and `type_name`,
+because the boundary follows the readers and `search files` reaches the
+table only through `files_with_types_view`'s join. Python inserts
+`(type_name, 'uncategorized', 'Auto-registered by file retype')`. So
+there are two options and neither is free: grow the subset by two
+columns, which needs a `pg-reschema` and a full re-mirror, or insert
+without `category`, which the live schema forbids and the port's own
+DDL would have to be weakened to allow — producing a `file_types` row
+that only this port could read back. The first is correct and is one
+step's work; the second is the kind of invention this project does not
+do.
+
+Worth noticing while the column is in view: Python's `retype` is the
+**one** `project_files` writer whose own statement names `updated_at`.
+`file mark`'s and `file set`'s do not — the trigger moves it behind
+them, which is the *Known gaps* entry step 35 opened. So when the
+subset does grow for this command, it grows for a writer that can set
+the column from the clock rather than one that needs a trigger
+reproduced, and the two halves of that gap close in the same change.
+It is the first time the `updated_at` entry has had a reason to move
+that is not just tidiness.
+
+### The mode that is spelled by a NULL
+
+`file mark` is the smallest write in this port and the one that asked
+the sharpest question, and the question is not about `edit_mode`. It is:
+**what does a port owe a column that a trigger writes and nothing
+reads?**
+
+The column is `project_files.updated_at`. Python's `file mark` does not
+name it; `update_project_files_updated_at` does, on every row update,
+and it is one of the three triggers on that table that are not
+cr-sqlite's. This port has no triggers at all — that was a boundary the
+write-path design document named on purpose — so a faithful port of the
+*code* leaves the column frozen, and a faithful port of the *behaviour*
+has to write it in the statement.
+
+Step 20 met this shape before and went the other way. The branch head is
+advanced by a trigger upstream; the port does the compare-and-swap in
+the application, and the entry argues that a port without the trigger is
+the only implementation that can do that CAS *correctly*, since Python's
+own comment records the trigger beating its code to the column. The
+difference between the two cases is not the mechanism, which is
+identical. It is the reader:
+
+- `vcs_branches.head_commit_id` is read by `vcs log`, `vcs show` and
+  `vcs commit` on both sides. A frozen head makes the ported commit find
+  nothing, which is a bug with a visible symptom.
+- `project_files.updated_at` is read by **nothing**. Not by any command
+  in this port, not by any command upstream — the two `SELECT`s that
+  name it live in a module nothing imports, and that module also selects
+  two columns the table does not have, which is how you can tell how
+  long it has been dead. Not by the state digest either, which digests
+  the mirrored projection, and the column is outside it.
+
+So the two decisions come apart on evidence rather than on taste, and
+the rule they share is the one the subset has always followed: the
+boundary follows the readers. Carrying `updated_at` for this write would
+make it the fourth column in the subset with a writer and no reader, and
+step 23 is the record of what that costs — `edit_intents` sat
+writer-only for two weeks and three separate comments went stale
+explaining why, each of them wrong about which command would close it.
+
+The part that decided it, though, is that **this write is not the first
+one to fire that trigger.** `file set`'s un-delete arm has been an
+`UPDATE project_files` since step 15. Fixing the bump for `file mark`
+and not for `file set` would mean two writers in one port diverging from
+upstream in two different ways, one of them documented and one of them
+not — and the undocumented one would be the older, more-used command.
+That is strictly worse than both diverging the same way with the
+divergence written down, which is what *Known gaps* now records.
+
+What makes the entry fragile is worth stating in the same breath:
+nothing in the gate can catch it. The sweep diffs stdout and no command
+prints the column. The cross-backend sweep compares two copies of the
+port against each other and both omit it. The state digest reads the
+projection the column is not in. `gate_counts.rs` reads prose. So this
+divergence is held by one paragraph in a 6,900-line file, which is
+exactly the class of claim this README has watched decay seven times —
+and saying so is the only guard available.
+
+The second thing the command turned up is smaller and is about method
+rather than about a column. Python's success line names the project the
+caller typed and resolves a different one; `file rm`'s names no project
+at all. Both were found by comparing the two commands to *each other*
+rather than by reading either one, which is now the second step running
+where sibling comparison caught what source reading would have got
+wrong. The generalisation is not "check the siblings" — it is that
+`print(f"...")` has no contract, so every renderer in the `file` family
+is its own measurement, and a port that factors them together is
+asserting an agreement upstream never made.
+
+### The deletion that deletes nothing
+
+`file rm` is a write whose entire effect is one word in one column, and
+the two things worth recording about it are both about what *else*
+would have been a reasonable implementation.
+
+**It could have soft-deleted the row, and that would have been
+unrecoverable.** `project_files.status` exists, `file ls` filters on it,
+and flipping it to `'deleted'` is what "remove this file" sounds like.
+It is also exactly wrong, and the reason is a guard three steps back:
+`file set`'s un-delete revives a soft-deleted row on the next write to
+that path. So a soft delete here would be undone by the next
+`file set`, silently, while the staged deletion that `vcs commit-staged`
+reads would never have been written. The caller would see the file come
+back and nothing would say why. Python stages, and the help text says
+what it is doing — "hard-delete on commit; history preserved" — which
+is the one sentence in that parser block that is load-bearing.
+
+**It could have cleared `content_hash`, and that would have cost
+history.** The column is stale by every ordinary reading: the row says
+`deleted` and carries the hash of content that is about to stop being
+current. But `commit_staged` reads that column and writes it to
+`vcs_file_states.content_hash`, with `'DELETED'` as the fallback — so
+leaving it is what makes a committed deletion record *which bytes were
+removed*, and clearing it would replace that with a sentinel. Python
+leaves it by omission; this port leaves it on purpose and says so, which
+is the difference between reproducing a behaviour and reproducing a
+line of SQL.
+
+The asymmetry that falls out is worth stating because no comment in
+either implementation does: **whether a committed deletion names the
+deleted bytes or the sentinel depends on whether the file was staged
+before it was removed.** `file set -s` then `file rm` names the hash;
+`file rm` alone names `DELETED`. Both are correct, both are Python's,
+and a reader of `vcs show` has no way to tell which happened.
+
+### Counting what the gate claims
+
+This is the second check in this repository whose subject is a check,
+and the first whose subject is this document. `sweep_coverage.rs` asks
+whether the sweep still covers the binary; `gate_counts.rs` asks
+whether the README still describes the tree. Both run in `cargo test`
+with nothing but the source, and both exist because the thing they
+check had no way to fail.
+
+**The decay is measured, not suspected.** Four consecutive test counts
+in this README were wrong: 393 when the figure was 409, step 29's 411
+when it was 409, step 30's 429 — correct the day it was written and 438
+a day later — and step 31's 502 sitting beside a breakdown that still
+summed to 429. Add the `cargo fmt` hunks, the Postgres DDL's "Twelve of
+fourteen" eighteen days after the columns landed, "two write commands"
+when there were four, "unit tests (296)" when there were 438, and
+"all 54 invocations" in the justfile when the sweep ran 101. Nine
+instances — eight of them numbers and one a pair of unformatted hunks —
+and every one of them a statement nothing in this repository could
+contradict. Not one was written carelessly, which is the pattern worth
+acting on: these are not mistakes of attention.
+
+**What a claim is.** Ten of them, each an English fragment that sits
+immediately beside a number:
+
+| the claim | counts |
+|---|---|
+| ``N tests run by `cargo test` `` | every `#[test]` less every `#[ignore]`d one |
+| ``N in `templedb-db`'s library`` | that crate's `src/` tree |
+| ``N in `templedb-cli`'s,`` | that crate's `src/` tree |
+| ``N in `tests/sweep_coverage.rs` `` | one integration target |
+| ``N in `tests/gate_counts.rs` `` | itself |
+| ``N more are `#[ignore]`d because they need `python3` `` | the three oracle targets' ignored tests |
+| ``N drive CPython's `difflib` ``, ``… `sqlite3` `` and ``… `importer.scanner` `` | each oracle target |
+| ``N more are `#[ignore]`d because they need a Postgres`` | `write_parity.rs` |
+| `unit tests (N)` | the total again, from the *Checks* table |
+
+The anchors are matched against README.md with every run of whitespace
+collapsed to one space, which is what lets a claim be a sentence rather
+than a line: this file is hard-wrapped at about 70 columns, so
+``51 in `templedb-cli` `` has a newline in the middle of it and a
+literal search finds nothing. Each anchor must occur **exactly once**,
+and that assertion is a check in its own right — two occurrences would
+make the number verified depend on which came first in the file.
+
+**Why the prose and not a declaration.** A block of counts in an HTML
+comment would be trivially parseable and would check the wrong thing.
+Nobody reads the comment; the sentence beside it is what a reader
+believes, so the sentence is what has to be checked. It is the argument
+`sweep_coverage.rs` makes about the sweep's bash arrays one layer down
+— parse the authoritative artifact, because a test carrying its own
+copy of the expected values passes while the artifact says something
+else. The price is that rewording a sentence fails a test. That is the
+right price: the failure says to re-aim the anchor, where the
+alternative is a claim that quietly stops being checked. One convention
+falls out of it and is now house style — **a gate-checked number is a
+numeral**, because the parser looks for digits.
+
+**Why it stops at `## Porting order`.** Everything below that heading
+is a measurement taken on a date, and this README's method is to leave
+a superseded number in place with the correction beside it rather than
+to edit it away. Step 22's "351 unit tests" is not a claim about this
+tree; forcing it forward would destroy the record. So the region ends
+at the heading and the checked claims are the present-tense ones. It is
+the one design decision here that a reader might otherwise take for an
+oversight, since the step entries are where most of the numbers are.
+
+**The counting rule, and the one it replaces.** A test is a line whose
+trimmed text is exactly `#[test]`. That reproduces
+`cargo test --workspace -- --list | grep -c ': test'` **exactly** —
+502 on 2026-11-17 before this file existed, and per target as well as
+in total: 381 + 51 + 6 + 59 + 3 + 2. The obvious shorthand does not.
+`grep -c '#\[test\]'` reports 503, and the extra one is
+`sweep_coverage.rs`'s own module doc saying *"the sweep should become a
+`#[test]`, and it cannot"* — a file about testing talks about tests.
+Step 31 had reported 503 as agreeing with its delta hours before this
+step measured it, so the rule is pinned by a unit test whose sample
+includes the mention that caused the problem, alongside a commented-out
+attribute and one inside a string.
+
+**Where each check lives, and why the line is build cost rather than
+purity.**
+
+| | `nix flake check` | `just check` |
+|---|---|---|
+| `cargo fmt --all --check` | yes | yes |
+| `gate_counts.rs`, `sweep_coverage.rs` | yes (in `cargo test`) | yes |
+| `cargo clippy --all-targets` | **no** | yes |
+
+`fmt` reads the source and needs no build at all, so it is free in both
+and goes first in both. The two self-checks are ordinary `#[test]`s and
+arrive in the flake for nothing. `clippy` recompiles the workspace and
+its dependencies under a second driver — 1.5 s incremental in the dev
+shell, a cold build in a sandbox sharing no `target/` — so putting it
+in the cheap half would make the cheap half the slow one for coverage
+`just check` already has. Stated here because an absence from a gate is
+exactly the thing this section is about: it is a decision, and this is
+where it is recorded.
+
+**What this does not count**, in *Known gaps* too and repeated here
+because a passing test is a bad place to learn what it did not check:
+the sweep's invocation count, because three of its rows are discovered
+at run time from the live database and nothing in this tree determines
+them; every count that describes a database rather than this source —
+mirrored tables, digested rows, the 1,346 live `created_at` values —
+because a hermetic test has no 483 MB SQLite file and no business
+asserting about one; and every claim about what a test *covers*, which
+is the same boundary `sweep_coverage.rs` draws when it says a row
+existing is not a row being good.
+
+### `intent create`, and the write whose stdout could be measured
+
+The command itself is small — one `INSERT … RETURNING`, one
+content-addressed blob, seven or eight lines of stdout — and the
+interesting part is the verification, so that is what this section is
+about. `crates/templedb-db/src/intent.rs` carries the rest.
+
+**The claim that was too strong.** This README has said since the
+write-path design document that "a write cannot be byte-diffed against
+Python, ever", and `UNSWEEPABLE` repeats it per command: "the sweep is
+a diff of stdout over a shared input and the two implementations write
+different databases, so there is no shared input". Every word of that
+is about the *effect* of a write — which row landed, in which database.
+It had also been read as covering the *output*, and the output is a
+different question: `intent create` prints eight lines that depend on
+the content, the flags and one generated id, and nothing about them
+needs the two implementations to share a database.
+
+**What made it measurable** is that Python resolves its database from
+`TEMPLEDB_PATH` — `config.py:13`, one `os.environ` lookup with no
+guard — so pointing it at a copy is a supported operation rather than a
+trick. The live file is 483 MB; `cp` of it plus `-wal` and `-shm` took
+under a minute, and `templedb intent list` against the copy returned
+the same two outstanding intents as against the original, which is the
+check that the copy is a database and not a torn page. Then **twelve
+`intent create` invocations** against the copy: the plain form, `-m`
+with `--base-rev`, `--from-file`, an empty pipe, a binary pipe, `-c`
+and `-f` together, a missing project, an unreadable `--from-file`, and
+four `TEMPLEDB_SESSION_ID` values — live, non-numeric, naming no row,
+and naming an ended session. Plus one `intent cancel` and an
+`intent show` of every row written, which is how the stored columns
+were read back.
+
+Nine of the twelve produced stdout or a status this port now
+reproduces exactly. The other three are the refusals whose *messages*
+differ, which is the gap this README already records — error wording is
+the port's own and goes to stderr, and the status is the contract step
+12 made. All three agree on the status: a missing project, an
+unreadable `--from-file` and undecodable stdin are exit 1 on both
+sides.
+
+The binary pipe is the one where reproducing the bytes was never
+available. Python's `sys.stdin.read()` raises `UnicodeDecodeError` and
+its CLI prints `Error: 'utf-8' codec can't decode byte 0x84 in position
+0` before exiting 1; this port says that stdin is not valid UTF-8 and
+that `file set` is the command that takes bytes. The three session
+values are the ones where the *behaviour* differs and not only the
+wording — see the table in step 31.
+
+**`intent create` is text-only on both sides, and that is a fact rather
+than a limitation here.** `file set` grew a `Content::Binary` arm in
+step 22 because Python's `file set` has one — it reads stdin as bytes
+and stores a `binary_asset` when they do not decode, which is what let
+`.authinfo.gpg` into the database at all. `intent create` has no such
+arm: `--content` is argv, `--from-file` is `read_text`, and the stdin
+path decodes. So the port takes a `&str` where `set_file` takes a
+`Content`, and refuses the bytes. Inventing a binary branch would store
+a blob Python cannot produce, under a hash an unported `apply` is
+supposed to read back.
+
+**It also settled a claim one step back, for free.** `intent cancel`'s
+success line was written from Python's source in step 25 and never
+compared against Python's bytes, because there was no way to get them.
+Run against the copy, `templedb intent cancel 1625` prints
+`✗ Intent #1625 cancelled` — `E2 9C 97`, U+2717 BALLOT X, one space
+either side of the id — which is byte for byte what `cancelled_line`
+produces. So that step was right, and it is now measured rather than
+inferred. The same copy would answer the same question for any future
+write whose output is a function of its arguments.
+
+**Why the copy is not now part of the sweep.** It would mean a sweep
+that writes, a 483 MB copy per run, and an oracle whose output includes
+an id that depends on how many times the sweep has run. The
+`UNSWEEPABLE` entry states the trade in those terms rather than
+repeating the old absolute: the stdout *was* measured, once, and the
+bytes are pinned in a unit test where they cost nothing to keep.
+
+### `search files`, and the order Python does not have
+
+`search files` matches on the path and reads no content, which makes it
+the cheapest read in the port and the one with the most decisions per
+line of SQL. The query is six lines; four of them are a divergence.
+
+The whole of it:
+
+```sql
+SELECT id, project_slug, file_path, type_name, lines_of_code
+  FROM files_with_types_view
+ WHERE LOWER(file_path) LIKE ?2 ESCAPE '\'
+   AND (CAST(?1 AS TEXT) IS NULL OR project_slug = ?1)
+ ORDER BY id
+ LIMIT 101
+```
+
+Against Python's two, which differ only in their projection and their
+filter:
+
+```sql
+SELECT file_path, project_slug, type_name, lines_of_code
+  FROM files_with_types_view
+ WHERE file_path LIKE ?
+ LIMIT 100
+```
+
+`LIMIT 101` rather than 100 is how the truncation is detected: one row
+past the cap is read and discarded, instead of a second `COUNT(*)` over
+the same predicate. The extra row is never rendered.
+
+`ORDER BY id` is argued in the step entry above and in `search.rs`. The
+short version is that it is not a tidying choice — without a total key
+the two backends are free to disagree about which hundred rows survive
+`LIMIT`, and `id` is the key that reproduces Python's incidental order
+at the same time.
+
+The `(CAST(?1 AS TEXT) IS NULL OR …)` form collapses Python's two
+queries into one, which it can do because the two differ only in what
+they print. That is also where the fifth select-and-discard lives: the
+unfiltered form never shows `lines_of_code`, and the filtered one does,
+so a single query selecting both and two projections over it is strictly
+less code than two queries — the first time in this port where "what
+the command prints" and "what the query selects" come apart *within one
+command*.
+
+What the view brings with it is not a choice at all, and both halves are
+reproduced rather than relaxed:
+
+  * **`file_types` is INNER joined**, so a file whose type is
+    unresolved is invisible. 0 of 2,780 live rows dangle, so the branch
+    is unreachable on live data and the fixture is the only place it can
+    be tested — beta's files carry a NULL `file_type_id` and are absent
+    from `search files` as a result. Python's own comment on the
+    *`search content`* FTS query records the opposite call for that
+    query, where an inner join on this table silently dropped indexed
+    files; the two queries genuinely want different joins, and this one
+    is the view's.
+  * **There is no `status` filter.** Covered above; the finding is that
+    `search files` is the only file-listing surface in either
+    implementation that reports a deleted file as present.
+
+And one thing the port declined to add: no FK from
+`project_files.file_type_id` to `file_types`, now that the table is in
+the subset and one could be declared. The view's inner join means a
+dangling id makes a file *invisible* rather than invalid, and that is a
+behaviour the two backends have to agree on; a FK would instead make
+`mirror` fail on data this port does not control. Same call the
+`project_category` CHECK gets, for the same reason — the mirror's job is
+to carry what is there.
+
+### The first tree read
+
+`file where` is the first command here whose answer is not a function
+of the database. It hashes the checkout copy, the edit-workspace copy
+and any `/nix/store` overlay copy of a path, and compares each against
+the hash `file_contents` holds. It writes nothing and resolves nothing,
+so it competes with the Python implementation for authority over
+nothing — which is why it lands before the tree *layer* of step 27 and
+not after it.
+
+**Eight sweep rows**, byte-identical including the ANSI escapes and all
+three exit statuses: drift in the checkout alone, an overlay hit that
+drifts alongside it, an overlay hit that drifts while the checkout
+matches, everything agreeing at exit 0, the two resolution rows step 29
+added, and the two exit-2 rows. Six of the eight read a tree and are
+fenced; the pair that does not is the exit-2 pair.
+
+That count said *nine* from 2026-11-05 and *eleven* for one day after
+step 29, and both were wrong in the same harmless way: the enumeration
+beside them has always listed the actual rows, and the number beside it
+was never recounted against `parity-sweep.sh`, which says eight in its
+own comment. Corrected rather than dropped, because a count nobody
+checks is the shape of defect this section is otherwise about.
+
+The exit-2 pair is **deliberately
+unfenced**, and that is why they are separate rows: Python returns
+before the probe loop when the database has no current row, so neither
+reads a tree at all. A change that made them read one would show up as
+a flapping row; a fenced row would hide it.
+
+**Two upstream defects are reproduced rather than fixed.** There were
+three; the third — the `edit-work` probe that could never fire — turned
+out to be a defect upstream had already repaired, and the entry that
+described it is now *The resolver the hardcoded paths were standing in
+for* below. The short version, because this section is where a reader
+will look for it: both mirror paths were built by hand here and both
+were wrong by 2026-11-15, and three of this command's four tree-reading
+sweep rows were failing because of it.
+
+**The docstring's depth cap does not exist.** It says the overlay walk
+is capped "to avoid runaway walks (spacemacs private/ is shallow
+anyway)". `os.walk` is called with no depth limit. Reproduced as
+written in code, not as described in prose.
+
+**Basename matching compares files that were never the same file.**
+The overlay probe matches `Path(path).name` against each directory's
+listing, so any `packages.el` under `~/.emacs.d` can be reported as a
+mirror of any tracked `packages.el`. That *is* the intent — the
+question is which copy Emacs loads, and the overlay does not preserve
+project layout — but one sweep row exists to pin it: `file where
+emacs-config emacs.d/layers/projdb/packages.el` reports drift against
+the **templedb** layer's `packages.el`, a different file that happens
+to share a name.
+
+**One divergence is the port's, and it is a hang that is not an
+output.** `os.walk(followlinks=True)` with no `seen` set walks a
+symlink cycle until it runs out of path length. This keeps a set of
+canonicalised directories and visits each once. It cannot show up in a
+diff, because the only case where the two differ is the one where
+Python has not finished producing output.
+
+**And one place the two are not comparable at all**: an existing file
+that cannot be read prints Python's `Exception` text in parentheses,
+and this prints its own. Same class as the error messages the known
+gaps list, reachable only for a file present and unreadable, and the
+only line in the command that is not byte-diffable.
+
+`--no-color` was deliberately **not** added. Python always paints and
+has no flag; `summary` has one and pays for it with a permanent entry
+in the sweep's flag allow-list, and there was no reason to buy a second.
+A byte-diff of coloured output is a byte-diff: flag surfaces went 24 →
+25 with no new divergence.
+
+### The resolver the hardcoded paths were standing in for
+
+This is the entry that used to say *the `edit-work` probe can never
+fire*. It was a correct reading of Python in September, a stale one by
+the time `file where` shipped on 2026-11-05, and the sweep is what said
+so — which makes it the clearest instance in this file of the method
+working on its own author.
+
+**What the sweep reported.** Measured 2026-11-15, before the change,
+`file where` differed from Python on **three of its four tree-reading
+sweep rows**, and two further slug/path pairs found by hand show the
+same defect pointing the other way — five cases, two directions:
+
+| slug and path | before |
+|---|---|
+| `templedb-rust README.md` | `edit-work` line missing |
+| `templedb integrations/emacs/templedb-agent.el` | `edit-work` line missing |
+| `system_config emacs.d/layers/templedb/packages.el` | `edit-work` line missing |
+| `woofsledger src/db.py` | `checkout ` line missing — its tree is its `repo_url` and not the canonical path |
+| `nixos_anywhere_vultr_woofs .envrc` | `checkout ` line **invented** — this port hashed a directory Python does not resolve |
+
+The last two were not sweep rows at the time and were found by walking
+the first files of every project through both binaries. They are now
+rows, and they are the two *directions* of one defect: a row that only
+caught the missing half would have passed while the port invented a
+mirror. The invented line is the worse failure, because the command's
+entire job is to say which copy of a file is stale, and it was
+answering about a tree nothing else reads.
+
+**What replaced them.** `CheckoutRepository.resolve` classifies the
+rows of `checkouts` by migration 113's `kind` and picks one per
+purpose. Live shape, measured 2026-11-15 and unchanged on 2026-11-16:
+**96 of 250 rows are active — 9 `canonical`, 80 `edit`, 7 `scratch`,
+no NULL `kind`** — and 69 of the 96 carry a `session_id`.
+
+| purpose | branch order |
+|---|---|
+| `Build` (Python's `PURPOSE_BUILD`) | newest extant `canonical`, else the newest extant row of any kind, else the newest row at all |
+| `Edit` (`PURPOSE_EDIT`) | an extant `edit` tree this session owns, else one no live session owns, else the `Build` answer |
+
+`crates/templedb-db/src/checkouts.rs` holds it as **one pure
+function**: every input that is not a database row is a parameter —
+`is_dir`, the ambient session, and `is_live` for a *row's* session — so
+the branch table above is testable without a filesystem, an
+environment or a session. Python reads `os.path.isdir`, `os.environ`
+and two further tables from inside the decision. 15 tests cover the
+branches, including the last-resort one where a `scratch` row wins
+because every other directory is gone.
+
+**The last fallback names a directory that is not there, and that is
+reproduced.** Python's final branch is `(extant(rows) or rows)[0]`: if
+no row's directory exists it returns the newest row anyway. The two
+agree because the *caller* skips a mirror that does not exist, so the
+missing line is the same on both sides — but the function does return a
+path to nowhere, and a future caller that trusts it will be wrong on
+both implementations equally.
+
+**The `repo_url` fallback is what the `woofsledger` row was about.** A
+project with no active checkout row falls back to `projects.repo_url`,
+"for projects whose working directory IS the repo", and **14 of the 26
+live projects are in that state** — so the hardcoded
+`checkouts/<slug>` path was not merely sometimes wrong, it was wrong
+for more than half the fleet. The guard inside the fallback is that
+`repo_url` is not always a path: **13 of the 26 carry a `://`**, such
+as `neko-lan-host`'s `templedb://neko-lan-host`. Reproduced including
+the shape of the test — Python's `'://' not in str(repo_url)` rejects a
+path with a `://` anywhere in it rather than only a scheme prefix.
+
+**Two of Python's four purposes are deliberately absent.**
+`PURPOSE_WRITE` exists to refuse — it declines to hand a writer the
+published tree — and `PURPOSE_SCAN` declines to adopt a stale tree,
+because a whole-tree scan records an absent file as a deletion. Both
+belong to step 27, both exist for writers, and neither has a reader
+here to verify it against. `Purpose` therefore has two variants rather
+than four with two unreachable: a future caller has to add the branch
+rather than discover that a guard it assumed was there is not. Python's
+three warnings are not reproduced either — they are stderr, where this
+README already records the wording as the port's own, and
+`_warn_if_behind` hashes up to 200 files to decide whether to print.
+
+**One tie-break added, and this time it selects nothing today.**
+`active` orders by `checkout_at DESC, id DESC`; Python orders by
+`checkout_at` alone and then takes `[0]` of whichever bucket it
+filtered into, so a tie decides *which directory a command reads*
+rather than the order of a listing. Measured 2026-11-15 and again
+2026-11-16: **zero of the 96 active rows share a
+`(project_id, checkout_at)` with another**, so the tie-break costs no
+parity and buys nothing measurable. It is here anyway, for the reason
+`intent list`'s is: `checkout_at` has second granularity, `templedb
+edit` writes a row per workspace, and two agents provisioning in the
+same second is an ordinary event. Staying inside a deterministic window
+is not a strategy when the window is a property of live data.
+
+**The one thing that will confuse the next reader**, stated here
+because the two functions are a single grep apart: `checkouts.rs`
+resolves `TEMPLEDB_SESSION` **by name**, which `session.rs` flatly
+refuses to do. They are not in tension.
+`VcsService.get_current_session` — what `session.rs` would have to call
+— *inserts* a row for a name it does not find, and a port that creates
+session rows has no read-only guarantee left to argue from.
+`CheckoutRepository.current_session_id` is a different function with an
+overlapping job, two `SELECT`s, and a docstring saying exactly that:
+"Resolving a path must not have the side effect of opening a session."
+So the name is readable here and refused there, on the same rule — the
+rule is about writing, not about the variable. Declining it here would
+have made this port probe a different directory from Python for every
+caller that exports the name, which is most of the agent wrappers in
+this system.
+
+**The mirror grew one table and one more reader for another.**
+`checkouts` arrives at seven of nine columns — `branch_name` and
+`last_sync_at` are selected by Python's resolution query and read by
+neither purpose ported here — and `vcs_sessions` goes from two columns
+to four, because resolving a session *by name* needs `name` and
+`started_at` where checking one by id needed `id` and `ended_at`. It is
+also the first table in the subset added because **a shipped command
+was wrong** rather than because a new command needed it.
+
+**What it cost the fence**, since `file where` is the one command here
+that reads a filesystem: the sweep's tree fence digests the roots a row
+reads, and two of those roots are now chosen at run time. Naming the
+enclosing directory instead was measured and rejected —
+`edit-workspaces/templedb-rust` was **70,806 entries** on 2026-11-15
+and **71,822** on 2026-11-16, and `edit-workspaces/templedb` is 57,046
+both days — because an edit workspace holds whatever the workspace
+holds, including the `target/` directory the sweep is writing into
+while it runs. The 1,016-entry move in one day is this port's own
+build, which is the argument rather than an aside: fencing those roots
+would make every row `churned`, which is to say unchecked. So one file
+per mirror label is outside the fence — a `stat` and a hash rather than
+a walk, the three overlay roots still fenced — and it is in *Known
+gaps* rather than left to be inferred from a passing row.
+
+**The lesson is narrow and it is not "read Python again".** A
+reproduced bug needs a check against the other implementation's
+*behaviour*. Step 26 had a measurement, and the measurement was of the
+state the behaviour used to depend on — the sort of evidence that makes
+a stale claim feel verified. `where_view.rs` also had a test for it,
+named `edit_work_probe_omits_the_session_directory_python_omits`, and
+what it asserted was that this port builds the path Python *used to*
+build — a test of the reproduction rather than of the parity, and one
+that would have gone on passing for as long as the reproduction stayed
+faithful to a September reading.
+The thing that actually caught it was the all-command sweep, run after
+a change to something else: the same mechanism, and the same month, as
+*The first place this port fell behind Python*.
+
+### `--commit`, and why it is one transaction
+
+Python's `--commit` runs two: `file set`'s write commits, then
+`VCSCommands().commit()` opens its own, and if the second fails the
+first has already landed. Its comment explains the one structural
+choice it does make — the call is in-process rather than a subprocess,
+"because a subprocess would fork a new session (ppid differs),
+defeating the whole point". That reason does not apply here, since this
+port resolves a session only when told one, so the question of how to
+compose the two halves was open rather than settled by precedent.
+
+One transaction, and the argument is that it costs nothing. The
+outcome Python's arrangement produces on a failed commit — content
+written, staged, uncommitted — is still reachable from this port: it is
+what `file set -s` does. So making `--commit` atomic removes no
+capability and buys what the flag's name claims, which is that either
+the content is committed or nothing happened.
+
+It also removes the one genuinely awkward interleave. With two
+transactions a `HEAD_RACE` lands the write, stages it, and exits
+non-zero — leaving a caller who asked for `file set --commit` to know
+that the remedy is a *different* command. The refusal's own text says
+"Nothing has been written", and under one transaction that sentence is
+true of the write as well.
+
+`a_refused_commit_rolls_back_the_write_that_asked_for_it` is the test,
+and it is written to be able to fail in both directions: the new path
+is asserted absent *and* a staged row from before the transaction is
+asserted untouched, so a rollback that took too much is as visible as
+one that took too little.
+
+**`--commit` commits the session, not the path.** The commit selects
+staged rows by `staged_by_session_id`, so anything an earlier
+`file set` in the same session staged goes with it. That is Python's
+behaviour exactly and Python says nothing about it; this prints a note
+when it happens, because `file set x --commit` reads as a claim about
+`x`.
+
+One thing it deliberately does not do: **stdout stays one line holding
+the content hash.** `vcs commit-staged` prints its commit id there
+because that is what its callers chain on, and here the caller chained
+on the content hash before this flag existed. A flag that changes the
+shape of stdout is how a script breaks without saying so. The cost is
+real and is not hidden — a `--commit` run cannot pipe its commit id,
+and a caller who needs it reads stderr or runs `vcs log -n 1`.
+
+### The intent reads
+
+`intent list` and `intent show` are two reads over one already-mirrored
+table, which should make them the least interesting step in this list.
+What makes them worth a section is that the README had the wrong thing
+queued, and said so in three places.
+
+The *Known gaps* entry read:
+
+> `edit_intents` is mirrored at twelve of fourteen columns, and the two
+> omitted are the ones a *reader* would want: `cancelled_at` and
+> `applied_commit_id`. They belong to `intent cancel` and to the commit
+> link `vcs commit` would make, neither of which is ported, so nothing
+> here could verify them.
+
+`mirror.rs`'s table comment said the two were "left to `intent cancel`
+and `vcs commit`", and the Postgres DDL's header listed `edit_intents`
+among three tables that follow the boundary rule "read sideways". All
+three name **writes** as the unblocker for two columns. `intent show` is
+`SELECT i.*` and prints both of them, so a pure read is what moved them
+from unverifiable to byte-diffed — the boundary rule exactly as written,
+*follow the readers*, with no sideways reading required.
+
+The failure is not that the rule was wrong. It is that `edit_intents`
+arrived in the subset for `file set`'s provenance record, so for two
+weeks it really did have a writer and no reader, and the sentence
+explaining its missing columns was written in that frame and then copied
+twice without being re-asked. By the time `intent show` was portable the
+explanation had become the reason not to look.
+
+That is the same shape as two earlier corrections here — the step-15
+entry that read `SqliteWriter` out of a superseded recommendation, and
+the `doctor` paragraph that was "wrong twice over" and eleven days stale
+when it was written. The pattern is specific enough to name: **a
+statement about why something is blocked outlives the blockage, because
+nothing re-derives it.** The audit's method exists for outputs drifting;
+this is prose drifting, and only reading the Python source again catches
+it.
+
+So the ordinary accounting. `edit_intents` is at all fourteen columns,
+the writer-only exception list drops from three tables to two, and the
+two commands are byte-identical across eleven invocations. `intent
+create`, `apply` and `cancel` are unported and all three are writes;
+`apply`'s three-way merge is the same engine `file set --if-match` does
+not carry.
+
+Two details found on the way:
+
+**Python's `list` query selects eleven columns and prints eight.**
+`base_revision`, `new_content_hash` and `author` never reach stdout, so
+the port's query names the eight and the mirror grew for none of them.
+That is the fourth select-and-discard in the port — `vcs log`'s
+`files_changed`, `doctor history`'s `duration_ms` and
+`sample_issues_json`, and now three at once — and the count has crossed
+the line where it is a habit rather than a curiosity: **what a command
+prints is a better guide to the subset than what its query selects.**
+
+**`intent show` exits 1 on a missing id.** `source snapshot`, `entity
+explore`, `entity trace` and `entity paths` all exit 2 for a
+well-formed question with a negative answer, which is what step 12
+established. `intent show` is a bare `logger.error(...); return 1` in
+Python, so there is no helper to inherit the 2 from. Reproduced at 1,
+because the contract is Python's status and not a consistent one, and a
+sweep row pins it so a later tidy-up shows up as a diff.
+
+### The tie-break Python does not have
+
+`intent list` carries this port's one open ordering divergence, and
+it is the third time the question has come up with a different answer.
+
+Python orders by `created_at DESC` and nothing else. `created_at`
+defaults to `datetime('now')`, so it has second granularity, and
+measured on the live database 2026-10-30: **32 of the 1,346
+`created_at` values are shared by two rows each.** Among those pairs
+the order is whatever the engine returns, and neither SQLite nor
+Postgres promises anything about equal keys.
+
+This port adds `id DESC`. Three reasons, in the order they actually
+decide it:
+
+1. **The port has two backends and the sweep compares them.** Without a
+   total sort key, `intent list --all-statuses` past the first tie is
+   free to differ between SQLite and Postgres. That is not a cosmetic
+   divergence, it is a failing row on an axis this README reports as 72
+   of 72.
+2. **`--limit` cuts inside a tie group**, so an untied order does not
+   merely reorder the output — it changes which rows appear at all.
+3. `id` is monotonic per insert, so within a tied second it recovers the
+   order the intents were proposed in, which is the question the command
+   asks.
+
+Compare the two precedents. `doctor history`'s `id DESC` tie-break was
+*already in Python*, with a comment explaining that a full `doctor
+entities` pass leaves ~44 rows sharing a timestamp — there, reproducing
+it was the work. `entity search` had no tie-break on either side, the
+port added one as a deliberate divergence, and the two converged when
+Python grew one of its own. This is `entity search` again at the same
+stage: a divergence that closes the day upstream adds four characters,
+and worth reporting there rather than carrying here indefinitely.
+
+**What it costs against the byte diff was measured, and then the
+measurement decayed in one day.** This is the more useful half of the
+story, so it is kept rather than tidied.
+
+On 2026-10-30 the newest tie group sat at **rank 134**, and the sweep
+rows were chosen to stay inside the first 134 — where both
+implementations are deterministic and a byte diff means something.
+That was true when it was written. On **2026-10-31** two intents landed
+at `2026-10-31 17:43:51`, the newest tie group moved to **rank 4**, and
+four sweep rows began differing. The sweep reported it as four
+unexpected differences, which is exactly right: the port's output had
+not changed and its claim about the oracle had.
+
+The lesson is not that the measurement was wrong. It is that **"stay
+inside the deterministic window" is not a strategy**, because the
+window is a property of live data and the data moves. A divergence that
+is permanent until upstream changes belongs in the sweep's `EXPECTED`
+list, where it is stated once and holds, rather than in a row's choice
+of arguments, where it has to keep being true. The three
+`--all-statuses` rows are exempted there now, alongside `entity
+explore`'s ordering and for the same reason.
+
+The narrow rows are deliberately *not* exempted. `intent list` with no
+flags is the default `status = 'proposed'` view — 2 of 1,356 live rows,
+small enough that a tie is unlikely rather than impossible. If one
+lands they move up to `EXPECTED` too, and that is the right failure
+mode: a new difference reported once beats a row quietly exempted in
+advance, which is the mistake the `--staged` allow-list entry made.
+
+Worth keeping from the original measurement, because it is still true
+and still a trap: check the **filtered** views, not only the unfiltered
+one, because a filter changes which rows fall inside the limit. Three
+candidate `-s` rows were rejected that way — `-s 941`, `-s 1169` and
+`-s 1000` each have tie groups inside their first 50.
+
+### The two forms that were never blocked
+
+`vcs diff --staged` and the bare `vcs diff <proj>` landed 2026-10-31 at
+**zero schema cost** — no new table, no new column, no new machinery.
+Both had been listed as not ported since step 9, and the reason given
+for each turned out to be wrong, in two different ways.
+
+The *Status* table said "`--staged` and the working-set form not
+ported", grouping them. They are not one gap. `_diff_working` and
+`_diff_staged` are both **pure database**: between them they read
+`vcs_working_state`, `project_files`, `file_contents`, `vcs_branches`,
+`vcs_file_states`, `vcs_commits` and `content_blobs`, every one of
+which has been in the 21-table subset since step 19. Neither touches a
+filesystem. The genuinely tree-dependent diff is a different thing
+again, and this README's section about it — *`vcs diff <proj> <file>`
+cannot ever show a diff* — is about the no-commits form and was never
+about either of these.
+
+The sweep's own allow-list carried the sharper version of the error:
+
+```
+# Needs the staging session, which is a write and six environment
+# fallbacks.
+"vcs diff p f|--staged"
+```
+
+Both halves are false. `_diff_staged` resolves **no session at all** —
+its predicate is `staged_by_session_id IS NOT NULL`, meaning *any*
+session — and it writes nothing. The exemption had been sitting in a
+list whose stated purpose is that "a divergence that *closes* shows up
+as a surprise", and this one could not, because the row made the flag's
+absence look intentional. That is the fourth stale blocked-reason in
+this port's reach, after `edit_intents`' two columns, step 15's
+`SqliteWriter` and the `doctor` paragraph.
+
+Also worth recording: `file` was a **required** positional here and
+Python's has been `nargs='?'` for as long as `_diff_working` has
+existed. The flag-surface stage cannot see that — it parses the
+`options:` block and never compares positional arity — so this is a
+second blind spot in the same stage, alongside commands only one side
+has.
+
+**What the two forms do not agree about.** They are structurally alike
+and three of their behaviours differ, which is why the port keeps two
+renderers rather than one with flags:
+
+| | `--staged` | bare form |
+|---|---|---|
+| new side of the diff | `file_contents.content_hash WHERE is_current` | `vcs_working_state.content_hash` |
+| label | `(staged)` | `(working)` |
+| unreadable content | truthiness, so an empty file is skipped | `is None`, so an empty file still diffs |
+| unknown state | header only, no body | falls into the modified renderer |
+
+The first row is a bug, and it is Python's. `_diff_staged`'s query
+aliases `ws.content_hash AS staged_hash` and then uses it in exactly
+one of its three branches; the `modified` branch builds its new side
+from `current_hash` and labels it `(staged)`. Since `ws.content_hash`
+is documented upstream as "the hash of the file on disk", those differ
+whenever a workspace edit has not been written back — and **all three
+live staged rows diverge** as of 2026-10-31: two carry a NULL staged
+hash and one a genuinely different one. So every `--staged` diff of a
+modified file currently labels the database's bytes as staged.
+
+Reproduced, because the output is the contract and the byte diff is
+what proves the rest of the renderer right. Reported rather than fixed
+here, and the sibling function is the argument: `_diff_working`, two
+screens away in the same file, builds its new side from
+`ws.content_hash` and labels it `(working)` — correctly. The sweep row
+for `regr-test --staged` is the one that pins it, so an upstream fix
+shows up as a diff rather than as silence.
+
+**One tie-break added**, same decision as `intent list`'s.
+`_get_last_committed_content` orders by `vc.commit_timestamp DESC LIMIT
+1` with nothing after it, and measured on the live database: **4
+`(file_id, commit_timestamp)` groups hold more than one row**, up to
+three. For those files the committed side of the diff is arbitrary and
+can differ between the two backends. `vc.id DESC` makes the key total,
+and it changes no current output — checked, not assumed: none of the
+three live staged rows is one of the affected files.
+
+**One behaviour worth knowing as a user.** `--staged` is not
+session-scoped. Its predicate takes any session's staged rows, while
+`vcs commit-staged` scopes to one and refuses the rest — so this
+command can show work a commit would not take. Python's behaviour,
+reproduced, and flagged because reading the output as "what my next
+commit contains" is reading it wrong.
+
+### The rebase this port refuses to do
+
+Python's `--if-match` no longer refuses a stale base. Since the audit
+it three-way merges: the expected hash is the base, the database's
+current content is the other side, and a clean `diff3` means the write
+applies on top of what landed. Only a genuine overlap exits 2, and
+`--no-rebase` restores the old behaviour. `intent apply` does the same
+thing with the same function, and there the merge is the *normal* path
+rather than an edge case, because an intent is designed to outlive the
+state it was written against.
+
+Its reasoning is good and is quoted here because it argues against this
+port's position: refusing "was the behaviour that made the flag
+expensive to use — the caller's only options were redo the work or drop
+the guard, and dropping the guard is what silently reverts people".
+
+**This section said "not ported, and the reason is scope rather than
+disagreement" until 2026-11-18, and the reason was wrong.** It read:
+
+> It needs a `ThreeWayMerge`, which exists over there for `vcs merge`
+> and does not exist here; `difflib` is in this port but a merge engine
+> is a different piece of work.
+
+That is accurate about the effort and it had never been checked against
+the engine. Step 33 checked it, because `intent apply` could not be
+ported without deciding, and the engine named there is **not a
+three-way merge**. The heading changes from *does not* to *refuses to*:
+the divergence is now a decision with a measurement behind it rather
+than a gap waiting on a sprint.
+
+#### What `ThreeWayMerge` actually does
+
+`merge_resolver.ThreeWayMerge._merge_with_diff3` is 110 lines and its
+docstring is "Three-way merge using diff3 algorithm". It opens by
+computing `difflib.unified_diff(base, ours)` and
+`difflib.unified_diff(base, theirs)` and **never reads either one** —
+two full diffs, assigned and discarded, which is the sixth
+select-and-discard this README has catalogued and the first in code
+rather than in SQL. What it does instead is walk the three versions
+with three indices, advancing all of them by one on every iteration,
+and compare each side's *n*th line against base's *n*th line.
+
+Two consequences follow from the lockstep, and neither is in the
+docstring:
+
+- **It is correct only while all three versions have the same number
+  of lines.** One insertion on either side shifts that side's indices
+  permanently out of alignment with base's, and every line after the
+  insertion is compared against the wrong line.
+- **Its loop is `while i_base < len(base_lines)`,** so anything either
+  side added past the end of base is never visited and silently
+  vanishes.
+
+#### Measured, 11 triples, 2026-11-18
+
+Eleven `(base, ours, theirs)` triples built by editing one 4-line base
+— in-place edits, insertions, deletions and appends, on each side and
+on both — compared against `git merge-file -p --diff3`:
+
+| outcome | count |
+|---|---|
+| agrees with `git merge-file --diff3` | 3 |
+| reports a clean merge, produces different text | 4 |
+| conflicts where a real diff3 merges cleanly | 3 |
+| reports clean where a real diff3 conflicts | 2 |
+
+Three of eleven, and the three that agree are exactly the
+equal-line-count in-place cases. The failures are **not
+conservative**, which is the part that decides the question. Seven
+triples report a clean merge; five of those seven produce text that is
+not what a three-way merge yields; `rebase_onto_current`'s
+`merged == current_text` guard catches **one** of the five, and
+**four reach `file_contents`**.
+
+Two of the three spurious conflicts are ordinary insert/delete cases.
+The third is worth naming on its own: when both sides make the
+**identical** edit, it conflicts. Each side is compared against base
+rather than against the other, so two equal changes are two changes.
+
+#### Reproduced end to end, not just in the library
+
+The worst outcome is silent, and it was driven through the shipping
+command rather than inferred from the function. On a copy of the live
+database, with `TEMPLEDB_PATH` pointed at it:
+
+```
+$ templedb file cat regr-test test.txt
+one
+two
+three
+four
+$ printf 'one\ntwo\nNEW\nthree\nfour\n' | \
+    templedb intent create regr-test test.txt --base-rev c45d3a272228…
+✓ Intent #1645 created (proposed)
+$ printf 'ONE\ntwo\nthree\nfour\n' | templedb intent create … && \
+    templedb intent apply …        # the file moves in place
+$ templedb intent apply 1645
+✓ Intent #1645 applied
+  rebased onto 6070bdcd4256 (was written against c45d3a272228)
+  test.txt → 6fb1ab4272d4 (proposed c7195b42f740)
+$ echo $?
+0
+$ templedb file cat regr-test test.txt
+ONE
+two
+NEW
+three
+```
+
+`four` is gone. Base had it, `ours` had it, `theirs` had it, nobody
+deleted it, the command printed a success line and exited 0.
+
+#### So the port refuses, and says so in four places
+
+`file set --if-match` is the strict compare-and-swap Python's
+`--no-rebase` selects, and `intent apply` exits 4 on a moved base for
+the same reason. The argument is not that the port lacks a feature.
+Reproducing that engine would mean writing content neither the author
+nor the database ever held, under a success message, into the one
+table whose rows *are* the user's files — and the project's standing
+rule is that the unacceptable outcome is the silent one. This is the
+loud one.
+
+**The two `--no-rebase` flags are handled differently, and that is an
+inconsistency this port now owns.** Python has one on each command,
+with the same meaning: refuse instead of merging.
+`file set --no-rebase` is **not** accepted here and sits in the sweep's
+flag allow-list as one pair, decided under the `--no-fts` rule — a flag
+that switches off behaviour the port does not have would be accepted
+and ignored, which is worse than absent. `intent apply --no-rebase`
+**is** accepted, decided here under a rule that cuts the other way: a
+caller passing it is asking for the behaviour this port already has on
+every input, and the stricter implementation erroring on the flag that
+requests strictness is the worse of the two outcomes.
+
+Both arguments are defensible and they are not the same argument, which
+means one of the two commands is wrong. The `--no-fts` rule is about a
+flag that *promises* something undeliverable; `--no-rebase` promises a
+refusal, and this port refuses. By that reading `file set` should
+accept it too and leave the allow-list — and that is not done here, on
+the grounds step 30 used for `search content -p`: changing an
+already-shipped command's flag surface is a step of its own, not a
+side-effect of a step about something else. It is in *Known gaps*
+rather than smoothed over.
+
+What the sweep can see of any of this is nothing, and that is the
+**fourth blind spot** in its flag stage, added with this step: it
+compares flag *names*, so `intent apply`'s surface agrees with
+Python's exactly while one of the two shared flags means something
+different on each side. The divergence is observable only in the exit
+status, which no row of a read-only sweep can reach.
+
+### The two columns that nearly rhyme
+
+`project list` has three filters now. `--nix-only` and `--category`
+were ported in step 1; `--type` arrived on Python's side afterwards and
+the flag-surface stage reported it.
+
+### The two columns that nearly rhyme
+
+`project list` has three filters now. `--nix-only` and `--category`
+were ported in step 1; `--type` arrived on Python's side afterwards and
+the flag-surface stage reported it.
+
+The trap is that `project_category` and `project_type` are different
+columns whose names almost match, and they share exactly one value:
+
+| flag | column | values |
+|---|---|---|
+| `--category` | `project_category` | package, service, desktop-app, nixos-module, home-module |
+| `--type` | `project_type` | regular, nixos-config, service |
+
+A port that read the wrong column would be right about every value
+except `service`, and `service` is the one a casual check is least
+likely to try. So both the in-memory fixture and the sweep's filter
+list test it specifically: the fixture's `beta` is
+`category = 'package'`, `type = 'service'`, which makes
+`--type service` and `--category service` select different rows, and
+`PROJECT_FILTERS` carries both spellings.
+
+Python's own comment is the clearest statement of what the flag is for:
+it "replaces `nixos list-configs`, which was this query with
+project_type hardcoded to 'nixos-config'".
+
+### Why `doctor entities` is not a command this port can have *yet*
+
+**The title lost a word on 2026-10-31**, and it was the load-bearing
+one. Everything below is still measured and still correct about what
+the command costs; what was wrong was the frame — see *Deferred, not
+refused*. Under eventual replacement this is a command the port will
+have, late, and the three numbers below are its bill rather than its
+refusal.
+
+The porting order said for five revisions that `doctor` sat behind the
+write-path design document, because `doctor entities` inserts into
+`invariant_checks`. That reasoning expired when the write path landed,
+so the entry was re-measured on 2026-10-29. The blocker is a different
+one and it is larger.
+
+**`doctor entities` is 44 checks**, not a command. Classified by what
+each one reads — **re-derived from the 44 method bodies on 2026-11-05**,
+which moved three of the five numbers:
+
+| | checks |
+|---|---|
+| **A** — reachable from the mirrored 21-table subset | 17 |
+| **B** — need tables outside it | 10 |
+| **C** — ask SQLite about *itself*: `sqlite_master`, `pragma_foreign_key_check`, cr-sqlite's `pragma_function_list`, the `-wal` sidecar's size | 8 |
+| **D** — read a filesystem | 8 |
+| **E** — read the Python implementation's own argparse tree | 1 |
+
+The previous version of this table had one bucket of 15 where C, D and
+E now sit, and it was classified by reading check *names*. Two of its
+entries were wrong, and splitting the bucket reports a blocker it hid.
+
+**Only 4 of the 8 in D read a checkout tree** — `checkout_matches_db`,
+`checkout_files_are_mode_locked`, `checkout_roles_are_unambiguous` and
+`generated_file_matches_generator`. The other four read roots no tree
+fixture covers: `~/.nix-profile` resolved into the store,
+`/nix/var/nix/profiles/system-*-link`,
+`~/.local/share/templedb/backups`, and
+`~/.local/share/templedb/fhs-deployments` for `st_mode`. So the
+tree-pinning harness of step 26 unblocks **four** checks here, not
+fifteen, and the README said fifteen for five weeks.
+
+**C is blocked by the verification backend, not by the tree, and that
+is the harder constraint.** Those eight ask SQLite about itself. A
+mirrored Postgres has no `sqlite_master`, no `pragma_function_list` and
+no `-wal` sidecar, so there is nothing for the cross-backend digest to
+compare and nothing for the sweep to byte-diff. While C and D shared a
+row this read as one obstacle with one fix; they are two obstacles and
+the tree is the tractable one.
+
+**Two checks the old bucket counted as filesystem reads are pure SQL.**
+`working_state_references_valid_files` is a `LEFT JOIN` orphan check
+over `vcs_working_state` and `project_files` — both already mirrored,
+portable today, and it is in A. `checkout_roles_are_unambiguous` is a
+query over `checkouts` plus exactly one `Path(...).is_dir()` liveness
+filter: no file content, no pinning, only directory existence.
+
+**And one is unportable in principle rather than not yet.**
+`cli_help_is_populated` imports `cli.core` and walks argparse's
+`_choices_actions`; its subject is the Python CLI's parser tree, so
+there is no Rust statement of the invariant. "Arrives whole, late" is
+therefore not reachable either — at 43 of 44 the whole-set exit status
+is still not reproducible. That needs a decision about what
+`doctor entities` *means* in this port, which is a question the 17/12/15
+table never raised because it had nowhere to put the check.
+
+One more is portable but is a project: `no_undefined_names` reads
+templedb's Python *out of `content_blobs`* rather than off the disk, so
+its substrate is mirrored and it sits in A — but running it means a
+Python parser and scope analyser in Rust.
+
+So a ported `doctor entities` would run 17 of 44 and print
+`(not ported)` 27 times. That is `summary`'s shape at a ratio that
+inverts its argument: `summary` is seven panes of nine and names what
+is missing, and this would be 39% ported and would mostly be naming.
+Its exit status is `0 if not problems else 1` over the **whole** set,
+so a partial run cannot reproduce the one part of a diagnostic command
+a script actually reads.
+
+It also writes three things rather than one. `invariant_checks` is
+mirrored; the claims it asserts on every passing check and the
+`reconciliations` episodes it opens and settles are a second and third
+write path, and the claims tables are outside the subset entirely.
+
+None of that is an argument about difficulty. It is the boundary rule
+the subset has followed since it was built — follow the readers — and
+`doctor entities` is on the far side of it for the same reason the
+systemd pane is. The entry in the porting order now says this instead
+of pointing at a document that no longer blocks anything.
+
+**`doctor history` is none of that**, which is why it is ported: a
+single `SELECT` over a table already mirrored, at a projection already
+carried, with a tie-break worth reproducing. `ran_at` has second
+granularity and one `doctor entities` pass stamps ~44 rows inside it,
+so `ORDER BY ran_at DESC LIMIT 20` returns an arbitrary 20 of the
+newest run — which is the wrong answer to the only question the command
+exists to answer, and over there it made a test pass or fail depending
+on what had run before it. `id DESC` recovers the order the checks ran
+in. It is also the one ordering in this port that is right on both
+backends for the same reason rather than by coincidence: the tie-break
+makes the sort key total, so there are no equal keys left for SQLite
+and Postgres to break differently.
+
+### Checking the checker
+
+*The sweep is a shell script, not a test* has been the first entry
+under *Known gaps* since the audit: `cargo test` does not run it, so
+nothing fails if it is never invoked. The entry proposed "a CI entry
+point or a `nix flake check`" and both are only half-answers — the
+sweep needs the live 776 MB database and the Python `templedb`, and a
+test that silently skips when those are absent is the same failure one
+layer down.
+
+But **coverage is a different question from agreement**, and coverage
+is answerable with nothing but the binary. The sweep exists because
+per-command harnesses missed drift; a command absent from the sweep has
+no harness at all, which is the same hole one level up. Nothing was
+checking for it. `doctor history` could have been added to the CLI and
+left out of `INVOCATIONS`, and every number the sweep prints would have
+gone up.
+
+`crates/templedb-cli/tests/sweep_coverage.rs` runs in `cargo test`,
+with no database and no interpreter. It walks the binary's own `--help`
+tree for every leaf command, parses `INVOCATIONS`, `FLAG_COMMANDS` and
+`FLAGS_EXPECTED` out of the script — parses, rather than carrying a
+second copy, because a test with its own list would pass while the
+sweep ran none of them — and asserts six things. The two that matter:
+
+- every leaf command is swept, or named in an exemption list with the
+  reason a diff against Python is not defined for it;
+- **every exemption still names a real command.** That is the direction
+  an exemption list cannot check by being consulted, because it only
+  ever suppresses — and it is exactly how `-s` and `--stage` sat stale
+  in the flag allow-list for two days after they stopped being needed,
+  found by hand.
+
+It caught something on its first run: `summary` was in no `INVOCATIONS`
+row. Not a hole — it is compared one pane at a time, because its whole
+stdout can never match — but the two reasons a command can be absent
+are opposite ("compared a different way" against "comparing it is not
+defined") and the test now carries them as two lists, with an assertion
+that nothing is in both.
+
+What it still does not check is whether a row's *arguments* reach
+anything interesting. `vcs log p` and `vcs log p -n 3 --published` both
+count as coverage and only one of them exercises the published view.
+That is a judgement the sweep's own comments carry and no test can take
+over.
+
+The CI entry point is `just check-all`, and naming it turned up that
+`just check` has never been the whole gate: it runs the unit tests, the
+oracles and the Python sweep, and skips the cross-backend sweep, the
+mirror freshness check and the write tests. Those three are the only
+verification the write path has, since a write cannot be byte-diffed
+against Python — so the gate was skipping the newest third of the port.
 
 ### The state digest, and why it must not sort
 
@@ -2310,15 +6189,25 @@ An earlier revision of this file recorded a reproduced wrongness here: a
 content lookup returned nothing for any blob whose `content_type` was
 not the literal `text`, the caller coerced that to the empty string, and
 empty-against-empty is no change. That is fixed on both sides now — see
-*The one place this port fell behind Python* below — and `vcs show`
+*The first place this port fell behind Python* below — and `vcs show`
 names the three cases apart.
 
-### The one place this port fell behind Python
+### The first place this port fell behind Python
 
 Every divergence above is this port moving ahead of the implementation
 it replaces. This one went the other way, and it is the most useful
 entry in this file for anyone maintaining a port against a moving
 target.
+
+**This heading said *the one place* until 2026-11-16, and it is now the
+first of two.** The second is `file where`'s two mirror roots, written
+up under *The resolver the hardcoded paths were standing in for*, and
+it is the same failure with one difference that matters: the port
+reproduced a bug, recorded a measurement that made the reproduction
+feel safe, and the measurement was of the *data* the bug depended on
+rather than of what Python does. Keeping the count honest here is the
+point — "the one place" is a claim about how often the method fails,
+and it had stopped being true.
 
 `content_blobs.content_type` is documented in the schema as `'text' or
 'binary'` and is not two-valued. Alongside 4,219 `text` and 35 genuinely
@@ -2533,8 +6422,16 @@ that document happened:
 
 | absent | what it was for |
 |---|---|
-| `--commit` / `-m` / `--commit-msg` | runs `vcs commit` in-process. Python's reason for in-process rather than a subprocess is the whole of why this is not three lines of `std::process::Command`: a subprocess resolves its own session, so the commit would look for a stage that belongs to someone else |
-| binary content | Python falls back to `content_blob` for undecodable stdin — which is why `.authinfo.gpg` can be stored at all. This takes text only, and refuses rather than mangling |
+| the `--if-match` three-way rebase, and `--no-rebase` with it | Python merges a stale base onto what landed instead of refusing, and only a genuine overlap exits 2. **Refused rather than missing**, decided 2026-11-18: the `ThreeWayMerge` it uses is not a three-way merge, and agrees with `git merge-file --diff3` on 3 of 11 measured cases. `--if-match` in this port is the strict compare-and-swap Python's `--no-rebase` selects. See *The rebase this port refuses to do* |
+
+**The table used to have two more rows and both closed on
+2026-10-29.** `--commit` / `-m` / `--commit-msg` is ported, in one
+transaction rather than Python's two — see *`--commit`, and why it is
+one transaction* — and so is binary content, which was the reason
+`.authinfo.gpg` could be stored over there and not here. The row that
+replaced them arrived from the other direction: Python grew the rebase
+after this section was written, and the sweep's flag-surface stage is
+what reported it.
 
 `--session <ID>` **is** here, as of 2026-10-23, and it is an id and not
 a name: Python accepts `ID|NAME` and its name path creates the session
@@ -3566,11 +7463,12 @@ name that promises a workflow it refuses, and a permanent allow-list
 entry for each flag. Absent and named in this file beats present and
 hollow; see *The second write*.
 
-**`project list`'s two filters** needed two more mirrored columns,
-`is_nix_project` and `project_category`, bringing the `projects`
-projection to eight — and because `statediff` derives its digest from
-the same `TableSpec`, they are covered by the cross-backend digest
-without a second edit.
+**`project list`'s filters** needed three more mirrored columns:
+`is_nix_project` and `project_category` on 2026-10-21, then
+`project_type` with `--type` on 2026-10-29, bringing the `projects`
+projection to nine — and because `statediff` derives its digest from
+the same `TableSpec`, every one of them is covered by the
+cross-backend digest without a second edit.
 
 They select rows and change nothing else, which is **not** what Python
 does. Python runs a separate query under either flag:
@@ -3885,13 +7783,38 @@ panes, and the pane that genuinely cannot be diffed is the one reading
 systemd, which is not ported.
 
 What is left of `summary` is the two unported panes, listed under
-*Known gaps*. `doctor` is unchanged: `doctor entities` is still a write
-path and still sits behind the write-path design document.
+*Known gaps*.
+
+**`doctor` is no longer unchanged, and the sentence that used to be
+here was wrong twice over.** It said `doctor entities` "is still a
+write path and still sits behind the write-path design document". The
+second half expired when the write path landed in step 15 and nobody
+went back to it — the document's three preconditions are done and the
+port has a `PgWriter` — and the first half, while true, was never the
+obstacle. Measured in step 22: `doctor entities` is 44 checks, 15 of
+which read something that is not a database — a figure the 2026-11-05
+re-derivation split into 8 engine checks, 8 filesystem checks and 1
+that reads argparse, of which only 4 read a tree. See *Why `doctor
+entities` is not a command this port can have*. `doctor history`, the
+subcommand the same paragraph dismissed as "a single `SELECT` over a
+table nothing else needs yet", is ported and byte-identical — and the
+table is `invariant_checks`, which `summary` has been reading since
+step 14, so that clause had been stale for eleven days when it was
+written.
 
 Nothing here renames the binary to `templedb`. The Python one is on PATH
 under that name and every script, systemd unit and agent wrapper invokes
 it; shadowing it while incomplete would break callers silently. Rename
 when it can answer everything the original can.
+
+That sentence is the project's goal statement, and on 2026-10-31 it
+became the one this README is consistent with. For a week three other
+sections argued the tree-dependent half of the system was out of scope,
+which cannot be squared with "everything the original can" — the
+original's `materialize`, `commit <slug> <dir>` and `checkout-*` family
+are the workflow every agent here runs on. The resolution is that the
+tree work is **last, not excluded**; see *Deferred, not refused* and
+steps 26–28.
 
 ## License
 

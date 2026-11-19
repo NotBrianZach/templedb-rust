@@ -87,9 +87,13 @@ pub(crate) const TABLES: &[TableSpec] = &[
             "repo_url",
             "git_branch",
             "active_branch_id",
-            // `project list --nix-only` and `--category`.
+            // `project list --nix-only`, `--category` and `--type`.
+            // The last two are different columns with near-identical
+            // names and an overlapping value (`service`); see
+            // `ProjectFilter`.
             "is_nix_project",
             "project_category",
+            "project_type",
         ],
         types: &[
             Type::INT8,
@@ -100,7 +104,21 @@ pub(crate) const TABLES: &[TableSpec] = &[
             Type::INT8,
             Type::INT4,
             Type::TEXT,
+            Type::TEXT,
         ],
+        key: &["id"],
+        page: 2000,
+    },
+    // Two of five columns, and the first table here that no query
+    // selects from directly: `search files` reaches it only through
+    // `files_with_types_view`'s INNER JOIN. Load order does not matter —
+    // nothing references it, deliberately, because the view's inner join
+    // is what a dangling `file_type_id` has to hit on *both* backends.
+    // See the Postgres DDL.
+    TableSpec {
+        name: "file_types",
+        columns: &["id", "type_name"],
+        types: &[Type::INT8, Type::TEXT],
         key: &["id"],
         page: 2000,
     },
@@ -111,6 +129,8 @@ pub(crate) const TABLES: &[TableSpec] = &[
             "project_id",
             "file_path",
             "status",
+            // Also the join column of `files_with_types_view`, since
+            // `search files` on 2026-11-17.
             "file_type_id",
             "lines_of_code",
             "edit_mode",
@@ -187,11 +207,43 @@ pub(crate) const TABLES: &[TableSpec] = &[
     // dependency is not enforced.
     TableSpec {
         name: "vcs_sessions",
-        // Two columns of ten. `session.rs` asks exactly one question of
-        // this table — is the id the caller named still live — so `id`
-        // and `ended_at` are what it carries.
-        columns: &["id", "ended_at"],
-        types: &[Type::INT8, Type::TEXT],
+        // Four columns of ten, and two readers rather than one.
+        // `session.rs` asks whether the id the caller named is still
+        // live, which is `id` and `ended_at`. `checkouts.rs` resolves
+        // TEMPLEDB_SESSION by name — and that is a read, where the name
+        // path `session.rs` declines is a write — which is `name` and
+        // `started_at`.
+        columns: &["id", "name", "started_at", "ended_at"],
+        types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+        key: &["id"],
+        page: 2000,
+    },
+    // `project_id` has a foreign key and `session_id` does not, for the
+    // reason above: a pruned session leaves checkout rows naming it, and
+    // resolution expects "that session is gone" as an answer.
+    TableSpec {
+        name: "checkouts",
+        // Seven of nine. `branch_name` and `last_sync_at` are selected
+        // by Python's resolution query and read by neither purpose this
+        // port implements.
+        columns: &[
+            "id",
+            "project_id",
+            "checkout_path",
+            "checkout_at",
+            "is_active",
+            "kind",
+            "session_id",
+        ],
+        types: &[
+            Type::INT8,
+            Type::INT8,
+            Type::TEXT,
+            Type::TEXT,
+            Type::INT4,
+            Type::TEXT,
+            Type::INT8,
+        ],
         key: &["id"],
         page: 2000,
     },
@@ -292,11 +344,24 @@ pub(crate) const TABLES: &[TableSpec] = &[
         key: &["id"],
         page: 2000,
     },
-    // After `projects`, which it references. The one table here that
-    // exists for a writer rather than a reader, so its projection is
-    // the columns `record_intent` supplies rather than the columns a
-    // query names — twelve of fourteen, with `cancelled_at` and
-    // `applied_commit_id` left to `intent cancel` and `vcs commit`.
+    // After `projects`, which it references. **All fourteen columns
+    // since 2026-10-30**, and the two that arrived last are the reason
+    // this comment is worth reading twice.
+    //
+    // It said twelve of fourteen, "with `cancelled_at` and
+    // `applied_commit_id` left to `intent cancel` and `vcs commit`" —
+    // naming two *writers* as the unblocker for two columns. That was
+    // wrong, and the README's *Known gaps* carried the same error for
+    // eleven days. `intent show` is a pure read that prints both, so a
+    // reader was all either column ever needed. The boundary rule did
+    // not bend here; it was applied to a table that had been reasoned
+    // about as write-only because for two weeks it was.
+    //
+    // So the projection is now the columns a query names, like every
+    // other table's, rather than the columns `record_intent` supplies.
+    // `applied_commit_id` is INT8 and not TEXT: it references
+    // `vcs_commits.id`, not a commit hash — the same near-miss as the
+    // `project_category` / `project_type` pair, one table over.
     TableSpec {
         name: "edit_intents",
         columns: &[
@@ -312,6 +377,8 @@ pub(crate) const TABLES: &[TableSpec] = &[
             "status",
             "created_at",
             "applied_at",
+            "cancelled_at",
+            "applied_commit_id",
         ],
         types: &[
             Type::INT8,
@@ -326,6 +393,8 @@ pub(crate) const TABLES: &[TableSpec] = &[
             Type::TEXT,
             Type::TEXT,
             Type::TEXT,
+            Type::TEXT,
+            Type::INT8,
         ],
         key: &["id"],
         page: 2000,

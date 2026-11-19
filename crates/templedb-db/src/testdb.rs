@@ -49,10 +49,13 @@ CREATE TABLE projects (
     repo_url         TEXT,
     git_branch       TEXT,
     active_branch_id INTEGER,
-    -- `project list`'s two filters. Nullable and 0/1, as the live
+    -- `project list`'s three filters. Nullable and 0/1, as the live
     -- column is: most rows are NULL rather than 0.
     is_nix_project   INTEGER,
-    project_category TEXT
+    project_category TEXT,
+    -- Not the same column as `project_category`, and the fixture rows
+    -- below are chosen so that a port filtering the wrong one fails.
+    project_type     TEXT
 );
 
 CREATE TABLE project_files (
@@ -67,6 +70,22 @@ CREATE TABLE project_files (
     -- can test `--edit-mode`.
     edit_mode     TEXT,
     UNIQUE(project_id, file_path)
+);
+
+-- Two of five live columns, the same two the Postgres subset carries:
+-- `search files` prints `type_name` and the view's join needs `id`.
+-- `category` is in the live view as `file_category`, in no reader here,
+-- and so in neither of these.
+--
+-- No FK from `project_files.file_type_id` to here, in the fixture or in
+-- the Postgres subset, and that is deliberate: the view INNER joins, so
+-- a dangling `file_type_id` makes a file invisible to `search files`
+-- rather than invalid. Reproducing the dangling row is how the two
+-- backends are made to agree about it; rejecting it at the mirror would
+-- make the copy fail on data the port does not control.
+CREATE TABLE file_types (
+    id        INTEGER PRIMARY KEY,
+    type_name TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE content_blobs (
@@ -102,13 +121,33 @@ CREATE TABLE vcs_branches (
     UNIQUE(project_id, branch_name)
 );
 
--- Only the two columns the port reads. The live table has ten; the
--- other eight belong to `vcs session list`, which is not ported, and
+-- Only the four columns the port reads. The live table has ten; the
+-- other six belong to `vcs session list`, which is not ported, and
 -- including them here would make the fixture and the Postgres subset
 -- describe different shapes.
+--
+-- `name` and `started_at` arrived with checkout-role resolution:
+-- `CheckoutRepository.current_session_id` resolves TEMPLEDB_SESSION by
+-- name, `ORDER BY started_at DESC LIMIT 1`. That is a *read*, unlike
+-- the name path `session.rs` declines — see `checkouts.rs`.
 CREATE TABLE vcs_sessions (
-    id       INTEGER PRIMARY KEY,
-    ended_at TEXT
+    id         INTEGER PRIMARY KEY,
+    name       TEXT,
+    started_at TEXT,
+    ended_at   TEXT
+);
+
+-- migration 113's `kind`. Resolution reads five of nine columns;
+-- `branch_name` and `last_sync_at` are selected by Python's query and
+-- used by neither purpose this port implements.
+CREATE TABLE checkouts (
+    id            INTEGER PRIMARY KEY,
+    project_id    INTEGER NOT NULL,
+    checkout_path TEXT NOT NULL,
+    checkout_at   TEXT,
+    is_active     INTEGER DEFAULT 1,
+    kind          TEXT,
+    session_id    INTEGER
 );
 
 CREATE TABLE vcs_commits (
@@ -176,23 +215,32 @@ CREATE TABLE vcs_working_state (
     UNIQUE(project_id, branch_id, file_id)
 );
 
--- `file set`'s provenance record. Written by the Postgres writer and
--- never read here, so the fixture carries it only so the mirror's
--- pagination and the cross-backend digest have the same shape on both
--- sides. Twelve columns, matching the Postgres subset.
+-- `file set`'s provenance record, and since 2026-10-30 also what
+-- `intent list` and `intent show` read. It was carried for the writer
+-- alone for two weeks — "never read here" is what this comment used to
+-- say — and the two columns the reads needed arrived with them.
+-- Fourteen columns now, matching the Postgres subset.
+--
+-- `status` carries no CHECK here even though the live schema declares
+-- one, which is deliberate and matches the Postgres subset: the `?`
+-- marker fallback in `intent.rs` is reachable only through a store
+-- that permits a fourth status, and a fixture that forbade it could
+-- not test the fallback at all.
 CREATE TABLE edit_intents (
-    id               INTEGER PRIMARY KEY,
-    session_id       INTEGER,
-    project_id       INTEGER NOT NULL,
-    file_path        TEXT NOT NULL,
-    base_revision    TEXT NOT NULL DEFAULT 'current',
-    new_content_hash TEXT NOT NULL,
-    patch_summary    TEXT,
-    author           TEXT,
-    description      TEXT,
-    status           TEXT NOT NULL DEFAULT 'proposed',
-    created_at       TEXT NOT NULL,
-    applied_at       TEXT
+    id                INTEGER PRIMARY KEY,
+    session_id        INTEGER,
+    project_id        INTEGER NOT NULL,
+    file_path         TEXT NOT NULL,
+    base_revision     TEXT NOT NULL DEFAULT 'current',
+    new_content_hash  TEXT NOT NULL,
+    patch_summary     TEXT,
+    author            TEXT,
+    description       TEXT,
+    status            TEXT NOT NULL DEFAULT 'proposed',
+    created_at        TEXT NOT NULL,
+    applied_at        TEXT,
+    cancelled_at      TEXT,
+    applied_commit_id INTEGER
 );
 
 CREATE TABLE entities (
@@ -325,6 +373,33 @@ CREATE VIEW source_snapshots AS
     JOIN project_files pf ON pf.id = vfs.file_id
     JOIN projects p       ON p.id = pf.project_id
     LEFT JOIN content_blobs cb ON cb.hash_sha256 = vfs.content_hash;
+
+-- The live view's joins and predicates exactly, projected to the five
+-- of its seventeen columns `search files` names. The other twelve are
+-- `project_files` columns this fixture does not carry — the subset
+-- follows the readers here as everywhere else, and a verbatim copy
+-- would drag ten unread columns in behind it.
+--
+-- Two things about it are load-bearing and both are reproduced rather
+-- than tidied:
+--
+--   * `file_types` is INNER joined, so a file whose type is unresolved
+--     is invisible here. Every one of the 2,780 live rows resolves, so
+--     this fixture is the only place the branch can be observed —
+--     beta's files all have a NULL `file_type_id`.
+--   * There is NO `status` filter, unlike `file ls` and
+--     `search content`. A deleted file is still listed. `gone.txt`
+--     below is the fixture's instance.
+CREATE VIEW files_with_types_view AS
+    SELECT
+        pf.id            AS id,
+        p.slug           AS project_slug,
+        pf.file_path     AS file_path,
+        ft.type_name     AS type_name,
+        pf.lines_of_code AS lines_of_code
+    FROM project_files pf
+    JOIN file_types ft ON pf.file_type_id = ft.id
+    JOIN projects p    ON pf.project_id = p.id;
 "#;
 
 const DATA: &str = r#"
@@ -343,16 +418,41 @@ const DATA: &str = r#"
 -- a row where both columns are NULL — which is what most live rows look
 -- like, and which `is_nix_project = 1` must exclude without an
 -- `IS NOT NULL` dodge.
+-- `project_type` is deliberately CROSSED with `project_category`
+-- here: all three rows that have a category share it, and their types
+-- differ — so `--category package` and `--type regular` select
+-- different sets, and a filter reading the wrong column cannot
+-- accidentally pass. `beta` carries the one value the two columns
+-- share, `service`, which is the single input that would make the
+-- confusion invisible if the fixture avoided it.
 INSERT INTO projects (id, slug, name, repo_url, git_branch, active_branch_id,
-                      is_nix_project, project_category) VALUES
+                      is_nix_project, project_category, project_type) VALUES
     (1, 'alpha', 'Alpha Project', 'git@example:alpha.git', 'main', 2,
-        1,    'package'),
+        1,    'package', 'regular'),
     (2, 'beta',  'beta',          NULL,                    NULL,   NULL,
-        0,    'package'),
+        0,    'package', 'service'),
     (3, 'empty', NULL,            NULL,                    NULL,   NULL,
-        NULL, NULL);
+        NULL, NULL,      NULL);
 
--- `file_type_id` and `lines_of_code` are read only by `project show`.
+-- The two ids alpha's files already point at, plus one nothing
+-- references. The unreferenced row is what makes `search files`'s join
+-- direction testable: it must never widen the result, and a query that
+-- accidentally drove off `file_types` instead of `project_files` would
+-- show up as an extra row rather than as a missing one.
+--
+-- `type_name` is what `search files` prints, so the two values differ in
+-- length — the table renderer pads to the widest, and two equal-length
+-- names would let a width bug pass.
+INSERT INTO file_types (id, type_name) VALUES
+    (1, 'rust'),
+    (2, 'markdown'),
+    (3, 'unreferenced');
+
+-- `file_type_id` and `lines_of_code` are read by `project show` and by
+-- `search files` — the latter through `files_with_types_view`, which
+-- INNER joins `file_types`, so beta's NULLs make every beta file
+-- invisible there. That is the live view's behaviour and the only place
+-- it can be observed: all 2,780 live rows resolve a type.
 -- alpha gets two distinct types and two of its four rows carry a line
 -- count, so `SUM` is non-NULL and `COUNT(DISTINCT file_type_id)` is
 -- more than one. beta's are all NULL, which is the shape that makes
@@ -483,10 +583,41 @@ INSERT INTO vcs_branches (id, project_id, branch_name, is_default, head_commit_i
 -- behaviour Python's lookup lacked until 2026-10-07. Session 9 is live
 -- and owns nothing, so "pinned but no unpublished commits" — the state
 -- just after a publish — is reachable too.
-INSERT INTO vcs_sessions (id, ended_at) VALUES
-    (7, NULL),
-    (8, '2026-10-07 12:00:00'),
-    (9, NULL);
+--
+-- The three names are for `checkouts::current_session`, which resolves
+-- TEMPLEDB_SESSION where `session.rs` refuses it. `alpha-work` is live,
+-- `finished` has ended, and sessions 7-9 are deliberately left nameless
+-- so that a resolver reading the wrong column finds nothing rather than
+-- finding row 7 by accident.
+INSERT INTO vcs_sessions (id, name, started_at, ended_at) VALUES
+    (7,  NULL,         '2026-10-01 09:00:00', NULL),
+    (8,  NULL,         '2026-10-02 09:00:00', '2026-10-07 12:00:00'),
+    (9,  NULL,         '2026-10-03 09:00:00', NULL),
+    (10, 'alpha-work', '2026-10-04 09:00:00', NULL),
+    (11, 'finished',   '2026-10-05 09:00:00', '2026-11-01 00:00:00');
+
+-- Checkout rows for alpha only. beta has none, which is the state 14 of
+-- the 26 live projects are in and the one that reaches the `repo_url`
+-- fallback.
+--
+-- Newest first after the `is_active` filter: owned (Mar), free (Feb),
+-- canonical (Jan). Row 4 is the newest of all and inactive, so a
+-- resolver that forgot `is_active = 1` picks it and every ordering
+-- assertion fails rather than one.
+INSERT INTO checkouts
+    (id, project_id, checkout_path, checkout_at, is_active, kind, session_id)
+VALUES
+    (1, 1, '/home/t/.config/templedb/checkouts/alpha',
+        '2026-01-01 00:00:00', 1, 'canonical', NULL),
+    -- Owned by session 8, which has ended: adoptable.
+    (2, 1, '/home/t/.config/templedb/edit-workspaces/alpha/free',
+        '2026-02-01 00:00:00', 1, 'edit', 8),
+    -- Owned by session 7, which is live: returned to 7 and invisible to
+    -- everyone else.
+    (3, 1, '/home/t/.config/templedb/edit-workspaces/alpha/owned',
+        '2026-03-01 00:00:00', 1, 'edit', 7),
+    (4, 1, '/home/t/.config/templedb/edit-workspaces/alpha/retired',
+        '2026-04-01 00:00:00', 0, 'edit', NULL);
 
 INSERT INTO vcs_commits
     (id, project_id, branch_id, commit_hash, author, commit_message,
@@ -565,26 +696,83 @@ INSERT INTO vcs_commit_metadata (id, commit_id, impact_level, created_at) VALUES
 -- state `vcs session reconcile`'s default `orphan_stages` policy
 -- produces; row 3 is `unmodified`, the resting state of 1,764 of the
 -- 1,886 live rows.
+--
+-- Rows 4 and 5 arrived 2026-10-31 with `vcs diff --staged` and the
+-- bare working-set form, which are the first readers that branch on
+-- `state` rather than only on the staging owner. Between them the five
+-- rows reach every branch of both renderers:
+--
+--   1  modified, STAGED    -- the diff path in both forms
+--   2  modified, unstaged  -- in `--staged`'s output? no. In the bare
+--                             form's? yes. The one row that separates
+--                             the two commands.
+--   3  unmodified          -- in neither, and the `state !=
+--                             'unmodified'` filter is the only thing
+--                             keeping it out of the bare form.
+--   4  added, STAGED       -- the `+++ New file` path.
+--   5  deleted, STAGED     -- the `-` path, and a NULL content_hash,
+--                             which is what a deletion carries. In the
+--                             bare form it must take the `deleted`
+--                             branch BEFORE the unreadable-content
+--                             check, which a NULL hash would otherwise
+--                             trip.
 INSERT INTO vcs_working_state
     (id, project_id, branch_id, file_id, content_hash, state,
      last_modified, staged_by_session_id, intent_id)
 VALUES
     (1, 1, 1, 1, 'h-main',     'modified',   '2026-10-05 00:00:00', 7,    2),
     (2, 1, 1, 4, 'h-readme-a', 'modified',   '2026-10-05 00:00:00', NULL, NULL),
-    (3, 1, 1, 2, NULL,         'unmodified', '2026-10-05 00:00:00', NULL, NULL);
+    (3, 1, 1, 2, NULL,         'unmodified', '2026-10-05 00:00:00', NULL, NULL),
+    (4, 1, 1, 13, 'h-readme-b', 'added',      '2026-10-06 00:00:00', 7,    NULL),
+    (5, 1, 1, 14, NULL,         'deleted',    '2026-10-06 00:00:00', 7,    NULL);
 
--- Two intents on one file, so the digest has more than one row and the
--- `(project_id, file_path, created_at DESC)` ordering has something to
--- order. One carries a session and one does not, which is the live
--- shape — 976 of 1,220 rows have a NULL `session_id`.
+-- Five intents, shaped for `intent list` / `intent show` rather than for
+-- the digest alone. What each row is for:
+--
+--   1  applied, with a session, a commit link, a patch summary and a
+--      description — the row that exercises all four conditional lines
+--      in `intent show`, and the only one that can check their order.
+--   2  proposed, NULL session, and NULL in every optional column. The
+--      nine-line minimum, and the row that proves a NULL `session_id`
+--      prints the literal `None` the way Python's f-string does.
+--   3  applied, same session as 1, tied on `created_at` with 5.
+--   4  proposed, NULL session — so the default `status = 'proposed'`
+--      view has two rows and an order to get wrong.
+--   5  cancelled, and the only row on project 2. Two jobs: it is the
+--      sole `cancelled` status, so the `✗` marker and the
+--      `cancelled_at` fallback in `when()` are both reachable; and
+--      being on another project makes `--project` and `--session`
+--      select different sets, which is what lets the AND test prove
+--      neither clause is a no-op.
+--
+-- Rows 3 and 5 share `2026-10-18 09:00:00` with non-contiguous ids, so
+-- an implementation that returned ties in insertion order rather than
+-- by `id DESC` would look plausible and be wrong. That tie is the
+-- fixture standing in for the 32 tie groups measured on the live
+-- database — see `intent.rs`.
+--
+-- Sessions are 7 and NULL, matching the live shape: 976 of 1,220 rows
+-- have no session.
 INSERT INTO edit_intents
     (id, session_id, project_id, file_path, base_revision, new_content_hash,
-     patch_summary, author, description, status, created_at, applied_at)
+     patch_summary, author, description, status, created_at, applied_at,
+     cancelled_at, applied_commit_id)
 VALUES
-    (1, NULL, 1, 'src/main.rs', 'new-file',   'h-main-old', '13 bytes', 'zach',
-        'file set', 'applied', '2026-10-04 00:00:00', '2026-10-04 00:00:00'),
-    (2, 7,    1, 'src/main.rs', 'h-main-old', 'h-main',     '26 bytes', 'zach',
-        'file set', 'applied', '2026-10-05 00:00:00', '2026-10-05 00:00:00');
+    (1, 7,    1, 'src/main.rs', 'new-file',   'h-main-old', '13 bytes', 'zach',
+        'file set', 'applied',   '2026-10-04 00:00:00', '2026-10-04 00:00:00',
+        NULL, 1),
+    (2, NULL, 1, 'src/main.rs', 'h-main-old', 'h-main',     NULL,       'zach',
+        NULL,       'proposed',  '2026-10-05 00:00:00', NULL,
+        NULL, NULL),
+    (3, 7,    1, 'src/lib.rs',  'h-main',     'h-lib',      '41 bytes', 'zach',
+        'file set', 'applied',   '2026-10-18 09:00:00', '2026-10-18 09:00:00',
+        NULL, 2),
+    (4, NULL, 1, 'README.md',   'current',    'h-readme-a', '8 bytes',  'zach',
+        'docs',     'proposed',  '2026-10-06 00:00:00', NULL,
+        NULL, NULL),
+    (5, 7,    2, 'beta.txt',    'current',    'h-beta',     '5 bytes',  'zach',
+        'file set', 'cancelled', '2026-10-18 09:00:00', NULL,
+        '2026-10-18 09:30:00', NULL);
 
 INSERT INTO entities (id, kind, external_ref, source_authority, label, observed_at) VALUES
     (1, 'Machine',    'box1',            'nix', 'box one',   '2026-10-01 00:00:00'),

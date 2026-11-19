@@ -56,11 +56,25 @@ pub struct ProjectFilter {
     /// live database grew after this port was built should filter
     /// correctly rather than be unrepresentable.
     pub category: Option<String>,
+    /// `--type`: an exact match on `project_type`.
+    ///
+    /// **A different column from [`ProjectFilter::category`]**, and the
+    /// two are easy to conflate because the names nearly rhyme.
+    /// `project_type` is `regular` / `nixos-config` / `service`;
+    /// `project_category` is `package` / `home-module` /
+    /// `nixos-module` / `service` / `desktop-app`. They overlap on the
+    /// word `service` and the live data varies them independently, so a
+    /// port that filtered the wrong one would answer correctly for
+    /// every value except that one.
+    ///
+    /// A `String` for the reason `category` is one: the fixed list is
+    /// input validation and belongs at the CLI edge.
+    pub project_type: Option<String>,
 }
 
 impl ProjectFilter {
     pub fn is_empty(&self) -> bool {
-        !self.nix_only && self.category.is_none()
+        !self.nix_only && self.category.is_none() && self.project_type.is_none()
     }
 }
 
@@ -107,6 +121,10 @@ pub fn list_projects_filtered(store: &dyn Store, filter: &ProjectFilter) -> Resu
     if let Some(category) = &filter.category {
         params.push(Value::from(category.as_str()));
         wheres.push(format!("p.project_category = ?{}", params.len()));
+    }
+    if let Some(project_type) = &filter.project_type {
+        params.push(Value::from(project_type.as_str()));
+        wheres.push(format!("p.project_type = ?{}", params.len()));
     }
     let where_clause = if wheres.is_empty() {
         String::new()
@@ -319,6 +337,7 @@ mod tests {
         let filter = super::ProjectFilter {
             nix_only: true,
             category: None,
+            project_type: None,
         };
         let slugs: Vec<_> = super::list_projects_filtered(&c, &filter)
             .unwrap()
@@ -337,6 +356,7 @@ mod tests {
         let filter = super::ProjectFilter {
             nix_only: false,
             category: Some("package".to_string()),
+            project_type: None,
         };
         let slugs: Vec<_> = super::list_projects_filtered(&c, &filter)
             .unwrap()
@@ -353,6 +373,7 @@ mod tests {
         let both = super::ProjectFilter {
             nix_only: true,
             category: Some("package".to_string()),
+            project_type: None,
         };
         let slugs: Vec<_> = super::list_projects_filtered(&c, &both)
             .unwrap()
@@ -367,8 +388,99 @@ mod tests {
         let none = super::ProjectFilter {
             nix_only: true,
             category: Some("service".to_string()),
+            project_type: None,
         };
         assert!(super::list_projects_filtered(&c, &none).unwrap().is_empty());
+    }
+
+    /// `--type` reads `project_type` and **not** `project_category`.
+    ///
+    /// The fixture crosses the two deliberately: `alpha` and `beta`
+    /// share the category `package` and differ in type, so a filter
+    /// reading the wrong column returns both rows here instead of one.
+    /// Added with the flag on 2026-10-29, after the sweep reported
+    /// `--type` appearing on Python's side.
+    #[test]
+    fn the_type_filter_reads_its_own_column() {
+        let c = testdb::fixture();
+        let filter = super::ProjectFilter {
+            project_type: Some("regular".to_string()),
+            ..Default::default()
+        };
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["alpha"]);
+    }
+
+    /// The one value the two columns share, which is the single input
+    /// that makes confusing them invisible.
+    ///
+    /// `beta` is `category = 'package'` and `type = 'service'`. So
+    /// `--type service` must select it and `--category service` must
+    /// not — and an implementation that read one column for both flags
+    /// would get exactly one of these two assertions right.
+    #[test]
+    fn service_means_different_things_to_the_two_filters() {
+        let c = testdb::fixture();
+        let by_type = super::ProjectFilter {
+            project_type: Some("service".to_string()),
+            ..Default::default()
+        };
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &by_type)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["beta"]);
+
+        let by_category = super::ProjectFilter {
+            category: Some("service".to_string()),
+            ..Default::default()
+        };
+        assert!(super::list_projects_filtered(&c, &by_category)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// All three filters AND together, and the empty-filter predicate
+    /// knows about the third one — `is_empty` returning true with a
+    /// type set would make a filtered list take the unfiltered path.
+    #[test]
+    fn the_type_filter_joins_the_others_with_and() {
+        let c = testdb::fixture();
+        let all_three = super::ProjectFilter {
+            nix_only: true,
+            category: Some("package".to_string()),
+            project_type: Some("regular".to_string()),
+        };
+        assert!(!all_three.is_empty());
+        let slugs: Vec<_> = super::list_projects_filtered(&c, &all_three)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(slugs, vec!["alpha"]);
+
+        // One clause contradicting the others empties the result
+        // rather than being ignored.
+        let contradiction = super::ProjectFilter {
+            nix_only: true,
+            category: Some("package".to_string()),
+            project_type: Some("service".to_string()),
+        };
+        assert!(super::list_projects_filtered(&c, &contradiction)
+            .unwrap()
+            .is_empty());
+
+        assert!(super::ProjectFilter::default().is_empty());
+        assert!(!super::ProjectFilter {
+            project_type: Some("regular".to_string()),
+            ..Default::default()
+        }
+        .is_empty());
     }
 
     /// An unknown category is empty, not an error. The CLI rejects a
@@ -380,6 +492,7 @@ mod tests {
         let filter = super::ProjectFilter {
             nix_only: false,
             category: Some("no-such-category".to_string()),
+            project_type: None,
         };
         assert!(super::list_projects_filtered(&c, &filter)
             .unwrap()
@@ -396,6 +509,7 @@ mod tests {
         let filter = super::ProjectFilter {
             nix_only: true,
             category: None,
+            project_type: None,
         };
         let filtered = super::list_projects_filtered(&c, &filter).unwrap();
         let alpha_all = all.iter().find(|p| p.slug == "alpha").unwrap();

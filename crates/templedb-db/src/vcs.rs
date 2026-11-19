@@ -753,6 +753,218 @@ pub fn version_text(store: &dyn Store, v: &ContentVersion) -> Result<Option<Stri
     }
 }
 
+/// The project's active branch id, for the two `vcs diff` forms that
+/// scope their working-state query to a branch.
+///
+/// A public wrapper rather than making [`active_branch_id`] public,
+/// because the error the callers need is "no active branch" as an
+/// `Option` and not a resolution strategy.
+pub fn active_branch(store: &dyn Store, project_id: i64) -> Result<Option<i64>> {
+    active_branch_id(store, project_id)
+}
+
+/// One `vcs_working_state` row, as the two working-set `vcs diff` forms
+/// read it.
+///
+/// Both forms select the same four columns and `--staged` adds a fifth,
+/// so this carries the union and the staged-only field is an `Option`
+/// that the unstaged form leaves `None`. One struct rather than two
+/// because the *renderers* differ and the rows do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingFile {
+    pub file_id: i64,
+    /// `'added'`, `'modified'`, `'deleted'` or `'unmodified'`. A
+    /// `String` for the reason every status column here is one: both
+    /// renderers have a fall-through that prints the header and no
+    /// body, so a fifth value renders rather than failing.
+    pub state: String,
+    pub file_path: String,
+    /// `vcs_working_state.content_hash` — documented upstream as "the
+    /// hash of the file on disk (set by detect_changes / refresh)".
+    /// This is the new side of the *unstaged* diff.
+    pub content_hash: Option<String>,
+    /// `file_contents.content_hash WHERE is_current = 1`, joined with a
+    /// LEFT JOIN so a file with no current row still appears.
+    ///
+    /// `None` for the unstaged form, which does not select it. Present
+    /// for `--staged`, which uses it as the new side — and that is the
+    /// bug documented on [`staged_files`], not a design choice.
+    pub current_hash: Option<String>,
+}
+
+/// Staged rows for one project and branch, as `vcs diff --staged`
+/// lists them.
+///
+/// # `ORDER BY pf.file_path` needs no tie-break, and that is checkable
+///
+/// Unlike the timestamp orderings elsewhere in this crate, this one is
+/// already total: `project_files` declares `UNIQUE(project_id,
+/// file_path)` and the query is scoped to a single project, so no two
+/// rows can share a path. The constraint is unconditional rather than
+/// partial on `status` — which `file set` found out the hard way, since
+/// re-adding a tombstoned path fires it — so this holds for deleted
+/// rows too.
+///
+/// # Not session-scoped, which is worth noticing
+///
+/// The predicate is `staged_by_session_id IS NOT NULL` — *any* session.
+/// `vcs commit-staged` scopes to one session and refuses to include
+/// another's rows, so the two commands disagree about what "staged"
+/// means: this shows work a commit would not take. Reproduced because
+/// it is Python's, and flagged because a caller reading this output as
+/// "what my next commit will contain" is reading it wrong.
+///
+/// # The `staged_hash` Python selects and does not use
+///
+/// Python's query aliases `ws.content_hash AS staged_hash` and then
+/// uses it in exactly one of its three branches — `'added'`, as
+/// `staged_hash or current_hash`. The `'modified'` branch builds its
+/// new side from `current_hash` alone and labels it `(staged)`.
+///
+/// Since `ws.content_hash` is the staged hash and
+/// `file_contents.is_current` is what the database currently holds,
+/// those are different things whenever a workspace edit has not been
+/// written back — and measured on the live database 2026-10-31, **all
+/// three staged rows diverge**: two carry a NULL staged hash and one
+/// has a genuinely different one. So every `--staged` diff of a
+/// modified file currently labels the database's bytes `(staged)`.
+///
+/// This port reproduces it, because the command's output is the
+/// contract and a byte diff is the only thing proving the rest of the
+/// renderer right. It is reported rather than fixed here, and the
+/// sibling function makes the case: [`changed_files`]'s renderer, two
+/// screens away in the same file upstream, builds its new side from
+/// `ws.content_hash` and labels it `(working)` — correctly.
+pub fn staged_files(
+    store: &dyn Store,
+    project_id: i64,
+    branch_id: i64,
+) -> Result<Vec<WorkingFile>> {
+    let rows = store
+        .query(
+            "SELECT ws.file_id, ws.state, ws.content_hash, pf.file_path,
+                    fc.content_hash
+               FROM vcs_working_state ws
+               JOIN project_files pf ON ws.file_id = pf.id
+               LEFT JOIN file_contents fc
+                      ON fc.file_id = ws.file_id AND fc.is_current = 1
+              WHERE ws.project_id = ?1 AND ws.branch_id = ?2
+                AND ws.staged_by_session_id IS NOT NULL
+              ORDER BY pf.file_path",
+            &[Value::from(project_id), Value::from(branch_id)],
+        )
+        .context("listing staged files")?;
+    rows.iter()
+        .map(|r| {
+            Ok(WorkingFile {
+                file_id: r.get_i64(0)?,
+                state: r.get_string(1)?,
+                content_hash: r.get_opt_string(2)?,
+                file_path: r.get_string(3)?,
+                current_hash: r.get_opt_string(4)?,
+            })
+        })
+        .collect()
+}
+
+/// Every changed row for one project and branch — what a bare
+/// `vcs diff <proj>` means.
+///
+/// `state != 'unmodified'`, which is the same comparison `vcs status`
+/// uses to assign the state, so the two agree by construction. No
+/// `current_hash`: this form's new side is the staged/working hash on
+/// the row itself, which is the thing `--staged` gets wrong.
+pub fn changed_files(
+    store: &dyn Store,
+    project_id: i64,
+    branch_id: i64,
+) -> Result<Vec<WorkingFile>> {
+    let rows = store
+        .query(
+            "SELECT ws.file_id, ws.state, ws.content_hash, pf.file_path
+               FROM vcs_working_state ws
+               JOIN project_files pf ON ws.file_id = pf.id
+              WHERE ws.project_id = ?1 AND ws.branch_id = ?2
+                AND ws.state != 'unmodified'
+              ORDER BY pf.file_path",
+            &[Value::from(project_id), Value::from(branch_id)],
+        )
+        .context("listing changed files")?;
+    rows.iter()
+        .map(|r| {
+            Ok(WorkingFile {
+                file_id: r.get_i64(0)?,
+                state: r.get_string(1)?,
+                content_hash: r.get_opt_string(2)?,
+                file_path: r.get_string(3)?,
+                current_hash: None,
+            })
+        })
+        .collect()
+}
+
+/// A file's text as of the most recent commit that touched it.
+///
+/// Python's `_get_last_committed_content`, including the part its
+/// docstring argues for: the lookup is **not** scoped to a branch, even
+/// though the caller has one and passes it. A file's history
+/// legitimately spans branches and scoping it would hide the parent
+/// revision after a switch. The `branch_id` parameter is therefore not
+/// taken here at all, rather than taken and ignored — the port has no
+/// signature-stability reason to carry it.
+///
+/// A row whose `content_hash` is NULL is a tombstone from before
+/// `content_blobs` existed, not a corruption, and has no content.
+///
+/// # The tie-break, which is this port's and is needed
+///
+/// Python orders by `vc.commit_timestamp DESC LIMIT 1` with nothing
+/// after it. Measured on the live database 2026-10-31: **4
+/// `(file_id, commit_timestamp)` groups hold more than one row**, up to
+/// three — all on file 3880, from commits a few seconds apart. For
+/// those files `LIMIT 1` returns whichever row the planner reaches
+/// first, so the "committed" side of the diff is arbitrary among them
+/// and can differ between SQLite and Postgres.
+///
+/// `vc.id DESC` makes the key total. It cannot change any current
+/// `--staged` output, which is checked rather than assumed: none of the
+/// three live staged rows is file 3880. Same decision and same
+/// reasoning as `intent list`'s tie-break, and the third missing one
+/// found in this port's reach.
+pub fn last_committed_content(store: &dyn Store, file_id: i64) -> Result<Option<String>> {
+    let row = store
+        .query_opt(
+            "SELECT vfs.content_hash
+               FROM vcs_file_states vfs
+               JOIN vcs_commits vc ON vc.id = vfs.commit_id
+              WHERE vfs.file_id = ?1 AND vfs.change_type != 'deleted'
+              ORDER BY vc.commit_timestamp DESC, vc.id DESC
+              LIMIT 1",
+            &[Value::from(file_id)],
+        )
+        .context("reading the last committed content")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(hash) = row.get_opt_string(0)? else {
+        return Ok(None);
+    };
+    Ok(blob_text(store, &hash)?.0)
+}
+
+/// Text for a content hash, or `None` when the blob is absent, binary
+/// or empty in both columns.
+///
+/// The public face of [`blob_text`]'s first element, which is what
+/// Python's `_get_content_by_hash` returns to these two callers. The
+/// kind is dropped because both working-set renderers branch on
+/// `None`-ness alone: the unstaged one prints `(binary or unreadable
+/// content — no textual diff)` for every `None`, without distinguishing
+/// a binary blob from a missing one.
+pub fn content_by_hash(store: &dyn Store, hash: &str) -> Result<Option<String>> {
+    Ok(blob_text(store, hash)?.0)
+}
+
 /// One row of `vcs branch`'s listing.
 #[derive(Debug, Clone)]
 pub struct BranchEntry {
@@ -1372,5 +1584,142 @@ mod tests {
         // takes the fallback rather than being special-cased.
         assert_eq!(mk("unmodified").marker(), "❓");
         assert_eq!(mk("").marker(), "❓");
+    }
+
+    fn paths(files: &[WorkingFile]) -> Vec<&str> {
+        files.iter().map(|f| f.file_path.as_str()).collect()
+    }
+
+    fn states(files: &[WorkingFile]) -> Vec<&str> {
+        files.iter().map(|f| f.state.as_str()).collect()
+    }
+
+    /// `--staged` takes only rows with an owner, in path order.
+    ///
+    /// Three of the fixture's five rows are staged, and between them
+    /// they are the three states both renderers branch on.
+    #[test]
+    fn staged_files_takes_only_owned_rows_in_path_order() {
+        let c = testdb::fixture();
+        let f = staged_files(&c, 1, 1).unwrap();
+        assert_eq!(paths(&f), vec!["src/hot.rs", "src/live.rs", "src/main.rs"]);
+        assert_eq!(states(&f), vec!["added", "deleted", "modified"]);
+    }
+
+    /// The bare form takes every row whose state is not `'unmodified'`,
+    /// owner or no owner — which is the one row that separates the two
+    /// commands. README.md is `modified` with a NULL
+    /// `staged_by_session_id`, so it appears here and not above.
+    #[test]
+    fn changed_files_takes_unstaged_rows_too() {
+        let c = testdb::fixture();
+        let f = changed_files(&c, 1, 1).unwrap();
+        assert_eq!(
+            paths(&f),
+            vec!["README.md", "src/hot.rs", "src/live.rs", "src/main.rs"]
+        );
+        // The unstaged one is present...
+        assert!(f.iter().any(|x| x.file_path == "README.md"));
+        // ...and the `unmodified` row is not, which is the filter's
+        // only job.
+        assert!(!f.iter().any(|x| x.file_path == "notes.md"));
+    }
+
+    /// A NULL `staged_by_session_id` means *unstaged*, never *unowned*.
+    /// The predicate is `IS NOT NULL`, so a row with no owner must not
+    /// be swept in — the same mistake `--stage` had to be argued out of.
+    #[test]
+    fn a_null_staging_owner_is_not_staged() {
+        let c = testdb::fixture();
+        let staged = staged_files(&c, 1, 1).unwrap();
+        assert!(!staged.iter().any(|f| f.file_path == "README.md"));
+        assert_eq!(staged.len(), 3);
+    }
+
+    /// The bare form does not select `current_hash` and `--staged`
+    /// does. That is not tidiness: it is the difference between the two
+    /// renderers' new sides, so leaving it `None` here keeps a renderer
+    /// from reading a column its Python counterpart never had.
+    #[test]
+    fn only_the_staged_query_carries_the_current_hash() {
+        let c = testdb::fixture();
+        assert!(changed_files(&c, 1, 1)
+            .unwrap()
+            .iter()
+            .all(|f| f.current_hash.is_none()));
+        let staged = staged_files(&c, 1, 1).unwrap();
+        let main = staged
+            .iter()
+            .find(|f| f.file_path == "src/main.rs")
+            .unwrap();
+        assert!(main.current_hash.is_some());
+    }
+
+    /// A deletion carries a NULL `content_hash`, which is why both
+    /// renderers must branch on `'deleted'` *before* looking the
+    /// content up — in the bare form a NULL hash otherwise trips the
+    /// unreadable-content check and prints the wrong line.
+    #[test]
+    fn a_deleted_row_carries_no_content_hash() {
+        let c = testdb::fixture();
+        let f = changed_files(&c, 1, 1).unwrap();
+        let del = f.iter().find(|x| x.state == "deleted").unwrap();
+        assert_eq!(del.file_path, "src/live.rs");
+        assert!(del.content_hash.is_none());
+    }
+
+    /// Scoped to the project *and* the branch. A branch nothing is
+    /// staged on returns nothing rather than the project's rows.
+    #[test]
+    fn both_queries_are_scoped_to_the_branch() {
+        let c = testdb::fixture();
+        assert!(staged_files(&c, 1, 2).unwrap().is_empty());
+        assert!(changed_files(&c, 1, 2).unwrap().is_empty());
+        assert!(staged_files(&c, 2, 1).unwrap().is_empty());
+    }
+
+    /// The committed side resolves through `vcs_file_states` and
+    /// `content_blobs`, and comes back as text.
+    #[test]
+    fn the_committed_side_resolves_through_the_blob() {
+        let c = testdb::fixture();
+        let text = last_committed_content(&c, 1).unwrap();
+        assert!(text.is_some(), "src/main.rs has committed states");
+        assert!(text.unwrap().contains("fn main()"));
+    }
+
+    /// A file with no commit touching it has no committed content, and
+    /// that is `None` rather than an empty string — the renderers'
+    /// `or ""` is what turns it into one, and only after the
+    /// truthiness test has already branched on it.
+    #[test]
+    fn a_file_with_no_commits_has_no_committed_content() {
+        let c = testdb::fixture();
+        assert!(last_committed_content(&c, 14).unwrap().is_none());
+    }
+
+    /// `content_by_hash` is text or nothing: a binary blob and a
+    /// missing one are both `None`, which is what collapses them into
+    /// one branch in the renderer.
+    #[test]
+    fn content_by_hash_gives_text_or_nothing() {
+        let c = testdb::fixture();
+        assert_eq!(
+            content_by_hash(&c, "h-readme-b").unwrap().as_deref(),
+            Some("shared\n")
+        );
+        assert!(content_by_hash(&c, "h-png").unwrap().is_none());
+        assert!(content_by_hash(&c, "no-such-hash").unwrap().is_none());
+    }
+
+    /// The active branch is what both forms scope to, and the fixture's
+    /// project 1 resolves to one.
+    #[test]
+    fn the_active_branch_resolves_for_both_forms() {
+        let c = testdb::fixture();
+        assert_eq!(active_branch(&c, 1).unwrap(), Some(2));
+        // A project with neither an active nor a default branch is the
+        // `No active branch found` exit, measured live on cathedraldb.
+        assert_eq!(active_branch(&c, 3).unwrap(), None);
     }
 }

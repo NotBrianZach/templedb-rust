@@ -96,14 +96,29 @@ impl SessionId {
         self.0
     }
 
-    /// A `SessionId` without a lookup behind it, for this crate's tests.
+    /// An id this crate has just confirmed names a row with
+    /// `ended_at IS NULL`.
     ///
-    /// There is deliberately no public constructor. Outside this crate
-    /// the only way to hold one is to have called [`resolve`], so the
-    /// type carries a fact — *this id named a live row* — rather than
-    /// merely a number. `vcs log`'s session view and the pending count
-    /// both take one, and neither should be reachable with a pid or a
+    /// There is deliberately no *public* constructor, and this one is
+    /// `pub(crate)` for the same reason the type exists: outside this
+    /// crate the only way to hold a `SessionId` is to have had one
+    /// handed back by a function that checked liveness, so the type
+    /// carries a fact — *this id named a live row* — rather than merely
+    /// a number. `vcs log`'s session view and the pending count both
+    /// take one, and neither should be reachable with a pid or a
     /// `vcs_commits.session_id` read back out of a row.
+    ///
+    /// Two call sites, both of which run the check immediately above
+    /// the call: [`lookup`] here, and
+    /// [`current_checkout_session`](crate::current_checkout_session),
+    /// which reproduces a *different* Python function with the same
+    /// liveness requirement and a weaker refusal — see its note on why
+    /// it reads the name variable this module declines.
+    pub(crate) const fn from_live_row(id: i64) -> Self {
+        SessionId(id)
+    }
+
+    /// A `SessionId` without a lookup behind it, for this crate's tests.
     #[cfg(test)]
     pub(crate) const fn in_test(id: i64) -> Self {
         SessionId(id)
@@ -293,10 +308,21 @@ pub fn resolve_tx(
         .context("looking up the pinned session in the write target")?;
     match row {
         Some(row) => Ok(Some(SessionId(row.get(0)))),
+        // The second line said "or unset it to record the intent with
+        // no session" until 2026-11-18, and `file rm` made it wrong.
+        // That advice was true of both callers this message had — a
+        // `file set` and an `intent create` with no session both
+        // proceed — and `file rm` refuses outright, because its entire
+        // effect is a row a session has to own. So the clause is
+        // generic now rather than re-specialised per caller, for
+        // `resolve_project_exact`'s stated reason: a refusal from one
+        // command that explains itself in another command's terms is
+        // worse than a refusal that explains less.
         None => bail!(
             "{}={id} references no live session in the write target\n\
-             Pick a live id from `templedb vcs session list --active`, or \
-             unset it to record the intent with no session.",
+             Pick a live id from `templedb vcs session list --active`. Unsetting \
+             it is not the same as fixing it: what a write with no session does \
+             depends on the write.",
             origin.label()
         ),
     }

@@ -1,30 +1,49 @@
 -- TempleDB, Postgres: the objects the Rust port reads.
 --
--- SCOPE. This is not the schema. The live SQLite database has 163
--- tables, 45 views, 61 triggers and 361 indexes; this file has twenty-one
--- tables and one view, because that is the entire set the Rust port
--- touches today. The full translation is the next step toward Postgres
--- as the primary store and belongs with the write-path design document,
--- not here: the remaining 142 tables have no reader in this codebase
--- yet, and mirroring data nothing reads would be work with no way to
--- verify it.
+-- SCOPE. This is not the schema. Recounted 2026-11-17, the live SQLite
+-- database has 171 rows of type `table` in `sqlite_master` — 160 once
+-- FTS5's ten shadow tables are set aside — plus 45 views, 61 triggers
+-- and 381 indexes, of which 285 are not SQLite's own autoindexes. This
+-- file has twenty-three tables and two views, because that is the entire
+-- set the Rust port touches today. The full translation is the next step
+-- toward Postgres as the primary store and belongs with the write-path
+-- design document, not here: the remaining 148 tables have no reader in
+-- this codebase yet, and mirroring data nothing reads would be work with
+-- no way to verify it.
+--
+-- The counting method is spelled out because the previous numbers here
+-- (163 tables, 361 indexes) were right when written and are not any
+-- more, and nothing in the gate recounts them.
 --
 -- Columns are likewise limited to the ones the queries name, plus the
 -- keys the joins and uniqueness constraints need. The omitted columns
 -- are not all uninteresting — `project_files` alone has twenty — but
 -- several carry foreign keys to tables outside this subset
--- (`file_types`, `commit_files`), so including them would drag the
--- boundary somewhere arbitrary rather than somewhere defensible. The
--- boundary moves when a reader appears and not before: `vcs_sessions`
--- arrived with `vcs log`'s default view, at two of its ten columns.
+-- (`commit_files`), so including them would drag the boundary somewhere
+-- arbitrary rather than somewhere defensible. The boundary moves when a
+-- reader appears and not before: `vcs_sessions` arrived with `vcs log`'s
+-- default view at two of its ten columns, and `file_types` arrived with
+-- `search files` on 2026-11-17 at two of five — reached only through a
+-- view, which is a first here. That `file_types` was itself named above
+-- as an example of a table the boundary should not be dragged toward is
+-- the ordinary case of the rule working: a reader appeared, so it moved.
 --
--- Three tables are exceptions to "follow the readers", and they follow
+-- Two tables are exceptions to "follow the readers", and they follow
 -- the same rule read sideways: nothing *reads* them here, a writer
 -- writes them, and the columns carried are the ones that writer
--- supplies. `edit_intents` at twelve of fourteen, `vcs_working_state`
--- at nine of eleven, and `vcs_commit_metadata` at three of forty —
--- where the trim is not a boundary decision at all but the table's
--- entire information content. See each table's own note.
+-- supplies. `vcs_working_state` at nine of eleven, and
+-- `vcs_commit_metadata` at three of forty — where the trim is not a
+-- boundary decision at all but the table's entire information content.
+-- See each table's own note.
+--
+-- It was three tables until 2026-10-30. `edit_intents` left the list by
+-- gaining readers — `intent list` and `intent show` — and is now at all
+-- fourteen columns on the ordinary rule. It is worth recording that it
+-- left the list rather than being removed from it: the two columns it
+-- had been missing were explained for eleven days as waiting on
+-- `intent cancel` and `vcs commit`, two *writes*, when a read was what
+-- they needed. An exception that is stated often enough starts being
+-- used as a reason.
 --
 -- `vcs_file_states.file_path` is the same exception one column wide,
 -- and the sharpest case of it: nothing reads that column in *either*
@@ -43,6 +62,9 @@ BEGIN;
 -- differently depending on where the bytes live.
 --
 -- 1. EVERY TEXT COLUMN IS `COLLATE "C"`.
+--
+--    (`checkouts.checkout_at DESC, id DESC` sorts on text too, which
+--    makes five.)
 --
 --    SQLite compares TEXT with BINARY collation: byte order, always.
 --    Postgres uses the database's collation, which on a typical
@@ -104,7 +126,29 @@ CREATE TABLE projects (
     -- of five. The constraint belongs to the writer, and a value
     -- outside the list should mirror and render as itself rather than
     -- fail the copy — the mirror's job is to carry what is there.
-    project_category text COLLATE "C"
+    project_category text COLLATE "C",
+    -- `project list --type`, which is a DIFFERENT column from
+    -- `project_category` despite the names. regular / nixos-config /
+    -- service against package / home-module / nixos-module / service /
+    -- desktop-app — overlapping on `service`, varying independently in
+    -- the live data, so filtering the wrong one is right about every
+    -- value but that one. Added 2026-10-29, when the sweep's
+    -- flag-surface stage reported `--type` appearing on Python's side.
+    project_type     text COLLATE "C"
+);
+
+-- Two of five live columns: `search files` prints `type_name` through
+-- `files_with_types_view` and the view's join needs `id`. `category` is
+-- carried by the live view as `file_category` and by no reader here, so
+-- it stays out along with `description` and `created_at` — the
+-- projection below drops it, which is why the table can.
+--
+-- The 23rd table, added 2026-11-17 with `search files`. It is the first
+-- one in the subset that exists only to be *joined through* — nothing
+-- selects from it directly, in either implementation.
+CREATE TABLE file_types (
+    id        bigint PRIMARY KEY,
+    type_name text COLLATE "C" NOT NULL UNIQUE
 );
 
 CREATE TABLE project_files (
@@ -112,9 +156,16 @@ CREATE TABLE project_files (
     project_id    bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     file_path     text COLLATE "C" NOT NULL,
     status        text COLLATE "C" DEFAULT 'active',
-    -- Both read only by `project show`. No FK on `file_type_id`:
-    -- `file_types` is outside this subset and the only use is
-    -- `COUNT(DISTINCT file_type_id)`, which needs the value, not the row.
+    -- Read by `project show`, and `file_type_id` also by
+    -- `files_with_types_view`. Still no FK, now that `file_types` is in
+    -- the subset and one could be declared: the view INNER joins, so a
+    -- dangling `file_type_id` makes a file invisible to `search files`
+    -- rather than invalid, and that is a behaviour the two backends have
+    -- to *agree* on. Declaring the FK would instead make `mirror` fail
+    -- on data this port does not control — the same call the
+    -- `project_category` CHECK below gets, for the same reason: the
+    -- mirror's job is to carry what is there. No live row dangles today
+    -- (0 of 2,780), so the constraint would buy nothing either.
     file_type_id  bigint,
     lines_of_code bigint,
     -- migration 106. Read by `file ls -l`, which renders NULL as the
@@ -259,11 +310,21 @@ CREATE TABLE vcs_branches (
     UNIQUE (project_id, branch_name)
 );
 
--- The staging sessions a commit can belong to. Two columns of ten, and
--- the boundary follows the readers as it does everywhere else: the port
--- resolves a session the caller *named* and checks that it is live, so
--- it reads `id` and `ended_at` and nothing more. `name`, `author`,
--- `host`, `pid`, `started_at`, `ended_reason`,
+-- The staging sessions a commit can belong to. Four columns of ten, and
+-- the boundary follows the readers as it does everywhere else.
+--
+-- `id` and `ended_at` are `session.rs`: the port resolves a session the
+-- caller *named* and checks that it is live.
+--
+-- `name` and `started_at` arrived on 2026-11-15 with checkout-role
+-- resolution, and they are worth separating from the two above because
+-- the module that reads them is not the module that reads a session.
+-- `CheckoutRepository.current_session_id` resolves TEMPLEDB_SESSION by
+-- name — `WHERE name = ? AND ended_at IS NULL ORDER BY started_at DESC
+-- LIMIT 1` — and *that* function does not create, where the one
+-- `session.rs` declines does. So the name is readable here on the
+-- ordinary rule and refused there on the write rule; see
+-- `checkouts.rs`. `author`, `host`, `pid`, `ended_reason`,
 -- `expected_lifetime_seconds` and `reap_policy` belong to
 -- `vcs session list` / `show` / `prune`, none of which is ported — and a
 -- column with no reader has nothing to verify a mirror against.
@@ -271,12 +332,56 @@ CREATE TABLE vcs_branches (
 -- `ended_at IS NULL` means active, which is the one predicate anything
 -- here asks. 842 rows live, 40 of them active.
 CREATE TABLE vcs_sessions (
-    id       bigint PRIMARY KEY,
-    ended_at text COLLATE "C"
+    id         bigint PRIMARY KEY,
+    name       text COLLATE "C",
+    started_at text COLLATE "C",
+    ended_at   text COLLATE "C"
 );
 
 -- Active sessions are 5% of the table and the only ones ever looked up.
 CREATE INDEX vcs_sessions_live ON vcs_sessions (id) WHERE ended_at IS NULL;
+
+-- Which directory on disk holds a project's content. Seven columns of
+-- nine, read by `checkouts.rs` for `file where`'s two mirror labels.
+--
+-- The 22nd table, and the first one added because a *shipped command
+-- was wrong*: `file where` built both of its paths by hand and the
+-- sweep reported it differing from Python on three of its four
+-- tree-reading rows, in both directions — a mirror missed and a mirror
+-- invented. Python resolves both labels from these rows. See the
+-- README's *The resolver the hardcoded paths were standing in for*.
+--
+-- `branch_name` and `last_sync_at` are selected by Python's resolution
+-- query and read by neither purpose this port implements, so they are
+-- the two left out.
+--
+-- No FK on `session_id`, for `vcs_commits`'s reason one table up:
+-- `vcs session prune` can delete a session whose checkout rows still
+-- name it, and resolution asks "is this session still live" expecting
+-- "no" as an answer rather than as a constraint violation. Measured
+-- 2026-11-15: 250 rows, 96 active — 9 `canonical`, 80 `edit`,
+-- 7 `scratch`, none with a NULL `kind`, and 69 of the 96 carrying a
+-- session.
+CREATE TABLE checkouts (
+    id            bigint PRIMARY KEY,
+    project_id    bigint NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    checkout_path text COLLATE "C" NOT NULL,
+    -- The sort key, and the one with no tie-break on Python's side.
+    -- Second granularity, and resolution takes `[0]` — so a tie decides
+    -- which directory a command reads. This port adds `id DESC`; zero
+    -- of the 96 active rows are tied today. See `checkouts.rs`.
+    checkout_at   text COLLATE "C",
+    is_active     integer,
+    -- migration 113: `canonical` / `edit` / `scratch`. Nullable, and
+    -- non-NULL on every live row; a NULL matches no bucket in either
+    -- implementation rather than defaulting to one.
+    kind          text COLLATE "C",
+    session_id    bigint
+);
+
+-- Resolution is always "this project's active rows, newest first".
+CREATE INDEX checkouts_project_active
+    ON checkouts (project_id, is_active, checkout_at DESC);
 
 CREATE TABLE vcs_commits (
     id               bigint PRIMARY KEY,
@@ -358,22 +463,33 @@ CREATE TABLE vcs_commit_parents (
     PRIMARY KEY (commit_id, parent_commit_id)
 );
 
--- Provenance for `file set`: who set this, when, from which session.
+-- Provenance for `file set`, and the row `intent create` proposes:
+-- who set this, when, from which session.
 --
--- The first table in this file that exists for a *writer* rather than a
--- reader, and the column set is chosen accordingly: these are the ones
--- `record_intent` writes, plus `id`. Twelve of fourteen.
+-- **All fourteen columns, and this header said twelve until
+-- 2026-11-17.** It arrived as the first table in this file carried for
+-- a *writer* rather than a reader, with a projection chosen as "the
+-- columns `record_intent` writes, plus `id`" and the two omitted ones
+-- explained by naming `intent cancel` and `vcs commit` — two writes —
+-- as their unblocker. That reasoning was wrong and `intent show`
+-- disproved it on 2026-10-30: a pure read prints both, so a reader was
+-- all either column ever needed. The columns were added that day and
+-- the comment beside them records the correction; this paragraph did
+-- not get it, so the table and its own header disagreed for eighteen
+-- days. The README's step 23 claims all three sites were corrected and
+-- the count was two of three — `mirror.rs` and *Known gaps*.
 --
--- The two omitted are `cancelled_at` and `applied_commit_id`, which
--- belong to `intent cancel` and to the commit link `vcs commit` would
--- make. Neither is ported, and `applied_commit_id` additionally
--- references `vcs_commits` — a column carried for nobody that would also
--- constrain the load order.
+-- Worth keeping rather than deleting, because the error is the kind
+-- this file is most exposed to: a projection comment is prose beside a
+-- column list, nothing cross-checks the two, and a table that spent
+-- two weeks genuinely write-only keeps attracting write-only
+-- reasoning.
 --
--- `created_at` is carried even though the writer lets it default,
+-- `created_at` is carried even though Python's writers let it default,
 -- because `mirror` has to reproduce what the live rows hold and the
--- cross-backend digest compares it. The DEFAULT exists for the writer;
--- the column exists for the copy.
+-- cross-backend digest compares it. Both of this port's writers supply
+-- it from the injected clock, so the DEFAULT is fidelity to the live
+-- schema rather than a value anything here relies on.
 CREATE TABLE edit_intents (
     id               bigint PRIMARY KEY,
     -- No FK to `vcs_sessions`, though the live schema declares one.
@@ -399,16 +515,40 @@ CREATE TABLE edit_intents (
     description      text COLLATE "C",
     -- CHECK'd to ('proposed','applied','cancelled') in SQLite and not
     -- reproduced, for the reason `ingestion_runs` gives: a constraint
-    -- that rejects a future status turns a copy into a failure. The
-    -- writer only ever inserts 'applied'.
+    -- that rejects a future status turns a copy into a failure.
+    --
+    -- All three values are now written here. `file set`'s intent
+    -- inserts 'applied' (the write already happened, in the same
+    -- transaction), `intent create` inserts 'proposed', and
+    -- `intent cancel` moves a row to 'cancelled'. So the absent CHECK
+    -- is the one place in the subset where a fourth status could exist,
+    -- which is why `intent.rs`'s renderer keeps Python's `?` fallback
+    -- rather than an exhaustive match.
     status           text COLLATE "C" NOT NULL DEFAULT 'proposed',
     created_at       text COLLATE "C" NOT NULL,
-    applied_at       text COLLATE "C"
+    applied_at       text COLLATE "C",
+    -- The last two columns in the subset to arrive, 2026-10-30, and the
+    -- only pair whose absence was explained by naming the wrong
+    -- unblocker. Both were "left to `intent cancel` and `vcs commit`" —
+    -- two writes — when what they needed was `intent show`, a read that
+    -- prints them. One live row carries a `cancelled_at`; 882 of 1,346
+    -- carry an `applied_commit_id`.
+    cancelled_at     text COLLATE "C",
+    -- bigint, not text: this references `vcs_commits.id`, the integer
+    -- key, and never a commit hash. The two are easy to confuse here
+    -- because every other commit reference a user types is a hash.
+    applied_commit_id bigint
 );
 
 -- The provenance question is always "what happened to this file", so
 -- the index carries the pair and the time.
 CREATE INDEX edit_intents_file ON edit_intents (project_id, file_path, created_at DESC);
+
+-- `intent list` orders by `created_at DESC, id DESC` and filters on
+-- `status` and `session_id`. The leading column is the sort, because
+-- the default view's `status = 'proposed'` selects 2 of 1,346 rows and
+-- a `--limit` over the time order is what the planner should drive.
+CREATE INDEX edit_intents_recent ON edit_intents (created_at DESC, id DESC);
 
 -- Three columns of forty, and that is the table's whole information
 -- content rather than the usual follow-the-readers trim.
@@ -705,6 +845,51 @@ CREATE VIEW source_snapshots AS
     JOIN project_files pf ON pf.id = vfs.file_id
     JOIN projects p       ON p.id = pf.project_id
     LEFT JOIN content_blobs cb ON cb.hash_sha256 = vfs.content_hash;
+
+-- ---------------------------------------------------------------------
+-- `files_with_types_view`, the second view, added 2026-11-17 with
+-- `search files`.
+--
+-- The live view's joins and predicates exactly, projected to five of its
+-- seventeen columns — the ones `search files` names. The other twelve
+-- are `project_files` columns outside this subset, and copying them here
+-- would move the boundary to wherever a view happens to reach rather
+-- than to wherever a reader does.
+--
+-- Nothing here is translated except the projection. In particular:
+--
+--   * `file_types` is INNER joined, so a file with an unresolved type is
+--     invisible to `search files`. 0 of 2,780 live rows dangle, so the
+--     branch is unreachable on live data and the fixture is where it is
+--     tested; it is reproduced rather than relaxed to a LEFT JOIN
+--     because the two backends have to agree on it, not because the
+--     inner join is right. (`search content`'s Python comment records
+--     the opposite call for the *FTS* query, where an inner join on this
+--     table silently dropped indexed files. The two queries genuinely
+--     want different joins; this one is the view's.)
+--
+--   * There is NO `status` filter. 373 of the 2,780 rows are
+--     `status = 'deleted'` and every one of them is listed by
+--     `search files`, which is the one file-listing surface in either
+--     implementation that reports a deleted file as present. `file ls`
+--     and `search content` both filter it. Reproduced for parity and
+--     reported upstream; see the README.
+--
+-- No `COLLATE "C"` clauses are added, because none is needed: every
+-- column is a plain reference to one that already carries it, and
+-- `ORDER BY id` is the only sort and is a bigint.
+-- ---------------------------------------------------------------------
+
+CREATE VIEW files_with_types_view AS
+    SELECT
+        pf.id            AS id,
+        p.slug           AS project_slug,
+        pf.file_path     AS file_path,
+        ft.type_name     AS type_name,
+        pf.lines_of_code AS lines_of_code
+    FROM project_files pf
+    JOIN file_types ft ON pf.file_type_id = ft.id
+    JOIN projects p    ON pf.project_id = p.id;
 
 -- ---------------------------------------------------------------------
 -- NOT TRANSLATED, AND NOT NEEDED: `file_contents_fts`.

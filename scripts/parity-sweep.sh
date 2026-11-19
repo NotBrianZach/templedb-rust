@@ -56,6 +56,59 @@ INVOCATIONS=(
     "file ls templedb --edit-mode non-immutable"
     "file ls templedb -l --edit-mode immutable"
     "file cat templedb src/cli/commands/entity.py"
+    # `file where` — the first rows in this script whose answer depends
+    # on a filesystem, and the first consumers of the tree fence below.
+    # Eight rows, chosen so that each of the command's branches is one.
+    #
+    # The first four were written when both mirror paths were hardcoded.
+    # Three of them were FAILING by 2026-11-15, because Python had moved
+    # both labels onto checkout-role resolution and this port had not;
+    # they pass unchanged now and are left exactly as they were, because
+    # a row that keeps its arguments through a rewrite of what it tests
+    # is the only kind that can report a regression.
+    #
+    #   drift in the checkout, and nothing else present
+    "file where templedb-rust README.md"
+    #   an overlay hit, which is the branch the `os.walk` order matters
+    #   for -- this file is in the checkout *and* resolved through
+    #   ~/.emacs.d into the store, and both copies drift from the DB
+    "file where templedb integrations/emacs/templedb-agent.el"
+    #   an overlay hit that drifts while the checkout matches. Also the
+    #   row that pins Python's basename matching: the overlay copy here
+    #   is the *templedb* layer's packages.el, a different file that
+    #   happens to share a name, and the command reports drift between
+    #   two files that were never the same one.
+    "file where emacs-config emacs.d/layers/projdb/packages.el"
+    #   everything agrees: exit 0 and no advisory line
+    "file where system_config emacs.d/layers/templedb/packages.el"
+    # Two rows for checkout-role resolution, added 2026-11-15 when the
+    # hardcoded mirror paths were replaced by it. Both were measured
+    # differing before that change, and they are the two *directions* of
+    # the same defect -- a row that only ever caught the missing half
+    # would have passed while this port invented a mirror.
+    #
+    # The four rows above already cover an adopted edit tree, which is
+    # the branch the old `edit-work` probe could never reach: three of
+    # them resolve one, and that is why three of them were failing.
+    #
+    #   no active `checkouts` row -- 14 of the 26 projects -- so Python's
+    #   `repo_url` fallback answers, and its tree is nowhere near
+    #   ~/.config/templedb. The old implementation MISSED this mirror.
+    "file where woofsledger src/db.py"
+    #   the opposite error: the old implementation INVENTED a `checkout `
+    #   line here by hashing ~/.config/templedb/checkouts/<slug>/<path>,
+    #   which exists and is not what resolution picks. This project has
+    #   `scratch` and `edit` rows and no `canonical` one, so it is also
+    #   the live case for the last-resort branch, where a `scratch` tree
+    #   -- never resolved to by name -- is what answers.
+    "file where nixos_anywhere_vultr_woofs .envrc"
+    # The two exit-2 rows are deliberately NOT fenced, and that is the
+    # point of having them: Python returns before the probe loop when
+    # the database has no current row, so neither of these reads a tree
+    # at all. If a future change made them read one, the unfenced row
+    # is what would start flapping -- a fenced row would hide it.
+    "file where templedb no/such/file.txt"
+    "file where no-such-project-ever README.md"
     "entity explore Machine/zMothership2"
     "entity trace Machine/zMothership2 --depth 1"
     "entity trace Machine/zMothership2 --depth 2"
@@ -109,6 +162,44 @@ INVOCATIONS=(
     "vcs diff templedb src/gui_pages/README.md B65BADB158475631 A2DD61F68EDFB702 -s --no-color"
     "search content rusqlite"
     "search content checkout -p templedb"
+    # `search files`, both forms. They print DIFFERENT COLUMNS -- the
+    # filtered one drops `project_slug` and gains `lines_of_code` -- so
+    # neither form's rows exercise the other's table, and both are here.
+    #
+    # The first two are the unfiltered form at one row and at 25 across
+    # five projects, which is what checks the ORDER BY: Python has none,
+    # and these rows are byte-identical only because `ORDER BY id` is
+    # what its planner happens to produce. See the README.
+    "search files justfile"
+    "search files flake"
+    # The filtered form. `README.md` is the one templedb-rust file with
+    # a `lines_of_code`, and `.rs` is 28 files where all but one are
+    # NULL -- which Python prints as the literal word `None`, so this
+    # row is what pins `py_str_opt_i64`.
+    "search files README.md -p templedb-rust"
+    "search files .rs -p templedb-rust"
+    # Over the hardcoded hundred: 536 files match and both sides print
+    # the first 100 in id order. Differs on stderr only, where this port
+    # says the list was cut and Python's `(100 results)` does not.
+    "search files .py"
+    # A deleted file, listed as present. The view has no `status`
+    # filter, unlike `file ls` and `search content`; `src/main.py` is
+    # deleted from templedb-rust and `file ls` does not show it. An
+    # upstream behaviour reproduced rather than endorsed -- this row is
+    # here so that it changing upstream shows up here.
+    "search files src/main.py -p templedb-rust"
+    # No match, exit 0, one line of stdout -- not an error on either
+    # side.
+    "search files zzz-no-such-file-ever"
+    # An unresolvable project, and the same no-match line. Python's
+    # `search` module is the ONE command family that never calls the
+    # fuzzy matcher, so `-p` here is an exact slug and a miss selects
+    # nothing instead of failing. Every other project argument in this
+    # sweep resolves fuzzily; this row is why that is a per-command
+    # fact rather than a port-wide one.
+    "search files README -p no-such-project-ever"
+    # The LIKE-metacharacter divergence, in EXPECTED below.
+    "search files get_"
     "entity paths Commit/templedb/FBDACA1F09FBBEF7 Commit/templedb/E534AF92F549CDDD"
     # No path, so the whole reachable component is exhausted.
     "entity paths Machine/zMothership2 Machine/web1 --max-depth 6"
@@ -142,6 +233,144 @@ INVOCATIONS=(
     # not exist. Python gives neither of them a 2.
     "source revisions no-such-project-ever CHANGELOG.md"
     "vcs show templedb no-such-commit-ever --no-diff"
+    # `doctor history`, all four of its shapes. The default limit
+    # matters on its own: 30 rows cuts *inside* the tied second a full
+    # `doctor entities` pass leaves behind (~44 rows share a
+    # timestamp), so a missing `id DESC` tie-break returns an arbitrary
+    # subset here and the row would fail intermittently rather than
+    # never.
+    "doctor history"
+    "doctor history --limit 5"
+    "doctor history --violated-only"
+    "doctor history --check no_undefined_names"
+    "doctor history --check no_undefined_names --limit 3"
+    # Selects nothing, so the "(no invariant check history yet …)"
+    # branch is compared rather than skipped. An empty result that both
+    # sides reach by different routes is still the same bytes.
+    "doctor history --check no-such-invariant-ever"
+    # `intent list` / `intent show`. The limits here are chosen from a
+    # measurement and the reason is the opposite of `doctor history`'s
+    # above: there the default limit cuts *inside* a tied second and
+    # that is why the row is valuable, and here it must not, because
+    # Python has no `id DESC` tie-break at all.
+    #
+    # Measured on the live database 2026-10-30: 32 `created_at` values
+    # are shared by two rows each out of 1,346, and the newest tie group
+    # sits at **rank 134**. So every invocation below stays inside the
+    # first 134 rows, where both implementations are deterministic.
+    # Past that Python disagrees with *itself* run to run, so a byte
+    # diff would be comparing against an unstable oracle and a failure
+    # there would say nothing about this port. See `intent.rs`.
+    # The `--all-statuses` rows below are in EXPECTED, because the
+    # tie-break divergence is permanent until Python grows one -- see
+    # the note there, including why picking "safe" arguments was the
+    # wrong way to handle it.
+    #
+    # The two narrow rows are NOT exempted and are still compared
+    # byte-for-byte. They are the default view, `status = 'proposed'`,
+    # which is 2 of 1,356 live rows -- small enough that a tie is
+    # unlikely rather than impossible. If one lands they move up to
+    # EXPECTED too, and that is the right failure: a new difference
+    # reported once beats a row quietly exempted in advance.
+    "intent list"
+    "intent list --all-statuses"
+    "intent list --all-statuses --limit 50"
+    "intent list --limit 1"
+    "intent list -p templedb --all-statuses --limit 20"
+    "intent list -s 1216 --all-statuses"
+    # Selects nothing, so the "(no matching intents)" branch is compared
+    # rather than skipped.
+    "intent list -s 999999 --all-statuses"
+    # A project that does not resolve: exit 1 from the fuzzy matcher at
+    # the edge, before the query is built.
+    "intent list -p no-such-project-ever"
+    # The full record, three shapes. #1 is the oldest row and the only
+    # one in the whole table carrying a `cancelled_at`, so it is the
+    # single invocation that compares that column's rendering — and it
+    # also has a NULL `session_id`, so it is where the literal `None`
+    # line gets diffed.
+    "intent show 1"
+    # Applied, with a commit link and a session. The common shape —
+    # 882 of 1,346 rows carry an `applied_commit_id` — and the one that
+    # exercises the column the mirror grew for this command.
+    "intent show 1347"
+    # Proposed: the nine-line minimum, with all five conditional lines
+    # absent.
+    "intent show 1279"
+    # Exit 1 and a stderr-only message. Python's `intent show` returns
+    # a bare 1 here where `source snapshot` returns 2 for the same
+    # class of miss, so this row is what pins the inconsistency rather
+    # than letting the port tidy it.
+    "intent show 99999999"
+    # `vcs diff`'s two working-set forms, ported 2026-10-31. Both read
+    # only mirrored tables and neither touches a tree, which is what
+    # made them portable -- the README had grouped `--staged` with the
+    # genuinely tree-dependent form.
+    #
+    # regr-test is the sharp one: its single staged row is `modified`
+    # with a staged hash that DIFFERS from `file_contents.is_current`,
+    # so it is the row that pins Python's unused-`staged_hash` bug. If
+    # upstream fixes that, this row starts differing and says so.
+    "vcs diff regr-test --staged --no-color"
+    "vcs diff regr-test --staged -s --no-color"
+    "vcs diff qa-runner --staged --no-color"
+    "vcs diff templedb --staged --no-color"
+    # Colour on, which is the default and the shape a human sees.
+    "vcs diff regr-test --staged"
+    # The bare form: every changed row, staged or not.
+    "vcs diff regr-test --no-color"
+    "vcs diff qa-runner --no-color"
+    "vcs diff templedb --no-color"
+    # Nothing staged and nothing changed -- the two empty branches,
+    # which print different text and both exit 0.
+    "vcs diff bza --staged"
+    "vcs diff bza"
+    # No active and no default branch: `No active branch found` on
+    # stderr and exit 1, which both forms share.
+    "vcs diff cathedraldb --staged"
+    "vcs diff cathedraldb"
+    # `file retype`, ported 2026-11-19. The dry form is the default, so
+    # this is the one command in the `file` family whose interesting
+    # behaviour is a READ with a diffable stdout -- every other write
+    # here had to be cross-read or measured on a copy. Its answer is a
+    # function of `importer.scanner`'s 179-entry classifier, which is
+    # pinned separately against CPython in `classify_parity.rs`; these
+    # rows are what check the query, the grouping and the renderer.
+    #
+    # The unfiltered form is the sharp one, and it is sharp for a
+    # reason the row cannot show: it finds 26 kinds of change with 11
+    # tied at a count of 1, and Python cuts the list at 25 -- so the
+    # cut falls INSIDE a tie group and `most_common` breaks ties by row
+    # order. Python has no `ORDER BY`; this port adds `ORDER BY pf.id`,
+    # which reproduces SQLite's current plan and gives Postgres a total
+    # key. Without it the cross-backend sweep would disagree about
+    # which rows appear, not merely about their order. See the README.
+    "file retype"
+    # A project narrowing, fuzzy on both sides -- unlike every write in
+    # this port, which takes an exact slug. `templedb-rust` is the one
+    # whose four `.rs` files carry the `SELECT id FROM file_types
+    # LIMIT 1` fallback type, so this row is the bug the command exists
+    # to repair, in four rows.
+    "file retype templedb-rust"
+    "file retype templedb"
+    "file retype system_config"
+    # `--from-type`, which is a condition on the LEFT JOINed column and
+    # therefore silently drops rows with a NULL or dangling
+    # `file_type_id`. `ansible_inventory` is the live value of that
+    # `LIMIT 1` fallback row (id 126) -- Python's own docstring says
+    # `api_route`, which was true before migration 138 reseeded the
+    # table -- so this row exercises 44 of the 88 changes.
+    "file retype --from-type ansible_inventory"
+    # Both narrowings together, and two forms that find nothing: the
+    # `Nothing to re-type (N active file(s) checked)` branch, which is
+    # the one place the denominator is printed without a numerator.
+    "file retype templedb --from-type javascript"
+    "file retype templedb-rust --from-type rust"
+    "file retype --from-type nonexistent_type"
+    # Exit 1 on an unresolved project, which is Python's bare
+    # `return 1`. stdout is empty on both sides and the stderr wording
+    # is this port's own, like every other error message here.
+    "file retype no-such-project-ever"
 )
 
 # Divergences that are deliberate and documented in the README. Matched
@@ -155,6 +384,41 @@ EXPECTED=(
     "entity explore"
     # Substring not stemmed, and a different layout.
     "search content"
+    # This port has an `id DESC` tie-break on `created_at` and Python
+    # has none. Same divergence `entity explore` carries one line up,
+    # and the same one `entity search` carried until Python grew a
+    # tie-break of its own.
+    #
+    # These rows were NOT here when the intent reads landed on
+    # 2026-10-30, and the reason they are here now is worth reading
+    # before writing another sweep row. The rows were chosen to stay
+    # inside the window where Python is deterministic -- measured then
+    # as "the newest tie group sits at rank 134, so a --limit 50 row is
+    # safe". That was true and it decayed in ONE DAY: two intents
+    # landed at 2026-10-31 17:43:51 and the newest tie group moved to
+    # rank 4.
+    #
+    # The lesson is not that the measurement was wrong. It is that
+    # "stay inside the deterministic window" is not a strategy, because
+    # the window is a property of live data and the data moves. A
+    # divergence that is permanent until upstream changes belongs in
+    # THIS list, where it is stated once, and not in a row's choice of
+    # arguments, where it has to keep being true.
+    "intent list --all-statuses"
+    "intent list -p templedb --all-statuses"
+    "intent list -s 1216 --all-statuses"
+    # Python interpolates `f"%{pattern}%"` raw, so `_` is a wildcard
+    # there and a literal here. Not a borderline call: `get_` returns
+    # ten rows upstream and NONE of them contains `get_` -- the hits are
+    # `GETTING_STARTED.md`, `get-booking-availability`,
+    # `getDialpadOpts.mjs` and so on. `set_` gives 321 against 5.
+    # Measured 2026-11-17: 1,112 of 2,780 live paths hold a literal
+    # underscore.
+    #
+    # Same bug `entity search` and the `file ls` prefix had, both since
+    # fixed upstream; this is the copy still live, and the row stays
+    # here so that it converging is a surprise rather than a silence.
+    "search files get_"
 )
 
 # Pin both implementations to the same live VCS session.
@@ -328,7 +592,34 @@ FLAG_COMMANDS=(
     "project show x"
     "file cat p f"
     "file ls p"
+    # Both sides have only `-h`/`--help` here, which is the claim worth
+    # pinning: `file where` was given no `--no-color` precisely so this
+    # stage would report zero divergences rather than a permanent one.
+    "file where p f"
     "file set p f"
+    # `file rm`, 2026-11-18, and the fourth write this stage can see.
+    # Neither side has a flag beyond `-h`/`--help`, which is the claim
+    # worth pinning rather than a triviality: the obvious thing to give
+    # this command was a `--session`, since the port requires a session
+    # where Python creates one, and Python's `file rm` has no such flag.
+    # Inventing it would have bought convenience and a permanent
+    # FLAGS_EXPECTED entry. `file where`'s missing `--no-color` is the
+    # same decision one command over.
+    "file rm p f"
+    # `file mark`, 2026-11-18, and the fifth write this stage can see.
+    # One flag on each side -- `--edit-mode`, required on both, with the
+    # same three choices -- and no allow-list entry. The choices
+    # themselves are invisible here (the awk strips `{...}` and
+    # `<...>`), so what this row pins is the flag NAME and its
+    # requiredness; that the three values match is pinned in
+    # `filemark.rs` instead.
+    #
+    # The tempting fourth value is `non-immutable`, which `file ls
+    # --edit-mode` takes and this one must not: Python's two `choices=`
+    # lists differ, and accepting it here would be a port-only flag
+    # VALUE -- a divergence this stage would not even report, since it
+    # compares names.
+    "file mark p f"
     "entity stats"
     "entity explore K/r"
     "entity trace K/r"
@@ -337,6 +628,13 @@ FLAG_COMMANDS=(
     "entity dead-imports"
     "entity observations K/r"
     "search content q"
+    # Both sides have `-p`/`--project` and nothing else. Deliberate:
+    # `search content`'s `--limit` is five entries down in
+    # FLAGS_EXPECTED, and `search files` was given no equivalent
+    # precisely so this line reports agreement instead of a permanent
+    # exemption -- Python's hundred is hardcoded here, where its FTS
+    # path had no limit at all.
+    "search files q"
     "source snapshot p f"
     "source revisions p f"
     "vcs log p"
@@ -344,7 +642,108 @@ FLAG_COMMANDS=(
     "vcs branch p"
     "vcs diff p f"
     "summary"
+    "doctor history"
+    "intent list"
+    "intent show 1"
+    # `intent cancel` is a write, so no INVOCATIONS row can exist for
+    # it -- but its NAME is Python's, unlike `file set`'s shape and
+    # unlike `vcs commit-staged` entirely, so `--help` resolves on both
+    # sides and this stage CAN see it. First write in the port whose
+    # surface the sweep compares at all, which closes half of the
+    # blind spot noted above.
+    "intent cancel 1"
+    # `intent create`, 2026-11-17, for `intent cancel`'s reason and
+    # with no allow-list entry: all four of Python's flags are ported
+    # (`-c`/`--content`, `-f`/`--from-file`, `--base-rev`,
+    # `-m`/`--message`) and none was invented, so the surfaces agree
+    # exactly. Second of the port's four writes this stage can see.
+    #
+    # What it still cannot see is this command's one behavioural
+    # divergence, because it is in a POSITIONAL: the project is matched
+    # exactly here and fuzzily by Python. Blind spot 3 above, and the
+    # same shape as `file set`'s.
+    "intent create p f"
+    # `intent apply`, 2026-11-18, and the third write this stage can
+    # see. One flag on each side -- `--no-rebase` -- and no allow-list
+    # entry, which took a decision rather than being free: what the
+    # flag selects is this port's behaviour whether or not it is
+    # passed, so the alternative was omitting it. It is here because a
+    # flag that promises a refusal and delivers one is honest, unlike
+    # `search content`'s `--no-fts` three entries down, which would
+    # promise matching this port cannot do.
+    #
+    # The fourth blind spot, and this command is the first instance:
+    # the stage compares the flag NAMES and can say nothing about what
+    # a shared flag DOES. `--no-rebase` is a no-op here and selects a
+    # different code path over there, and these surfaces agree
+    # perfectly. The divergence is in the README and in the exit
+    # status, not in anything this stage reads.
+    "intent apply 1"
+    # `file retype`, 2026-11-19. Two flags on Python's side --
+    # `--from-type` and `--apply` -- of which one is ported, so this
+    # command arrives WITH an allow-list entry rather than without one,
+    # unlike `intent create` and `file mark`. The entry is
+    # `file retype|--apply` and the argument for absent-rather-than-
+    # inert is beside it in FLAGS_EXPECTED.
+    #
+    # It also runs straight into blind spot 5, which `file mark` named
+    # a day earlier: this stage compares flag NAMES, and `--from-type`
+    # takes a free-form value on both sides so there is nothing to
+    # disagree about. The positional is blind spot 3 as usual, and here
+    # for once it is not a divergence -- `retype` is a read, so the
+    # project is fuzzy on both sides.
+    "file retype"
 )
+
+# This stage compares the INTERSECTION, and the headline number
+# ("N of N commands agree") counts only commands that exist on both
+# sides. Five things it cannot see, stated plainly because the number
+# reads like coverage:
+#
+#   1. Commands only PYTHON has. Measured 2026-10-31: Python has 44
+#      top-level commands and ~290 subcommands against this port's 10
+#      and 21. Recounted 2026-11-17 by walking `--help` -- 11
+#      top-level and 29 leaves, counting the three that take no
+#      subcommand (`mirror`, `state`, `summary`) as their own leaf,
+#      which is the method `tests/sweep_coverage.rs` uses and which the
+#      older pair of numbers evidently did not. Either way the point
+#      stands and is the only thing load-bearing here: `doctor
+#      entities` used to be named as *the* example of this blind spot,
+#      which understated it by about 270. The blind spot is most of the
+#      surface, not one command.
+#   2. Commands only THIS PORT has: `vcs commit-staged`, `mirror`,
+#      `state`. `templedb <name> --help` fails on the other side, so
+#      there is nothing to compare. For commit-staged that is the
+#      intended consequence of not calling it `vcs commit`.
+#   3. POSITIONAL arity, in either direction. The awk below reads the
+#      `options:`/`flags:` block and nothing else, so a positional
+#      that is required on one side and optional on the other is
+#      invisible. That is not hypothetical: `vcs diff`'s `file` was
+#      required here and `nargs='?'` over there from step 9 until
+#      2026-10-31, and this stage ran clean through all of it.
+#   4. What a shared flag DOES. This stage compares flag NAMES, so two
+#      surfaces can agree perfectly while one of the shared flags
+#      selects a different behaviour. Added 2026-11-18 with
+#      `intent apply`, whose `--no-rebase` is a no-op here and a live
+#      branch over there -- the first case that makes the gap concrete
+#      rather than hypothetical. Nothing in this script can close it:
+#      the divergence is visible in the exit status and argued in the
+#      README, and neither is a flag name.
+#   5. A flag's accepted VALUES. `parse_flags` strips `{...}` and
+#      `<...>` precisely so argparse's choice lists and clap's
+#      metavars do not have to be spelled the same way, which means a
+#      choice list that gained or lost a value is invisible. Added
+#      2026-11-18 with `file mark`: Python's two `--edit-mode` lists
+#      are different lists -- four values on `file ls` and three on
+#      `file mark` -- so a port reusing one enum for both would accept
+#      `file mark --edit-mode non-immutable`, a value upstream rejects,
+#      and this stage would report agreement. Closed by construction
+#      rather than by a check: `main.rs` carries two enums, and
+#      `filemark.rs` pins the three.
+#
+# `intent cancel`, `intent create` and `intent apply` are the WRITES
+# whose surfaces this stage can see, because unlike the other two their
+# names are Python's.
 
 # Flag divergences that are deliberate, as `<command>|<flag>` pairs.
 # Every one of these is argued in the README; the pair form means a
@@ -353,9 +752,15 @@ FLAGS_EXPECTED=(
     # Writes. A read-only port cannot have them.
     "vcs branch p|-d"
     "vcs branch p|--delete"
-    # Needs the staging session, which is a write and six environment
-    # fallbacks.
-    "vcs diff p f|--staged"
+    # `vcs diff p f|--staged` was here until 2026-10-31, exempted on the
+    # grounds that it "needs the staging session, which is a write and
+    # six environment fallbacks". Both halves were false. `_diff_staged`
+    # resolves no session at all -- its predicate is
+    # `staged_by_session_id IS NOT NULL`, any session -- and it writes
+    # nothing. The flag is ported and the exemption is gone, which is
+    # why this comment is here instead of the row: an allow-list entry
+    # that outlives its reason is indistinguishable from one that still
+    # holds.
     # Dead unless --no-fts is passed too, and what it selects is this
     # port's default behaviour.
     "search content q|-i"
@@ -378,22 +783,52 @@ FLAGS_EXPECTED=(
     # exactly what happened to `--verify` and `--allow-mojibake`, both
     # of which were here for one commit and are now implemented.
     #
-    # `--commit` / `-m` / `--commit-msg` would run the commit in-process
-    # — Python's does, deliberately, because a subprocess would fork a
-    # new session and lose the stage. The port has the commit now, so
-    # what is missing is the in-process call rather than anything
-    # underneath it.
-    #
     # `--skip-intent`, `--session`, `--verify` and `--allow-mojibake`
-    # have all left this list, and `-s` / `--stage` left it on
-    # 2026-10-27 with the auto-stage. Six flags picked up by a per-flag
-    # list rather than a waved-at exception — which is also the reason
-    # the list has to be pruned by hand: a flag that becomes present on
-    # both sides stops producing a difference, so a stale entry here
-    # suppresses nothing and reads as a divergence that still exists.
-    "file set p f|--commit"
-    "file set p f|--commit-msg"
-    "file set p f|-m"
+    # have all left this list; `-s` / `--stage` left it on 2026-10-27
+    # with the auto-stage, and `--commit` / `-m` / `--commit-msg` on
+    # 2026-10-29. Nine flags picked up by a per-flag list rather than a
+    # waved-at exception — which is also the reason the list has to be
+    # pruned by hand: a flag that becomes present on both sides stops
+    # producing a difference, so a stale entry here suppresses nothing
+    # and reads as a divergence that still exists.
+    #
+    # `--no-rebase` is the newest entry and it arrived from the other
+    # direction — Python grew it, and this stage is what reported it.
+    # With `--if-match`, Python no longer refuses a stale base: it
+    # three-way merges the write onto what landed and only a genuine
+    # overlap exits 2. That is a `ThreeWayMerge` engine this port does
+    # not have, so `--if-match` here is still the strict
+    # compare-and-swap Python's `--no-rebase` selects — the port's
+    # behaviour is the flag's behaviour, which is why the flag itself
+    # would have nothing to switch. See the README's *The rebase this
+    # port does not do*.
+    "file set p f|--no-rebase"
+    # `file retype --apply` is the write half, and it is ABSENT from
+    # this port's parser rather than accepted and ignored. The two
+    # readings in this list point opposite ways and the shape of the
+    # flag decides which applies:
+    #
+    #   - `search content --no-fts` is accepted-and-ignored territory:
+    #     a flag switching OFF behaviour the port does not have.
+    #     Listed above as absent, on the grounds that accepting it
+    #     would promise different matching and deliver none.
+    #   - `intent apply --no-rebase` is accepted: it promises a
+    #     refusal this port delivers unconditionally.
+    #
+    # `--apply` is neither. It switches ON the only behaviour that
+    # writes, so accepting it would mean `file retype --apply` exiting
+    # 0 having written nothing -- a silent divergence, which is the one
+    # outcome this project treats as a defect. Refused at the parser,
+    # exits 2, loud.
+    #
+    # The blocker is the create arm and not the update:
+    # `file_types.category` is `TEXT NOT NULL` with no default and this
+    # port mirrors that table at two of five columns, so Python's
+    # `INSERT (type_name, 'uncategorized', 'Auto-registered by file
+    # retype')` needs the subset to grow. See the README's *Known gaps*
+    # for the two-part fix. This entry should leave the list when that
+    # lands.
+    "file retype|--apply"
 )
 
 # `project list`'s filters, compared by which projects they select.
@@ -417,6 +852,16 @@ PROJECT_FILTERS=(
     "--category desktop-app"
     "--nix-only --category package"
     "--nix-only --category nixos-module"
+    # `--type`, which is a different column from `--category` with an
+    # overlapping value. `service` is here on both flags on purpose:
+    # it is the one spelling that selects different projects depending
+    # on which column is read, so an implementation that confused them
+    # passes every other row in this list and fails this pair.
+    "--type regular"
+    "--type nixos-config"
+    "--type service"
+    "--nix-only --type nixos-config"
+    "--category package --type regular"
 )
 
 # The slugs in a `project list` table, from either implementation.
@@ -613,6 +1058,139 @@ is_expected() {
     return 1
 }
 
+# --- the tree fence ----------------------------------------------------
+#
+# Rows whose answer depends on a directory, run between two digests of
+# that directory so that churn cannot be reported as a divergence.
+#
+# This is the harness the README's step 26 asks for, and it is a fence
+# rather than a pin. The difference is the whole design decision, so it
+# is written down here:
+#
+# **Pinning was the wrong shape for these commands.** The obvious plan —
+# a fixture tree in the repository, or a copy under a fake `HOME` — fails
+# on a coupling that is easy to miss until you read
+# `_check_checkout_matches_db`: it does not read a fixed path. It loops
+# every project and calls `CheckoutRepository.resolve(id, PURPOSE_EDIT)`,
+# which picks the tree from the **`checkouts` table** and the ambient
+# session. So a fixture tree needs fixture rows, and those rows live in
+# the SQLite file this port must not write. Point one side at a fixture
+# and the sweep compares Python-on-live against Rust-on-fixture, which
+# compares nothing at all.
+#
+# A fixture is also blind to the one check whose subject is POSIX mode:
+# TempleDB's content store carries no execute bit — the justfile says so,
+# and it is why the sweep is invoked as `bash scripts/...` — so a tree
+# materialised from the database cannot reproduce a mode at all.
+#
+# **What is left is to detect, not to prevent.** Measured 2026-11-05:
+# 432 non-`.git` files under `checkouts/` changed in 24 hours and 1,749
+# in seven days, out of 229,389. That is 0.2% a day and it is *bursty* —
+# a `publish` rewrites a few hundred files at once and nothing moves in
+# between. So the digests almost always match on the first attempt, and
+# when they do not, retrying converges. A pin would cost a fixture, a
+# second set of table rows and an unreproducible file mode to buy
+# certainty about an event that is rare and detectable.
+#
+# Same argument as `summary_parity` above, one substrate over: there,
+# a third process writes the database and a pane that matched on any
+# attempt is agreeing. Here a third process writes the tree.
+#
+# **Granularity is path + size + mtime, not content.** Hashing 229,389
+# files to decide whether to trust one row is the wrong trade, and
+# `mtime` is what `publish` moves. Symlinks are digested by their target
+# rather than followed, because the overlay roots `file where` probes
+# point into `/nix/store`: the store path is immutable, so the only
+# thing that can change is which one the link names, and following the
+# link would walk a Nix closure to learn that.
+#
+# A row that churns through every attempt is reported as `churned` and
+# counted in neither `pass` nor `unexpected`. It must not be silent and
+# it must not be a failure: the tree moved, which says nothing about
+# whether the two implementations agree.
+TREE_FENCE_ATTEMPTS=3
+
+# `<invocation>|<root>[:<root>...]`, matched as a prefix of the
+# invocation. Roots that do not exist are skipped rather than erroring —
+# `file where` probes several that are absent for most slug/path pairs.
+#
+# **Every root a row reads has to be named, not just the interesting
+# one.** `file where` hashes one file in the checkout and then *walks*
+# all three overlay roots looking for a basename match, so the whole of
+# `~/.emacs.d` is in its answer even for a row that gets no overlay hit:
+# a file appearing there changes the output. Naming only the checkout
+# would make the fence look present and cover a third of the read.
+#
+# Measured 2026-11-05: 471 ms per digest over `~/.emacs.d` (16,741
+# entries), `/etc/nixos` and `~/.config/systemd/user` plus one
+# checkout, so a fenced row costs about a second and the four of them
+# add four to the sweep. Stated because it is the fence's whole price
+# and it is charged whether or not a tree moves.
+#
+# **One root per row is deliberately NOT named: the tree resolution
+# picks.** Since 2026-11-15 `file where`'s two mirror paths come from
+# the `checkouts` table rather than from `~/.config/templedb/<root>/
+# <slug>`, so the directory a row reads is chosen at run time and can be
+# anywhere. Naming the enclosing root instead was measured and rejected:
+# `edit-workspaces/templedb-rust` was **70,806 entries** on 2026-11-15
+# and **71,822** a day later, and `edit-workspaces/templedb` is 57,046
+# both days, because an edit workspace holds whatever the workspace
+# holds — including the `target/` directory this very sweep is writing
+# into while it runs. That one-day move of 1,016 entries is this port's
+# own build. Fencing those would make every row `churned`, which is to
+# say unchecked, and it would charge seconds per row to do it.
+#
+# What is left unfenced is therefore ONE FILE per mirror label: the
+# probe is `stat` + hash of `<resolved root>/<path>`, not a walk. The
+# residual risk is that single file changing inside the ~1 s between the
+# two binaries, which is strictly smaller than the overlay walk the
+# fence does cover, and it is the reason the digest-retry loop is a
+# detector rather than a guarantee. Named in the README's *Known gaps*
+# rather than left to be inferred from a passing row.
+_ck="$HOME/.config/templedb/checkouts"
+_overlays="$HOME/.emacs.d:/etc/nixos:$HOME/.config/systemd/user"
+TREE_INVOCATIONS=(
+    "file where templedb-rust README.md|$_ck/templedb-rust:$_overlays"
+    "file where templedb integrations/emacs/templedb-agent.el|$_ck/templedb:$_overlays"
+    "file where emacs-config emacs.d/layers/projdb/packages.el|$_ck/emacs-config:$_overlays"
+    "file where system_config emacs.d/layers/templedb/packages.el|$_ck/system_config:$_overlays"
+    # `woofsledger` has no checkout row, so its tree is its `repo_url`
+    # and it is small enough to fence whole: 4,651 entries.
+    "file where woofsledger src/db.py|$HOME/woofsledger:$_overlays"
+    # Three candidate roots, because this project's resolution has three
+    # extant rows to choose between and all three are cheap (140 entries
+    # for the largest). The canonical path is named too even though no
+    # row points there -- it is what the old implementation hashed, so
+    # fencing it is what keeps this row able to report a return to that
+    # behaviour rather than merely to a different answer.
+    "file where nixos_anywhere_vultr_woofs .envrc|$_ck/nixos_anywhere_vultr_woofs:/tmp/woofs-verify:/tmp/woofs-fresh:$_overlays"
+)
+unset _ck _overlays
+
+# Every root this script knows how to fence, by name, so a row names a
+# set rather than repeating absolute paths. `$HOME` is expanded here and
+# not in the rows, because the rows are compared as prefixes.
+tree_roots_for() {
+    local inv=$1 row root out=()
+    for row in "${TREE_INVOCATIONS[@]}"; do
+        [[ $inv == "${row%%|*}"* ]] || continue
+        IFS=: read -r -a out <<<"${row#*|}"
+        for root in "${out[@]}"; do printf '%s\n' "$root"; done
+        return 0
+    done
+    return 1
+}
+
+# One line per entry: path, size, mtime. Symlinks by target.
+tree_digest() {
+    local root
+    for root in "$@"; do
+        [[ -e $root ]] || continue
+        find "$root" -xdev -type l -printf '%p -> %l\n' 2>/dev/null
+        find "$root" -xdev -type f -printf '%p %s %T@\n' 2>/dev/null
+    done | sort | sha256sum | cut -d' ' -f1
+}
+
 case $MODE in
 python)
     label="python"
@@ -680,17 +1258,49 @@ esac
 # Folding stderr in would make seven of these rows permanently red and
 # the script useless as a check. They are counted separately instead, so
 # a *new* stderr difference is still visible without being an error.
-pass=0 unexpected=0 expected=0 stderr_only=0
+pass=0 unexpected=0 expected=0 stderr_only=0 churned=0 fenced=0
 errfile_a=$(mktemp) errfile_b=$(mktemp)
 sumfile_a=$(mktemp) sumfile_b=$(mktemp)
 trap 'rm -f "$errfile_a" "$errfile_b" "$sumfile_a" "$sumfile_b"' EXIT
 
 for inv in "${INVOCATIONS[@]}"; do
-    # Unquoted on purpose: the rows above are argument lists.
-    # shellcheck disable=SC2086
-    a=$("$RS" $inv 2>"$errfile_a"); ea=$?
-    # shellcheck disable=SC2086
-    b=$(run_b $inv 2>"$errfile_b"); eb=$?
+    # The roots this row reads, if any. A row with none takes the
+    # unfenced path below and costs nothing — `tree_roots_for` fails and
+    # `roots` stays empty.
+    roots=()
+    mapfile -t roots < <(tree_roots_for "$inv" || true)
+
+    if (( ${#roots[@]} )); then
+        fenced=$((fenced + 1))
+        before="" after="" attempt=0
+        while (( attempt < TREE_FENCE_ATTEMPTS )); do
+            attempt=$((attempt + 1))
+            before=$(tree_digest "${roots[@]}")
+            # shellcheck disable=SC2086
+            a=$("$RS" $inv 2>"$errfile_a"); ea=$?
+            # shellcheck disable=SC2086
+            b=$(run_b $inv 2>"$errfile_b"); eb=$?
+            after=$(tree_digest "${roots[@]}")
+            [[ $before == "$after" ]] && break
+        done
+        if [[ $before != "$after" ]]; then
+            # Neither a pass nor a failure: the tree moved under every
+            # attempt, so this row checked nothing. Said out loud,
+            # because a row that silently stops being checked reads as a
+            # row that passed — the same rule the no-live-session branch
+            # above follows.
+            churned=$((churned + 1))
+            printf 'churned   %s   (tree moved through %d attempts: %s)\n' \
+                "$inv" "$TREE_FENCE_ATTEMPTS" "${roots[*]}"
+            continue
+        fi
+    else
+        # Unquoted on purpose: the rows above are argument lists.
+        # shellcheck disable=SC2086
+        a=$("$RS" $inv 2>"$errfile_a"); ea=$?
+        # shellcheck disable=SC2086
+        b=$(run_b $inv 2>"$errfile_b"); eb=$?
+    fi
     same_err=no
     cmp -s "$errfile_a" "$errfile_b" && same_err=yes
 
@@ -716,4 +1326,6 @@ project_filter_parity
 
 printf '\ntempledb-rs vs %s, %d invocations: %d stdout-identical (%d differing on stderr only), %d deliberate, %d unexpected\n' \
     "$label" "${#INVOCATIONS[@]}" "$pass" "$stderr_only" "$expected" "$unexpected"
+printf 'fence     %d of %d rows read a tree and ran between two digests of it; %d churned out\n' \
+    "$fenced" "${#INVOCATIONS[@]}" "$churned"
 exit $((unexpected > 125 ? 125 : unexpected))

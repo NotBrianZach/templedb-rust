@@ -17,7 +17,14 @@
 //! precedent: a flag — or a name — is only harmless when the thing it
 //! names is present. `vcs commit` over there means *scan the tree,
 //! reconcile it, commit*; this cannot scan, so sharing the name would
-//! promise a workflow that is refused rather than merely absent.
+//! promise a workflow that is absent.
+//!
+//! Absent, and as of the 2026-10-31 decision **deferred rather than
+//! refused** — the goal is eventual replacement, so the tree half
+//! arrives at step 28 and this name is what keeps the promise honest
+//! until then. The argument for the separate name is unchanged by
+//! that: it was never "the tree half will never exist", it was "this
+//! command cannot do it". See the README's *Deferred, not refused*.
 //!
 //! The name also says what the operation *is*, which is not "a reduced
 //! commit": it is what `publish` already performs. Its guard is
@@ -33,7 +40,7 @@
 //!
 //! # What it does
 //!
-//! | ported | refused |
+//! | ported | deferred to step 28 |
 //! |---|---|
 //! | the staged-rows write across six tables | workspace scanning — there is no workspace |
 //! | the parent edge | guards 4, 5, 6, 8, which all compare against a tree |
@@ -557,14 +564,20 @@ fn staged_rows(
 /// bytes — measuring the escaped form would overcount every file holding
 /// a NUL, and one live file does.
 ///
-/// # Where the tree half is refused
+/// # Where the tree half stops, and this run refuses
 ///
 /// A missing blob is where Python leaves the database: it resolves the
 /// file's path, joins it onto `~/.config/templedb/checkouts/<slug>`,
 /// reads the bytes off disk and stores them. That is the mirror-to-disk
 /// dependency the design document says settles the question — this port
-/// has no checkout, so it refuses here instead, by name and with the
-/// hash it could not find.
+/// has no checkout *yet*, so it refuses here instead, by name and with
+/// the hash it could not find.
+///
+/// The refusal is a runtime one and stays whatever happens to the
+/// roadmap: even once step 28 gives the port a tree, a blob that is
+/// missing from both the database and the disk has nothing to commit.
+/// What step 28 changes is how often this is reached, not whether it
+/// is right.
 fn blob_metrics(
     tx: &mut postgres::Transaction<'_>,
     file_path: &str,

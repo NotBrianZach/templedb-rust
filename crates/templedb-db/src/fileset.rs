@@ -24,14 +24,43 @@
 //!
 //! | absent | what it protects against |
 //! |---|---|
-//! | `--commit` / `-m` | would run `vcs commit-staged` in-process; the stage it needs is here now, so this is the last thing between `file set` and that loop being driveable from one command |
+//! | the `--if-match` three-way rebase, and `--no-rebase` with it | Python merges a stale base onto what landed rather than refusing, and the engine it merges with is not a three-way merge — measured 2026-11-18, it agrees with `git merge-file --diff3` on 3 of 11 cases. Refused rather than missing. See *The rebase this port refuses to do* in the README |
 //! | `deploy_stage_runs` | chain observability; outside the subset |
-//! | binary content | Python falls back to `content_blob` for undecodable stdin. This takes text only |
 //!
 //! Six guards *are* here: `--if-match` optimistic concurrency, the
 //! un-delete that revives a soft-deleted row, the mojibake check,
 //! `--verify`, the `edit_intents` record, and the auto-stage with
 //! `--stage`. Each is below with the incident that produced it.
+//!
+//! `--commit` is here too, as of 2026-10-29, and it is not a guard: it
+//! runs [`crate::commit_staged`] in the write's own transaction. See
+//! the CLI for the one place it is stricter than Python's.
+//!
+//! # Binary content
+//!
+//! [`Content::Binary`] stores the bytes in `content_blobs.content_blob`
+//! under `content_type = 'binary_asset'` with a NULL `content_text`,
+//! which is what Python's scanner produces for the same file — so a blob
+//! written here and one written by an import are indistinguishable
+//! downstream.
+//!
+//! The reason the branch exists at all is Python's, and it is an
+//! incident rather than a completeness argument: reading stdin as *text*
+//! made `file set` fail outright on any binary input, which is why
+//! `system_config`'s `.authinfo.gpg` could not be stored — and a file
+//! that cannot be stored is one `publish materialize` later deletes from
+//! the checkout as an untracked stray, which broke a Nix build.
+//!
+//! Two properties fall out of the branch rather than being chosen:
+//!
+//! - **The mojibake guard does not run.** Python's `_mojibake_runs`
+//!   opens with `if not isinstance(text, str): return []`, so binary
+//!   input skips it there too. It would be meaningless anyway — the
+//!   guard looks for text that decodes back through Latin-1, and these
+//!   bytes are not text.
+//! - **`line_count` is 0, not NULL and not a count of `0x0a`.** Python's
+//!   comment is the argument: "counting 0x0a bytes would invent a
+//!   statistic about a blob".
 //!
 //! # The auto-stage, and why `--stage` is stricter here
 //!
@@ -131,16 +160,104 @@ pub struct SetOutcome {
     pub staged: Staged,
 }
 
-/// sha256 of the UTF-8 bytes, lowercase hex — the same digest Python
-/// takes, over the same bytes.
-pub fn content_hash(content: &str) -> String {
+/// What a write is writing: decoded text, or bytes that would not
+/// decode.
+///
+/// Two variants rather than `&[u8]` everywhere, because three of the
+/// things this command does are only defined for text — the mojibake
+/// guard, the `content_text` column and the line count — and a `&[u8]`
+/// parameter would make each of those a runtime question with a
+/// `from_utf8` in front of it. The enum puts the question at the edge,
+/// where the caller already knows the answer: the CLI decodes stdin
+/// once and the variant records what happened.
+///
+/// `From<&str>` exists so every text call site — the CLI's, and every
+/// write test — reads exactly as it did before binary was a case.
+#[derive(Debug, Clone, Copy)]
+pub enum Content<'a> {
+    /// Valid UTF-8. Stored in `content_blobs.content_text`.
+    Text(&'a str),
+    /// Bytes that are not valid UTF-8. Stored in
+    /// `content_blobs.content_blob` as a `binary_asset`.
+    Binary(&'a [u8]),
+}
+
+impl<'a> From<&'a str> for Content<'a> {
+    fn from(s: &'a str) -> Content<'a> {
+        Content::Text(s)
+    }
+}
+
+impl<'a> From<&'a String> for Content<'a> {
+    fn from(s: &'a String) -> Content<'a> {
+        Content::Text(s)
+    }
+}
+
+impl<'a> Content<'a> {
+    /// The bytes that get hashed and counted. For text this is the
+    /// UTF-8 encoding, which is what Python's `content.encode('utf-8')`
+    /// produces for the same string.
+    pub fn bytes(self) -> &'a [u8] {
+        match self {
+            Content::Text(s) => s.as_bytes(),
+            Content::Binary(b) => b,
+        }
+    }
+
+    /// The text, when there is any. `None` is the whole of what the
+    /// mojibake guard and the `content_text` column need to know.
+    pub fn text(self) -> Option<&'a str> {
+        match self {
+            Content::Text(s) => Some(s),
+            Content::Binary(_) => None,
+        }
+    }
+
+    /// Python's `if not content` — which is false for `''` *and* for
+    /// `b''`, so an empty pipe is refused whichever branch it took.
+    pub fn is_empty(self) -> bool {
+        self.bytes().is_empty()
+    }
+
+    /// `file_size_bytes`: the byte length, for both variants.
+    pub fn size_bytes(self) -> i64 {
+        self.bytes().len() as i64
+    }
+
+    /// `file_contents.line_count`.
+    ///
+    /// Zero for binary, which is Python's literal `0 if is_binary else
+    /// …` and not a degenerate case of the text arithmetic: counting
+    /// `0x0a` bytes in a PNG would invent a statistic about a blob.
+    pub fn line_count(self) -> i64 {
+        match self {
+            Content::Text(s) => line_count(s),
+            Content::Binary(_) => 0,
+        }
+    }
+
+    /// sha256 of the bytes, lowercase hex.
+    pub fn hash(self) -> String {
+        hash_bytes(self.bytes())
+    }
+}
+
+/// sha256 of `bytes`, lowercase hex.
+fn hash_bytes(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
-    h.update(content.as_bytes());
+    h.update(bytes);
     // Hex by hand rather than `{:x}` on the output: sha2 0.11 returns a
     // `hybrid_array::Array`, which does not implement `LowerHex`. The
     // zero-padded two-digit form is the one Python's `hexdigest()`
     // produces and the one `content_blobs.hash_sha256` stores.
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// sha256 of the UTF-8 bytes, lowercase hex — the same digest Python
+/// takes, over the same bytes.
+pub fn content_hash(content: &str) -> String {
+    hash_bytes(content.as_bytes())
 }
 
 /// Python's line count: `content.count('\n') + 1`, and 0 for empty.
@@ -300,10 +417,29 @@ pub fn check_mojibake(content: &str, previous: Option<&str>) -> Result<()> {
 /// "because every place that shows a hash truncates it — `file where`,
 /// `source snapshot --meta`, doctor output — so requiring 64 characters
 /// would mean nobody uses the flag".
+///
+/// # Exit 2, not 1, and this was wrong until 2026-10-29
+///
+/// The port exited 1 here on the stated grounds that Python "splits a
+/// bad flag from a mismatched one: a malformed flag is bad input, a
+/// mismatched one is a conflict". Measured against the Python
+/// implementation while porting `--commit`, that split does not exist —
+/// `file set … --if-match xyz` exits **2** over there, the same status
+/// as a mismatch, because both refusals leave `set()` through the same
+/// `return 2`.
+///
+/// So the claim the README and this comment carried was about a design
+/// Python does not have, and nothing had ever checked it: the sweep
+/// compares flag *surfaces* and whole-command stdout, and neither
+/// reaches an exit status behind a flag that needs a write target. It
+/// is the exact failure the error-status work of step 12 was for, one
+/// command later.
 pub fn normalise_if_match(expected: &str) -> Result<String> {
     let exp = expected.trim().to_ascii_lowercase();
     if exp.len() < 8 || !exp.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("--if-match wants at least 8 hex chars of a sha256, got {expected:?}");
+        return Err(anyhow::Error::new(crate::Coded::conflict(format!(
+            "--if-match wants at least 8 hex chars of a sha256, got {expected:?}"
+        ))));
     }
     Ok(exp)
 }
@@ -321,10 +457,9 @@ pub fn normalise_if_match(expected: &str) -> Result<String> {
 /// That happened twice on 2026-10-04 to `src/cli/commands/entity.py`, a
 /// 5,239-line file four separate fixes were landing in, and the first
 /// instance went unnoticed for three commits.
-/// Both refusals exit 2, as Python's do — `Coded::conflict`. The
-/// *invalid argument* case is a plain `bail!` and exits 1, which is
-/// also Python's split: a malformed flag is bad input, a mismatched one
-/// is a conflict.
+/// Every refusal here exits 2, including a malformed argument — see
+/// [`normalise_if_match`] for the measurement that corrected the last
+/// of those.
 pub fn check_if_match(expected: &str, current: Option<&str>) -> Result<()> {
     let exp = normalise_if_match(expected)?;
     let short = &exp[..exp.len().min(12)];
@@ -398,9 +533,13 @@ pub fn verify_current(
 pub fn resolve_project_exact(tx: &mut postgres::Transaction<'_>, slug: &str) -> Result<i64> {
     match tx.query_opt("SELECT id FROM projects WHERE slug = $1", &[&slug])? {
         Some(row) => Ok(row.get(0)),
+        // Names no command, as of 2026-11-17: `intent create` resolves
+        // through here too, and a refusal from one command that
+        // explains itself by naming another is worse than a generic
+        // one. "A write" is the scope the rule actually has.
         None => bail!(
             "no project with slug {slug:?} in the write target.\n\
-             `file set` takes an exact slug, not a fuzzy name — unlike every \
+             A write takes an exact slug, not a fuzzy name — unlike every \
              read command — because a mis-resolved write overwrites a file."
         ),
     }
@@ -730,6 +869,74 @@ fn auto_stage(
     })
 }
 
+/// Store `content` as a `content_blobs` row, keyed by its own hash.
+///
+/// `ON CONFLICT DO NOTHING`, which is Python's `INSERT OR IGNORE`.
+/// Content is addressed by its own hash, so a blob that is already
+/// there is already correct and re-writing it would be a no-op that
+/// churned the row.
+///
+/// `encoding` and `reference_count` are absent from the mirrored
+/// subset, so they are not written. Python sets them — `'utf-8'` /
+/// NULL and 0, the latter so SQLite's `increment_blob_reference`
+/// trigger can count the `file_contents` row that follows. Neither
+/// column is read by any ported command, so the boundary still
+/// follows the readers; it is recorded in the README as partial
+/// fidelity rather than left to be discovered.
+///
+/// The two arms differ in exactly the three columns Python's two arms
+/// differ in — `content_text`, `content_blob`, `content_type` — written
+/// as one statement with typed NULLs rather than two, so a later change
+/// to the shared columns cannot reach one arm and miss the other.
+///
+/// # Why this is a function as of 2026-11-17
+///
+/// It was inline in [`set_file`] until `intent create` became the
+/// second writer of this table. Both call sites need the *identical*
+/// statement — Python's two are identical too, one in
+/// `_write_content_to_db` and one in `intent.create` — and the comment
+/// above is the argument for one statement rather than two: a change to
+/// a shared column that reached one copy and missed the other is
+/// exactly the failure the single-statement form was chosen to prevent,
+/// and two copies in two modules is a worse version of it than two arms
+/// in one.
+///
+/// `hash` and `size_bytes` are parameters rather than recomputed from
+/// `content`, because both call sites already have them and hashing a
+/// blob twice to tidy a signature is the wrong trade.
+pub(crate) fn store_blob(
+    tx: &mut postgres::Transaction<'_>,
+    content: Content<'_>,
+    hash: &str,
+    size_bytes: i64,
+) -> Result<()> {
+    let stored = content.text().map(pgtext::escape);
+    tx.execute(
+        "INSERT INTO content_blobs
+             (hash_sha256, content_text, content_blob, content_type, file_size_bytes)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (hash_sha256) DO NOTHING",
+        &[
+            &hash,
+            &stored.as_deref(),
+            &match content {
+                // `&[u8]` rather than the whole `Content`, because
+                // `postgres` maps that to `bytea` and `Option` to a
+                // typed NULL.
+                Content::Binary(b) => Some(b),
+                Content::Text(_) => None,
+            },
+            &match content {
+                Content::Text(_) => "text",
+                Content::Binary(_) => "binary_asset",
+            },
+            &size_bytes,
+        ],
+    )
+    .context("storing a content blob")?;
+    Ok(())
+}
+
 /// Write `content` as the current contents of `project_id`/`file_path`.
 ///
 /// Mirrors Python's `_write_content_to_db` across four tables, in the
@@ -740,14 +947,15 @@ fn auto_stage(
 /// happened, and the stage goes after the intent because it carries the
 /// intent's id. That last pair is the one place the order differs from
 /// Python's, which stages and *then* links in a second statement.
-pub fn set_file(
+pub fn set_file<'a>(
     tx: &mut postgres::Transaction<'_>,
     clock: &Clock,
     project_id: i64,
     file_path: &str,
-    content: &str,
+    content: impl Into<Content<'a>>,
     opts: &SetOptions<'_>,
 ) -> Result<SetOutcome> {
+    let content: Content<'a> = content.into();
     // First, before anything is read or written. See `check_stage` for
     // why it is here and not at the CLI edge.
     check_stage(opts.stage, opts.session)?;
@@ -758,41 +966,24 @@ pub fn set_file(
     if let Some(expected) = opts.if_match {
         check_if_match(expected, previous.as_deref())?;
     }
-    if !opts.allow_mojibake {
+    // Text only. Python's `_mojibake_runs` opens with
+    // `if not isinstance(text, str): return []`, so binary input skips
+    // the guard over there as well — and it would have nothing to say
+    // about bytes that are not text in the first place.
+    if let (false, Some(text)) = (opts.allow_mojibake, content.text()) {
         // The baseline is only read when the incoming content has runs
         // at all, so an ordinary write does not pay for a blob fetch.
-        if mojibake_runs(content).is_empty() {
-            // Nothing to compare against; skip the pre-read entirely.
-        } else {
+        if !mojibake_runs(text).is_empty() {
             let prev_text = current_text(tx, project_id, file_path)?;
-            check_mojibake(content, prev_text.as_deref())?;
+            check_mojibake(text, prev_text.as_deref())?;
         }
     }
 
-    let hash = content_hash(content);
-    let size_bytes = content.len() as i64;
-    let lines = line_count(content);
-    let stored = pgtext::escape(content);
+    let hash = content.hash();
+    let size_bytes = content.size_bytes();
+    let lines = content.line_count();
 
-    // `ON CONFLICT DO NOTHING`, which is Python's `INSERT OR IGNORE`.
-    // Content is addressed by its own hash, so a blob that is already
-    // there is already correct and re-writing it would be a no-op that
-    // churned the row.
-    //
-    // `encoding` and `reference_count` are absent from the mirrored
-    // subset, so they are not written. Python sets them — `'utf-8'` and
-    // 0, the latter so SQLite's `increment_blob_reference` trigger can
-    // count the `file_contents` row that follows. Neither column is read
-    // by any ported command, so the boundary still follows the readers;
-    // it is recorded in the README as partial fidelity rather than left
-    // to be discovered.
-    tx.execute(
-        "INSERT INTO content_blobs
-             (hash_sha256, content_text, content_blob, content_type, file_size_bytes)
-         VALUES ($1, $2, NULL, 'text', $3)
-         ON CONFLICT (hash_sha256) DO NOTHING",
-        &[&hash, &stored.as_ref(), &size_bytes],
-    )?;
+    store_blob(tx, content, &hash, size_bytes)?;
 
     let existing = tx.query_opt(
         "SELECT id, status FROM project_files WHERE project_id = $1 AND file_path = $2",
@@ -1045,11 +1236,14 @@ mod tests {
         assert!(format!("{err:#}").contains("2 new sequences;"));
     }
 
-    /// `--if-match` refusals exit 2, as Python's do, and a *malformed*
-    /// argument exits 1 — the same split Python makes between bad input
-    /// and a conflict.
+    /// Every `--if-match` refusal exits 2 — the mismatch, the new file,
+    /// *and* the malformed argument.
+    ///
+    /// The last one asserted 1 until 2026-10-29, on the strength of a
+    /// split Python turned out not to make: `--if-match xyz` exits 2
+    /// over there, measured. See [`normalise_if_match`].
     #[test]
-    fn if_match_refusals_exit_two_and_bad_input_exits_one() {
+    fn every_if_match_refusal_exits_two() {
         let conflict = check_if_match("deadbeef", Some("ff4938cc03ca2b40")).unwrap_err();
         assert_eq!(crate::code_of(&conflict), crate::NOT_FOUND);
 
@@ -1057,7 +1251,77 @@ mod tests {
         assert_eq!(crate::code_of(&new_file), crate::NOT_FOUND);
 
         let malformed = check_if_match("xyz", Some("ff4938cc03ca2b40")).unwrap_err();
-        assert_eq!(crate::code_of(&malformed), crate::USAGE);
+        assert_eq!(crate::code_of(&malformed), crate::NOT_FOUND);
+
+        // And with no current content either, which is the arm that
+        // reaches `normalise_if_match` before the `None` branch.
+        let both_wrong = check_if_match("zz", None).unwrap_err();
+        assert_eq!(crate::code_of(&both_wrong), crate::NOT_FOUND);
+    }
+
+    /// The three columns that make a blob binary, and the two numbers
+    /// derived from it.
+    ///
+    /// `Content` is where every one of those decisions lives, so this
+    /// is the test that would fail if a later change reached for
+    /// `content.len()` or `line_count(…)` directly.
+    #[test]
+    fn binary_content_hashes_its_bytes_and_counts_no_lines() {
+        // Not valid UTF-8: a lone 0x84 continuation, which is the byte
+        // Python's incident report names.
+        let raw: &[u8] = &[0x84, 0x00, 0xff, b'\n', b'\n'];
+        // Through an owned copy rather than `str::from_utf8(raw)`:
+        // clippy const-evaluates the literal form and rejects it as a
+        // call that always fails, which is exactly what this is
+        // asserting. The precondition is worth stating — a "binary"
+        // fixture that decoded would test the text path under a
+        // binary name.
+        assert!(String::from_utf8(raw.to_vec()).is_err());
+        let c = Content::Binary(raw);
+
+        assert_eq!(c.size_bytes(), 5);
+        // Two newlines in there, and the count is still 0: Python's
+        // `0 if is_binary`, not a line count that happens to agree.
+        assert_eq!(c.line_count(), 0);
+        assert!(c.text().is_none());
+        assert_eq!(c.hash(), hash_bytes(raw));
+        assert_eq!(c.hash().len(), 64);
+    }
+
+    /// Text reaching `Content` keeps every number it had before the
+    /// enum existed — the same hash, the same size, the same quirky
+    /// line count.
+    #[test]
+    fn text_content_is_unchanged_by_going_through_the_enum() {
+        for s in ["", "a", "a\n", "héllo\n", "a\nb\n"] {
+            let c = Content::Text(s);
+            assert_eq!(c.hash(), content_hash(s), "{s:?}");
+            assert_eq!(c.size_bytes(), s.len() as i64, "{s:?}");
+            assert_eq!(c.line_count(), line_count(s), "{s:?}");
+            assert_eq!(c.text(), Some(s), "{s:?}");
+        }
+        // Multibyte: size is bytes, not characters. The same split
+        // `patch_summary` records.
+        assert_eq!(Content::Text("é").size_bytes(), 2);
+    }
+
+    /// `From<&str>` is what keeps every text call site reading as it
+    /// did, so it has to produce the text variant and not a byte one.
+    #[test]
+    fn a_str_converts_to_the_text_variant() {
+        let c: Content<'_> = "hello\n".into();
+        assert_eq!(c.text(), Some("hello\n"));
+        assert_eq!(c.line_count(), 2);
+    }
+
+    /// Python's `if not content` is false for `''` and for `b''`, so
+    /// the CLI's empty-input refusal has to see both the same way.
+    #[test]
+    fn emptiness_is_the_same_question_for_both_variants() {
+        assert!(Content::Text("").is_empty());
+        assert!(Content::Binary(b"").is_empty());
+        assert!(!Content::Text("\0").is_empty());
+        assert!(!Content::Binary(&[0u8]).is_empty());
     }
 
     #[test]

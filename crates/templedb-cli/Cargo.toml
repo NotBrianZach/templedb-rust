@@ -12,4 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+# `file where` hashes files on disk to compare them against the hash the
+# database holds, so the binary needs the same digest the mirror does.
+sha2.workspace = true
 templedb-db = { path = "../templedb-db" }

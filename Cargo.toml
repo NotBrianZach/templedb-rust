@@ -43,3 +43,25 @@ libc = "0.2"
 # an older `digest` and fails to build offline — the lock has 0.11 and
 # nothing else.
 sha2 = "0.11"
+# `file retype`'s answer is a function of `importer.scanner`'s
+# `FILE_TYPE_PATTERNS`, which is 179 ordered Python regexes, and of
+# `SKIP_FILE_PATTERNS`, which is six more. This is the FIRST dependency
+# this port has added that was not already in `Cargo.lock` — every other
+# line in this block is a declaration of something the lock already
+# carried — and it brings three transitive crates with it
+# (`regex-automata`, `regex-syntax`, `aho-corasick`), so the addition is
+# argued rather than assumed.
+#
+# The alternative was a hand-written matcher over the dozen or so shapes
+# the table actually uses. It was rejected on verification grounds, not
+# effort: compiling the pattern *strings* means `classify.rs`'s table
+# diffs against `scanner.py`'s line by line and a transcription error is
+# a visible textual difference, where a shape-classified table makes all
+# 179 entries judgment calls. See `classify.rs`'s header, which records
+# that the first draft of this port got the `README` entry's semantics
+# wrong while transcribing its pattern correctly.
+#
+# Default features. `unicode` is what makes `\d` Unicode-aware, which is
+# what Python's `\d` is, so turning it off to save binary size would be
+# a silent divergence in `is_ignored_path`.
+regex = "1"

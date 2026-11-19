@@ -1,11 +1,15 @@
 # Checks for templedb-rust.
 #
-# The point of this file is `just check`, which is the full gate: the
-# hermetic tests and then the all-command parity sweep. Before it
-# existed, the sweep was a script nothing ran — it was written on
-# 2026-10-14 after an audit found three commands that had silently
-# drifted behind Python, and a check that only runs when someone
-# remembers it is the same failure mode one layer up.
+# The point of this file is `just check`, which is the full gate:
+# formatting, lints, the hermetic tests and then the all-command parity
+# sweep. Before it existed, the sweep was a script nothing ran — it was
+# written on 2026-10-14 after an audit found three commands that had
+# silently drifted behind Python, and a check that only runs when
+# someone remembers it is the same failure mode one layer up.
+#
+# `fmt` and `clippy` are here for exactly that reason and arrived late,
+# on 2026-11-17: the README had claimed both clean in four step entries
+# while nothing in the gate ran either.
 #
 # The split between `just` and `nix flake check` follows what needs the
 # live database. `nix flake check` builds in a sandbox and can run the
@@ -29,7 +33,37 @@
 # Hermetic tests, then the sweep against Python.
 default: check
 
+# Formatting and lints, which this project claimed for twelve days and
+# did not check. `cargo fmt --all --check` left two hunks unformatted in
+# files.rs from 2026-11-05 to 2026-11-17 while four README step entries
+# said "fmt and clippy clean", and the reason is the one the sweep's own
+# comment above gives: a check that only runs when someone remembers it
+# is not a check. Both are in `check` now, first, because fmt needs no
+# build and clippy's is incremental.
+#
+# They are separate recipes rather than one so that a failure names
+# which of the two it was, and `just fmt` is here because the fix for a
+# failing `fmt-check` should not have to be looked up.
+
+# Is the tree formatted? Fails without changing anything.
+fmt-check:
+    cargo fmt --all --check
+
+# Format the tree in place.
+fmt:
+    cargo fmt --all
+
+# Clippy over tests and benches too, warnings fatal.
+lint:
+    cargo clippy --all-targets -- -D warnings
+
 # Unit tests: everything needing no database and no interpreter.
+#
+# Includes the two self-checks, which need neither but do read files
+# outside the crate: tests/sweep_coverage.rs parses the sweep script and
+# tests/gate_counts.rs parses README.md. Both find the repository root
+# from CARGO_MANIFEST_DIR, so they work from any directory and inside
+# the nix sandbox.
 test:
     cargo test --workspace
 
@@ -47,27 +81,45 @@ test:
 # directory because `real_source_files_diff_identically` reads
 # `src/difflib.rs` by relative path.
 
-# The CPython oracles: difflib and the clock (needs python3).
+# The CPython oracles: difflib, the clock and the path classifier
+# (needs python3; the third also needs `templedb` on PATH).
+#
+# The third is the one that made this recipe differ from the flake's
+# `checkPhase`. `classify_parity` imports `importer.scanner` out of the
+# installed `templedb` package -- it reads the PYTHONPATH that package's
+# own launcher exports, so it diffs against the same `scanner.py` the
+# parity sweep's `templedb` runs -- and a Nix sandbox has neither the
+# package nor the launcher. So it runs here, where `just sweep` already
+# requires `templedb` on PATH, and not there. See the comment in
+# flake.nix.
 oracle:
     cd crates/templedb-db && cargo test --test difflib_parity -- --ignored
     cd crates/templedb-db && cargo test --test clock_parity -- --ignored
+    cd crates/templedb-db && cargo test --test classify_parity -- --ignored
 
-# All 54 implemented invocations, diffed against the Python templedb,
-# plus `summary` compared one pane at a time — its whole stdout can
-# never match, because two of Python's nine panes are not ported.
+# Every implemented invocation, diffed against the Python templedb, plus
+# `summary` compared one pane at a time — its whole stdout can never
+# match, because two of Python's nine panes are not ported.
 #
 # Impure by construction: needs the live database and `templedb` on
 # PATH. Exits with the number of *unexpected* differences, so a
 # deliberate divergence does not fail it — the list lives in the script.
+#
+# These descriptions said "all 54 invocations" until 2026-11-17, when
+# the sweep had 101 rows. The count is gone rather than corrected: three
+# rows are discovered at run time from the live database, so no number
+# written here can be checked by anything, and the sweep prints the
+# number it actually ran. Where the gate cannot count, prefer not to
+# claim — see the README's *Counting what the gate claims*.
 
-# All 54 invocations plus summary's panes, diffed against the Python templedb.
+# Every implemented invocation plus summary's panes, diffed against the Python templedb.
 sweep: build
     bash scripts/parity-sweep.sh python
 
 # The same sweep across backends. PGURL is a mirrored Postgres; see
 # `templedb-rs mirror`.
 
-# SQLite vs a mirrored Postgres, same 54 invocations.
+# SQLite vs a mirrored Postgres, the same invocations.
 sweep-backends PGURL: build
     bash scripts/parity-sweep.sh backends {{PGURL}}
 
@@ -79,12 +131,40 @@ sweep-regress OLDBIN: build
 build:
     cargo build --release
 
-# Everything. Run this before publishing.
-check: test oracle sweep
+# Everything that needs SQLite and Python but not Postgres.
+check: fmt-check lint test oracle sweep
 
 # Only the half `nix flake check` can run without a live database.
 check-hermetic:
     nix flake check
+
+# The whole gate, Postgres included. This is the one to point CI at.
+#
+# `check` has never been the whole gate and reading it as one is the
+# mistake this recipe exists to prevent: it runs the unit tests, the
+# oracles and the Python sweep, and it does NOT run the cross-backend
+# sweep, the mirror freshness check or the write tests. Those three are
+# the only verification the write path has — a write cannot be
+# byte-diffed against Python, ever — so a gate that skipped them was
+# skipping the newest and least-settled third of the port.
+#
+# Needs a running cluster (`just pg-up`) and refreshes the mirror on
+# the way through, because `sweep-pg` refuses a stale one.
+#
+# Ordered cheapest-first so a failure arrives early: formatting and
+# lints, then hermetic tests, then the interpreter oracles, then the two
+# sweeps, then the writes.
+#
+# `pg-check` is deliberately NOT in this list, and it was for one
+# revision. It asks whether the mirror is current and exits 4 when it
+# is not -- which is a true answer and a useless gate, because any
+# `templedb commit` anywhere makes it stale and one had happened
+# within the hour the first time this ran. `sweep-pg-fresh` re-mirrors
+# first and `sweep-pg` refuses a stale copy anyway, so the staleness
+# question is already answered here, by the step that can fix it.
+# Keep `pg-check` for the question it is actually for: "is the mirror
+# I am about to read by hand still a copy?"
+check-all: fmt-check lint test oracle sweep sweep-pg-fresh write-test
 
 # --- Postgres ---------------------------------------------------------
 #

@@ -117,9 +117,69 @@ pub fn read_file(store: &dyn Store, slug: &str, path: &str) -> Result<String> {
     }
 }
 
+/// The current `content_hash` for a project's path, or `None`.
+///
+/// `file where`'s one database read, and the whole of its left column.
+/// Python's `_get_current_hash` carries a `LIMIT 1` that cannot select
+/// anything: `(project_id, file_path)` is unique among active rows and
+/// `is_current = 1` is unique per file, so the join yields at most one
+/// row. It is reproduced as `query_opt`, which is the same contract
+/// without pretending there is a choice being made.
+///
+/// `None` is both "no such file" and "the file is deleted", because
+/// `status = 'active'` is inside the predicate rather than beside it.
+/// The caller needs that collapse — Python prints one message for both
+/// and exits 2 — so it is not disentangled here.
+pub fn current_hash(store: &dyn Store, slug: &str, path: &str) -> Result<Option<String>> {
+    let row = store
+        .query_opt(
+            "SELECT fc.content_hash
+               FROM file_contents fc
+               JOIN project_files pf ON pf.id = fc.file_id
+               JOIN projects p ON p.id = pf.project_id
+              WHERE p.slug = ?1 AND pf.file_path = ?2
+                AND pf.status = 'active' AND fc.is_current = 1",
+            &[Value::from(slug), Value::from(path)],
+        )
+        .context("reading the current content hash")?;
+
+    // `content_hash` is declared NOT NULL, so a row without one is a
+    // schema violation rather than a deleted file -- `get_string`
+    // refusing NULL is the right answer and is why this is not
+    // `get_opt_string`, which would silently report the file as absent.
+    row.map(|r| r.get_string(0)).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::testdb;
+
+    /// The three answers `file where`'s left column can have, on the
+    /// fixture rows built for exactly this: an active file with a
+    /// current hash, an active file with no content row, and a row
+    /// whose status is `deleted`.
+    #[test]
+    fn current_hash_distinguishes_present_absent_and_deleted() {
+        let c = testdb::fixture();
+        assert!(super::current_hash(&c, "alpha", "src/main.rs")
+            .unwrap()
+            .is_some());
+        // Active, but no `file_contents` row is current -- the join
+        // drops it, so there is no hash to report.
+        assert_eq!(super::current_hash(&c, "alpha", "notes.md").unwrap(), None);
+        // status = 'deleted': Python prints "(no current row -- file is
+        // deleted or never existed)" and exits 2 for this and for a
+        // path that was never there, so both collapse to None here.
+        assert_eq!(super::current_hash(&c, "alpha", "gone.txt").unwrap(), None);
+        assert_eq!(
+            super::current_hash(&c, "alpha", "no/such/file").unwrap(),
+            None
+        );
+        assert_eq!(
+            super::current_hash(&c, "no-such-project", "README.md").unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn lists_active_files_under_prefix() {

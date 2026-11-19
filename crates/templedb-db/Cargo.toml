@@ -7,5 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 postgres.workspace = true
+# `classify.rs` is `importer.scanner`'s 179-entry pattern table, which
+# `file retype` consults once per active row. See the workspace manifest
+# for why this is compiled rather than hand-matched.
+regex.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
